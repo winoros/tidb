@@ -85,8 +85,9 @@ func (s *joinReorderGreedySingleGroupSolver) solve(joinNodePlans []LogicalPlan) 
 			return nil, err
 		}
 		s.curJoinGroup = append(s.curJoinGroup, &jrNode{
-			p:       node,
-			cumCost: s.baseNodeCumCost(node),
+			p: node,
+			//cumCost: s.baseNodeCumCost(node),
+			cumCost: 0,
 		})
 		// s.groupNodeCumCost[node.ID()] = s.baseNodeCumCost(node)
 		s.groupNodeCumCost[node.ID()] = 0
