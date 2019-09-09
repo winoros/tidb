@@ -16,6 +16,7 @@
 package kv
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -121,7 +122,7 @@ func checkNewIterator(c *C, buffer MemBuffer) {
 func mustGet(c *C, buffer MemBuffer) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
-		val, err := buffer.Get(s)
+		val, err := buffer.Get(context.TODO(), s)
 		c.Assert(err, IsNil)
 		c.Assert(string(val), Equals, string(s))
 	}
@@ -189,7 +190,8 @@ func (s *testKVSuite) TestNewIteratorMin(c *C) {
 	}
 	for _, buffer := range s.bs {
 		for _, kv := range kvs {
-			buffer.Set([]byte(kv.key), []byte(kv.value))
+			err := buffer.Set([]byte(kv.key), []byte(kv.value))
+			c.Assert(err, IsNil)
 		}
 
 		cnt := 0
@@ -197,7 +199,8 @@ func (s *testKVSuite) TestNewIteratorMin(c *C) {
 		c.Assert(err, IsNil)
 		for it.Valid() {
 			cnt++
-			it.Next()
+			err := it.Next()
+			c.Assert(err, IsNil)
 		}
 		c.Assert(cnt, Equals, 6)
 
@@ -220,15 +223,6 @@ func (s *testKVSuite) TestBufferLimit(c *C) {
 	c.Assert(err, IsNil)
 	err = buffer.Set([]byte("yz"), make([]byte, 499))
 	c.Assert(err, NotNil) // buffer size limit
-
-	buffer = NewMemDbBuffer(DefaultTxnMembufCap).(*memDbBuffer)
-	buffer.bufferLenLimit = 10
-	for i := 0; i < 10; i++ {
-		err = buffer.Set([]byte{byte(i)}, []byte{byte(i)})
-		c.Assert(err, IsNil)
-	}
-	err = buffer.Set([]byte("x"), []byte("y"))
-	c.Assert(err, NotNil) // buffer len limit
 }
 
 var opCnt = 100000
@@ -282,7 +276,7 @@ func benchmarkSetGet(b *testing.B, buffer MemBuffer, data [][]byte) {
 			buffer.Set(k, k)
 		}
 		for _, k := range data {
-			buffer.Get(k)
+			buffer.Get(context.TODO(), k)
 		}
 	}
 }

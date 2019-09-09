@@ -14,10 +14,8 @@
 package server
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +27,7 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/failpoint"
 	zaplog "github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
@@ -41,6 +39,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/store/helper"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv"
@@ -71,7 +70,7 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		types.NewBytesDatum([]byte("foobar")),
 		types.NewFloat64Datum(-100.25),
 	}
-	var expectIndexValues []string
+	expectIndexValues := make([]string, 0, len(indexValues))
 	for _, v := range indexValues {
 		str, err := v.ToString()
 		if err != nil {
@@ -91,15 +90,14 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IndexID, Equals, sIndex)
-	c.Assert(r.first.IsRecord, IsFalse)
-	c.Assert(r.first.RecordID, Equals, int64(0))
-	c.Assert(r.first.IndexValues, DeepEquals, expectIndexValues)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.last.RecordID, Equals, recordID)
-	c.Assert(r.last.IndexValues, IsNil)
+	c.Assert(r.First.IndexID, Equals, sIndex)
+	c.Assert(r.First.IsRecord, IsFalse)
+	c.Assert(r.First.RecordID, Equals, int64(0))
+	c.Assert(r.First.IndexValues, DeepEquals, expectIndexValues)
+	c.Assert(r.Last.RecordID, Equals, recordID)
+	c.Assert(r.Last.IndexValues, IsNil)
 
 	testCases := []struct {
 		tableID int64
@@ -118,11 +116,11 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		{10, 1, false},
 	}
 	for _, t := range testCases {
-		var f *FrameItem
+		var f *helper.FrameItem
 		if t.indexID == 0 {
-			f = r.getRecordFrame(t.tableID, "", "")
+			f = r.GetRecordFrame(t.tableID, "", "")
 		} else {
-			f = r.getIndexFrame(t.tableID, t.indexID, "", "", "")
+			f = r.GetIndexFrame(t.tableID, t.indexID, "", "", "")
 		}
 		if t.isCover {
 			c.Assert(f, NotNil)
@@ -141,12 +139,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithEndNoLimit(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IsRecord, IsTrue)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.getRecordFrame(300, "", ""), NotNil)
-	c.Assert(r.getIndexFrame(200, 100, "", "", ""), NotNil)
+	c.Assert(r.First.IsRecord, IsTrue)
+	c.Assert(r.Last.IsRecord, IsTrue)
+	c.Assert(r.GetRecordFrame(300, "", ""), NotNil)
+	c.Assert(r.GetIndexFrame(200, 100, "", "", ""), NotNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithStartNoLimit(c *C) {
@@ -158,12 +156,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithStartNoLimit(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IsRecord, IsFalse)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.getRecordFrame(3, "", ""), NotNil)
-	c.Assert(r.getIndexFrame(8, 1, "", "", ""), NotNil)
+	c.Assert(r.First.IsRecord, IsFalse)
+	c.Assert(r.Last.IsRecord, IsTrue)
+	c.Assert(r.GetRecordFrame(3, "", ""), NotNil)
+	c.Assert(r.GetIndexFrame(8, 1, "", "", ""), NotNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestRegionsAPI(c *C) {
@@ -203,13 +201,28 @@ func regionContainsTable(c *C, regionID uint64, tableID int64) bool {
 	return false
 }
 
-func (ts *HTTPHandlerTestSuite) TestListTableRegionsWithError(c *C) {
+func (ts *HTTPHandlerTestSuite) TestListTableRegions(c *C) {
 	ts.startServer(c)
 	defer ts.stopServer(c)
+	ts.prepareData(c)
+	// Test list table regions with error
 	resp, err := http.Get("http://127.0.0.1:10090/tables/fdsfds/aaa/regions")
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
 	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
+
+	resp, err = http.Get("http://127.0.0.1:10090/tables/tidb/pt/regions")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+
+	var data []*TableRegions
+	dec := json.NewDecoder(resp.Body)
+	err = dec.Decode(&data)
+	c.Assert(err, IsNil)
+
+	region := data[1]
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/regions/%d", region.TableID))
+	c.Assert(err, IsNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestGetRegionByIDWithError(c *C) {
@@ -237,6 +250,13 @@ func (ts *HTTPHandlerTestSuite) TestRegionsFromMeta(c *C) {
 	for _, meta := range metas {
 		c.Assert(meta.ID != 0, IsTrue)
 	}
+
+	// test no panic
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/server/errGetRegionByIDEmpty", `return(true)`), IsNil)
+	resp1, err := http.Get("http://127.0.0.1:10090/regions/meta")
+	c.Assert(err, IsNil)
+	defer resp1.Body.Close()
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/server/errGetRegionByIDEmpty"), IsNil)
 }
 
 func (ts *HTTPHandlerTestSuite) startServer(c *C) {
@@ -297,18 +317,25 @@ func (ts *HTTPHandlerTestSuite) prepareData(c *C) {
 	c.Assert(err, IsNil)
 	dbt.mustExec("alter table tidb.test add index idx1 (a, b);")
 	dbt.mustExec("alter table tidb.test add unique index idx2 (a, b);")
+
+	dbt.mustExec(`create table tidb.pt (a int) partition by range (a)
+(partition p0 values less than (256),
+ partition p1 values less than (512),
+ partition p2 values less than (1024))`)
 }
 
 func decodeKeyMvcc(closer io.ReadCloser, c *C, valid bool) {
 	decoder := json.NewDecoder(closer)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err := decoder.Decode(&data)
 	c.Assert(err, IsNil)
 	if valid {
-		c.Assert(data.Info, NotNil)
-		c.Assert(len(data.Info.Writes), Greater, 0)
+		c.Assert(data.Value.Info, NotNil)
+		c.Assert(len(data.Value.Info.Writes), Greater, 0)
 	} else {
-		c.Assert(data.Info, IsNil)
+		c.Assert(data.Value.Info.Lock, IsNil)
+		c.Assert(data.Value.Info.Writes, IsNil)
+		c.Assert(data.Value.Info.Values, IsNil)
 	}
 }
 
@@ -317,45 +344,35 @@ func (ts *HTTPHandlerTestSuite) TestGetTableMVCC(c *C) {
 	ts.prepareData(c)
 	defer ts.stopServer(c)
 
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/key/tidb/test/1"))
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(data.Info, NotNil)
-	c.Assert(len(data.Info.Writes), Greater, 0)
-	startTs := data.Info.Writes[0].StartTs
-
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/%d", startTs))
-	c.Assert(err, IsNil)
-	var p1 kvrpcpb.MvccGetByStartTsResponse
-	decoder = json.NewDecoder(resp.Body)
-	err = decoder.Decode(&p1)
-	c.Assert(err, IsNil)
+	c.Assert(data.Value, NotNil)
+	info := data.Value.Info
+	c.Assert(info, NotNil)
+	c.Assert(len(info.Writes), Greater, 0)
+	startTs := info.Writes[0].StartTs
 
 	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/%d/tidb/test", startTs))
 	c.Assert(err, IsNil)
-	var p2 kvrpcpb.MvccGetByStartTsResponse
+	var p2 mvccKV
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&p2)
 	c.Assert(err, IsNil)
 
-	for id, expect := range data.Info.Values {
-		v1 := p1.Info.Values[id].Value
-		v2 := p2.Info.Values[id].Value
-		c.Assert(bytes.Equal(v1, expect.Value), IsTrue)
-		c.Assert(bytes.Equal(v2, expect.Value), IsTrue)
+	for i, expect := range info.Values {
+		v2 := p2.Value.Info.Values[i].Value
+		c.Assert(v2, BytesEquals, expect.Value)
 	}
 
-	_, key, err := codec.DecodeBytes(p1.Key, nil)
-	c.Assert(err, IsNil)
-	hexKey := hex.EncodeToString(key)
+	hexKey := p2.Key
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/hex/" + hexKey)
 	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
-	var data2 kvrpcpb.MvccGetByKeyResponse
+	var data2 mvccKV
 	err = decoder.Decode(&data2)
 	c.Assert(err, IsNil)
 	c.Assert(data2, DeepEquals, data)
@@ -368,19 +385,12 @@ func (ts *HTTPHandlerTestSuite) TestGetMVCCNotFound(c *C) {
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/key/tidb/test/1234"))
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(data.Info, IsNil)
-
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/0"))
-	c.Assert(err, IsNil)
-	var p kvrpcpb.MvccGetByStartTsResponse
-	decoder = json.NewDecoder(resp.Body)
-	err = decoder.Decode(&p)
-	c.Assert(err, IsNil)
-	c.Assert(p.Info, IsNil)
+	c.Assert(data.Value.Info.Lock, IsNil)
+	c.Assert(data.Value.Info.Writes, IsNil)
+	c.Assert(data.Value.Info.Values, IsNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestDecodeColumnValue(c *C) {
@@ -451,7 +461,6 @@ func (ts *HTTPHandlerTestSuite) TestGetIndexMVCC(c *C) {
 	ts.prepareData(c)
 	defer ts.stopServer(c)
 
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
 	// tests for normal index key
 	resp, err := http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx1/1?a=1&b=2")
 	c.Assert(err, IsNil)
@@ -492,14 +501,14 @@ func (ts *HTTPHandlerTestSuite) TestGetIndexMVCC(c *C) {
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx1/1?a=1")
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data1 kvrpcpb.MvccGetByKeyResponse
+	var data1 mvccKV
 	err = decoder.Decode(&data1)
 	c.Assert(err, NotNil)
 
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx2/1?a=1")
 	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
-	var data2 kvrpcpb.MvccGetByKeyResponse
+	var data2 mvccKV
 	err = decoder.Decode(&data2)
 	c.Assert(err, NotNil)
 }
@@ -558,7 +567,7 @@ func (ts *HTTPHandlerTestSuite) TestGetSchema(c *C) {
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&lt)
 	c.Assert(err, IsNil)
-	c.Assert(lt[0].Name.L, Equals, "test")
+	c.Assert(len(lt), Greater, 0)
 
 	_, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/schema/abc"))
 	c.Assert(err, IsNil)
@@ -584,6 +593,36 @@ func (ts *HTTPHandlerTestSuite) TestGetSchema(c *C) {
 	se, err := session.CreateSession(ts.store.(kv.Storage))
 	c.Assert(err, IsNil)
 	c.Assert(dbtbl.SchemaVersion, Equals, domain.GetDomain(se.(sessionctx.Context)).InfoSchema().SchemaMetaVersion())
+
+	db, err := sql.Open("mysql", getDSN())
+	c.Assert(err, IsNil, Commentf("Error connecting"))
+	defer db.Close()
+	dbt := &DBTest{c, db}
+
+	dbt.mustExec("create database if not exists test;")
+	dbt.mustExec("use test;")
+	dbt.mustExec(` create table t1 (id int KEY)
+		partition by range (id) (
+		PARTITION p0 VALUES LESS THAN (3),
+		PARTITION p1 VALUES LESS THAN (5),
+		PARTITION p2 VALUES LESS THAN (7),
+		PARTITION p3 VALUES LESS THAN (9))`)
+
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/schema/test/t1"))
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&t)
+	c.Assert(err, IsNil)
+	c.Assert(t.Name.L, Equals, "t1")
+
+	resp, err = http.Get(fmt.Sprintf(fmt.Sprintf("http://127.0.0.1:10090/db-table/%v", t.GetPartitionInfo().Definitions[0].ID)))
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&dbtbl)
+	c.Assert(err, IsNil)
+	c.Assert(dbtbl.TableInfo.Name.L, Equals, "t1")
+	c.Assert(dbtbl.DBInfo.Name.L, Equals, "test")
+	c.Assert(dbtbl.TableInfo, DeepEquals, t)
 }
 
 func (ts *HTTPHandlerTestSuite) TestAllHistory(c *C) {
@@ -600,7 +639,7 @@ func (ts *HTTPHandlerTestSuite) TestAllHistory(c *C) {
 	decoder := json.NewDecoder(resp.Body)
 
 	var jobs []*model.Job
-	s, _ := session.CreateSession(ts.server.newTikvHandlerTool().store.(kv.Storage))
+	s, _ := session.CreateSession(ts.server.newTikvHandlerTool().Store.(kv.Storage))
 	defer s.Close()
 	store := domain.GetDomain(s.(sessionctx.Context)).Store()
 	txn, _ := store.Begin()
@@ -660,20 +699,20 @@ func (ts *HTTPHandlerTestSuite) TestPostSettings(c *C) {
 	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
 	c.Assert(err, IsNil)
 	c.Assert(resp.StatusCode, Equals, http.StatusOK)
-	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUtf8, Equals, true)
+	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUTF8, Equals, true)
 	txn1, err := dbt.db.Begin()
 	c.Assert(err, IsNil)
 	_, err = txn1.Exec("insert t2 values (unhex('F0A48BAE'));")
 	c.Assert(err, NotNil)
 	txn1.Commit()
 
-	// Disable CheckMb4ValueInUtf8.
+	// Disable CheckMb4ValueInUTF8.
 	form = make(url.Values)
 	form.Set("check_mb4_value_in_utf8", "0")
 	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
 	c.Assert(err, IsNil)
 	c.Assert(resp.StatusCode, Equals, http.StatusOK)
-	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUtf8, Equals, false)
+	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUTF8, Equals, false)
 	dbt.mustExec("insert t2 values (unhex('f09f8c80'));")
 }
 
@@ -690,7 +729,7 @@ func (ts *HTTPHandlerTestSuite) TestPprof(c *C) {
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
-	log.Fatalf("Failed to get profile for %d retries in every 10 ms", retryTime)
+	zaplog.Fatal("failed to get profile for %d retries in every 10 ms", zap.Int("retryTime", retryTime))
 }
 
 func (ts *HTTPHandlerTestSuite) TestServerInfo(c *C) {
@@ -714,7 +753,7 @@ func (ts *HTTPHandlerTestSuite) TestServerInfo(c *C) {
 	c.Assert(info.Version, Equals, mysql.ServerVersion)
 	c.Assert(info.GitHash, Equals, printer.TiDBGitHash)
 
-	store := ts.server.newTikvHandlerTool().store.(kv.Storage)
+	store := ts.server.newTikvHandlerTool().Store.(kv.Storage)
 	do, err := session.GetDomain(store.(kv.Storage))
 	c.Assert(err, IsNil)
 	ddl := do.DDL()
@@ -737,7 +776,7 @@ func (ts *HTTPHandlerTestSuite) TestAllServerInfo(c *C) {
 	c.Assert(clusterInfo.IsAllServerVersionConsistent, IsTrue)
 	c.Assert(clusterInfo.ServersNum, Equals, 1)
 
-	store := ts.server.newTikvHandlerTool().store.(kv.Storage)
+	store := ts.server.newTikvHandlerTool().Store.(kv.Storage)
 	do, err := session.GetDomain(store.(kv.Storage))
 	c.Assert(err, IsNil)
 	ddl := do.DDL()
@@ -752,4 +791,22 @@ func (ts *HTTPHandlerTestSuite) TestAllServerInfo(c *C) {
 	c.Assert(serverInfo.Version, Equals, mysql.ServerVersion)
 	c.Assert(serverInfo.GitHash, Equals, printer.TiDBGitHash)
 	c.Assert(serverInfo.ID, Equals, ddl.GetID())
+}
+
+func (ts *HTTPHandlerTestSuite) TestHotRegionInfo(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/regions/hot")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
+}
+
+func (ts *HTTPHandlerTestSuite) TestDebugZip(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/debug/zip")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
 }

@@ -129,8 +129,8 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	tk.Se.GetSessionVars().BinlogClient = s.client
 	pump := s.pump
 	tk.MustExec("drop table if exists local_binlog")
-	ddlQuery := "create table local_binlog (id int primary key, name varchar(10)) shard_row_id_bits=1"
-	binlogDDLQuery := "create table local_binlog (id int primary key, name varchar(10)) /*!90000 shard_row_id_bits=1 */"
+	ddlQuery := "create table local_binlog (id int unique key, name varchar(10)) shard_row_id_bits=1"
+	binlogDDLQuery := "create table local_binlog (id int unique key, name varchar(10)) /*!90000 shard_row_id_bits=1 */"
 	tk.MustExec(ddlQuery)
 	var matched bool // got matched pre DDL and commit DDL
 	for i := 0; i < 10; i++ {
@@ -155,7 +155,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 		{types.NewIntDatum(1), types.NewStringDatum("abc")},
 		{types.NewIntDatum(2), types.NewStringDatum("cde")},
 	}
-	gotRows := mutationRowsToRows(c, prewriteVal.Mutations[0].InsertedRows, 0, 2)
+	gotRows := mutationRowsToRows(c, prewriteVal.Mutations[0].InsertedRows, 2, 4)
 	c.Assert(gotRows, DeepEquals, expected)
 
 	tk.MustExec("update local_binlog set name = 'xyz' where id = 2")
@@ -169,7 +169,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 1, 3)
 	c.Assert(gotRows, DeepEquals, oldRow)
 
-	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 5, 7)
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 7, 9)
 	c.Assert(gotRows, DeepEquals, newRow)
 
 	tk.MustExec("delete from local_binlog where id = 1")
@@ -430,4 +430,41 @@ func (s *testBinlogSuite) TestDeleteSchema(c *C) {
 	// The final schema of this SQL should be the schema of table b1, rather than the schema of join result.
 	tk.MustExec("delete from b1 where job_id in (select job_id from b2 where batch_class = 'TEST') or split_job_id in (select job_id from b2 where batch_class = 'TEST');")
 	tk.MustExec("delete b1 from b2 right join b1 on b1.job_id = b2.job_id and batch_class = 'TEST';")
+}
+
+func (s *testBinlogSuite) TestAddSpecialComment(c *C) {
+	testCase := []struct {
+		input  string
+		result string
+	}{
+		{
+			"create table t1 (id int ) shard_row_id_bits=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 */ ;",
+		},
+		{
+			"create table t1 (id int ) shard_row_id_bits=2 pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+		},
+		{
+			"create table t1 (id int ) shard_row_id_bits=2     pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2     pre_split_regions=2 */ ;",
+		},
+
+		{
+			"create table t1 (id int ) shard_row_id_bits=2 engine=innodb pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ engine=innodb ;",
+		},
+		{
+			"create table t1 (id int ) pre_split_regions=2 shard_row_id_bits=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+		},
+		{
+			"create table t6 (id int ) shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2;",
+			"create table t6 (id int ) /*!90000 shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2 */ ;",
+		},
+	}
+	for _, ca := range testCase {
+		re := binloginfo.AddSpecialComment(ca.input)
+		c.Assert(re, Equals, ca.result)
+	}
 }

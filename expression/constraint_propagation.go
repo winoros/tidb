@@ -22,7 +22,8 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 // exprSet is a Set container for expressions, each expression in it is unique.
@@ -150,7 +151,7 @@ func ruleConstantFalse(ctx sessionctx.Context, i, j int, exprs *exprSet) {
 	if cons, ok := cond.(*Constant); ok {
 		v, isNull, err := cons.EvalInt(ctx, chunk.Row{})
 		if err != nil {
-			log.Error(err)
+			logutil.BgLogger().Warn("eval constant", zap.Error(err))
 			return
 		}
 		if !isNull && v == 0 {
@@ -247,7 +248,7 @@ func ruleColumnOPConst(ctx sessionctx.Context, i, j int, exprs *exprSet) {
 		var err error
 		fc1, err = NewFunction(ctx, scalarFunc.FuncName.L, scalarFunc.RetType, con1)
 		if err != nil {
-			log.Warn(err)
+			logutil.BgLogger().Warn("build new function in ruleColumnOPConst", zap.Error(err))
 			return
 		}
 	}
@@ -255,22 +256,15 @@ func ruleColumnOPConst(ctx sessionctx.Context, i, j int, exprs *exprSet) {
 	// Make sure col1 and col2 are the same column.
 	// Can't use col1.Equal(ctx, col2) here, because they are not generated in one
 	// expression and their UniqueID are not the same.
-	if col1.ColName.L != col2.ColName.L {
-		return
-	}
-	if col1.OrigColName.L != "" &&
-		col2.OrigColName.L != "" &&
-		col1.OrigColName.L != col2.OrigColName.L {
-		return
-	}
-	if col1.OrigTblName.L != "" &&
-		col2.OrigTblName.L != "" &&
-		col1.OrigColName.L != col2.OrigColName.L {
+	// NOTE: We can use this way to compare this two column since this method is only called for partition pruning,
+	//       where all columns come from the same DataSource.
+	//       If we want to use this method in more places. We need to first change the comparing way.
+	if col1.ID != col2.ID {
 		return
 	}
 	v, isNull, err := compareConstant(ctx, negOP(OP2), fc1, con2)
 	if err != nil {
-		log.Warn(err)
+		logutil.BgLogger().Warn("comparing constant in ruleColumnOPConst", zap.Error(err))
 		return
 	}
 	if !isNull && v > 0 {

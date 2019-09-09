@@ -13,7 +13,10 @@
 
 package kv
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/hex"
+)
 
 // Key represents high-level Key type.
 type Key []byte
@@ -70,6 +73,11 @@ func (k Key) Clone() Key {
 	return append([]byte(nil), k...)
 }
 
+// String implements fmt.Stringer interface.
+func (k Key) String() string {
+	return hex.EncodeToString(k)
+}
+
 // KeyRange represents a range where StartKey <= key < EndKey.
 type KeyRange struct {
 	StartKey Key
@@ -108,18 +116,4 @@ func (r *KeyRange) IsPoint() bool {
 	diffOneIdx := i
 	return r.StartKey[diffOneIdx]+1 == r.EndKey[diffOneIdx] &&
 		bytes.Equal(r.StartKey[:diffOneIdx], r.EndKey[:diffOneIdx])
-}
-
-// EncodedKey represents encoded key in low-level storage engine.
-type EncodedKey []byte
-
-// Cmp returns the comparison result of two key.
-// The result will be 0 if a==b, -1 if a < b, and +1 if a > b.
-func (k EncodedKey) Cmp(another EncodedKey) int {
-	return bytes.Compare(k, another)
-}
-
-// Next returns the next key in byte-order.
-func (k EncodedKey) Next() EncodedKey {
-	return EncodedKey(bytes.Join([][]byte{k, Key{0}}, nil))
 }

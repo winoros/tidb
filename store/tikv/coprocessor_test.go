@@ -15,6 +15,7 @@ package tikv
 
 import (
 	"context"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
@@ -34,6 +35,7 @@ func (s *testCoprocessorSuite) TestBuildTasks(c *C) {
 	_, regionIDs, _ := mocktikv.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
 	pdCli := &codecPDClient{mocktikv.NewPDClient(cluster)}
 	cache := NewRegionCache(pdCli)
+	defer cache.Close()
 
 	bo := NewBackoffer(context.Background(), 3000)
 
@@ -96,6 +98,7 @@ func (s *testCoprocessorSuite) TestSplitRegionRanges(c *C) {
 	mocktikv.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
 	pdCli := &codecPDClient{mocktikv.NewPDClient(cluster)}
 	cache := NewRegionCache(pdCli)
+	defer cache.Close()
 
 	bo := NewBackoffer(context.Background(), 3000)
 
@@ -148,6 +151,7 @@ func (s *testCoprocessorSuite) TestRebuild(c *C) {
 	storeID, regionIDs, peerIDs := mocktikv.BootstrapWithMultiRegions(cluster, []byte("m"))
 	pdCli := &codecPDClient{mocktikv.NewPDClient(cluster)}
 	cache := NewRegionCache(pdCli)
+	defer cache.Close()
 	bo := NewBackoffer(context.Background(), 3000)
 
 	tasks, err := buildCopTasks(bo, cache, buildCopRanges("a", "z"), false, false)
@@ -161,7 +165,7 @@ func (s *testCoprocessorSuite) TestRebuild(c *C) {
 	regionIDs = append(regionIDs, cluster.AllocID())
 	peerIDs = append(peerIDs, cluster.AllocID())
 	cluster.Split(regionIDs[1], regionIDs[2], []byte("q"), []uint64{peerIDs[2]}, storeID)
-	cache.DropRegion(tasks[1].region)
+	cache.InvalidateCachedRegion(tasks[1].region)
 
 	tasks, err = buildCopTasks(bo, cache, buildCopRanges("a", "z"), true, false)
 	c.Assert(err, IsNil)
@@ -289,6 +293,32 @@ func (s *testCoprocessorSuite) TestCopRangeSplit(c *C) {
 		splitCase{"p", buildCopRanges("a", "b", "c", "d", "e", "g", "l", "o")},
 		splitCase{"t", buildCopRanges("a", "b", "c", "d", "e", "g", "l", "o", "q", "t")},
 	)
+}
+
+func (s *testCoprocessorSuite) TestRateLimit(c *C) {
+	done := make(chan struct{}, 1)
+	rl := newRateLimit(1)
+	c.Assert(rl.putToken, PanicMatches, "put a redundant token")
+	exit := rl.getToken(done)
+	c.Assert(exit, Equals, false)
+	rl.putToken()
+	c.Assert(rl.putToken, PanicMatches, "put a redundant token")
+
+	exit = rl.getToken(done)
+	c.Assert(exit, Equals, false)
+	done <- struct{}{}
+	exit = rl.getToken(done) // blocked but exit
+	c.Assert(exit, Equals, true)
+
+	sig := make(chan int, 1)
+	go func() {
+		exit = rl.getToken(done) // blocked
+		c.Assert(exit, Equals, false)
+		close(sig)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	rl.putToken()
+	<-sig
 }
 
 type splitCase struct {

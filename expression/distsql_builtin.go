@@ -320,8 +320,12 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 	case tipb.ScalarFuncSig_BitNegSig:
 		f = &builtinBitNegSig{base}
 
-	case tipb.ScalarFuncSig_UnaryNot:
-		f = &builtinUnaryNotSig{base}
+	case tipb.ScalarFuncSig_UnaryNotReal:
+		f = &builtinUnaryNotRealSig{base}
+	case tipb.ScalarFuncSig_UnaryNotDecimal:
+		f = &builtinUnaryNotDecimalSig{base}
+	case tipb.ScalarFuncSig_UnaryNotInt:
+		f = &builtinUnaryNotIntSig{base}
 	case tipb.ScalarFuncSig_UnaryMinusInt:
 		f = &builtinUnaryMinusIntSig{base}
 	case tipb.ScalarFuncSig_UnaryMinusReal:
@@ -420,6 +424,10 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 		f = &builtinJSONUnquoteSig{base}
 	case tipb.ScalarFuncSig_JsonArraySig:
 		f = &builtinJSONArraySig{base}
+	case tipb.ScalarFuncSig_JsonArrayAppendSig:
+		f = &builtinJSONArrayAppendSig{base}
+	case tipb.ScalarFuncSig_JsonArrayInsertSig:
+		f = &builtinJSONArrayInsertSig{base}
 	case tipb.ScalarFuncSig_JsonObjectSig:
 		f = &builtinJSONObjectSig{base}
 	case tipb.ScalarFuncSig_JsonExtractSig:
@@ -442,6 +450,8 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 		f = &builtinJSONLengthSig{base}
 	case tipb.ScalarFuncSig_JsonDepthSig:
 		f = &builtinJSONDepthSig{base}
+	case tipb.ScalarFuncSig_JsonSearchSig:
+		f = &builtinJSONSearchSig{base}
 
 	case tipb.ScalarFuncSig_InInt:
 		f = &builtinInIntSig{base}
@@ -540,30 +550,20 @@ func PBToExpr(expr *tipb.Expr, tps []*types.FieldType, sc *stmtctx.StatementCont
 	return newDistSQLFunctionBySig(sc, expr.Sig, expr.FieldType, args)
 }
 
-func fieldTypeFromPB(ft *tipb.FieldType) *types.FieldType {
-	return &types.FieldType{
-		Tp:      byte(ft.GetTp()),
-		Flag:    uint(ft.GetFlag()),
-		Flen:    int(ft.GetFlen()),
-		Decimal: int(ft.GetDecimal()),
-		Collate: mysql.Collations[uint8(ft.GetCollate())],
-	}
-}
-
 func convertTime(data []byte, ftPB *tipb.FieldType, tz *time.Location) (*Constant, error) {
-	ft := fieldTypeFromPB(ftPB)
+	ft := pbTypeToFieldType(ftPB)
 	_, v, err := codec.DecodeUint(data)
 	if err != nil {
 		return nil, err
 	}
 	var t types.Time
 	t.Type = ft.Tp
-	t.Fsp = ft.Decimal
+	t.Fsp = int8(ft.Decimal)
 	err = t.FromPackedUint(v)
 	if err != nil {
 		return nil, err
 	}
-	if ft.Tp == mysql.TypeTimestamp && !t.IsZero() {
+	if ft.Tp == mysql.TypeTimestamp && tz != time.UTC {
 		err = t.ConvertTimeZone(time.UTC, tz)
 		if err != nil {
 			return nil, err

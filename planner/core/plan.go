@@ -16,12 +16,15 @@ package core
 import (
 	"fmt"
 	"math"
+	"strconv"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
 )
 
@@ -34,14 +37,17 @@ type Plan interface {
 	// Get the ID.
 	ID() int
 	// Get the ID in explain statement
-	ExplainID() string
+	ExplainID() fmt.Stringer
 	// replaceExprColumns replace all the column reference in the plan's expression node.
 	replaceExprColumns(replace map[string]*expression.Column)
 
-	context() sessionctx.Context
+	SCtx() sessionctx.Context
 
 	// property.StatsInfo will return the property.StatsInfo for this plan.
 	statsInfo() *property.StatsInfo
+
+	// OutputNames returns the outputting names of each column.
+	OutputNames() []*types.FieldName
 }
 
 func enforceProperty(p *property.PhysicalProperty, tsk task, ctx sessionctx.Context) task {
@@ -111,6 +117,9 @@ type LogicalPlan interface {
 
 	// SetChildren sets the children for the plan.
 	SetChildren(...LogicalPlan)
+
+	// SetChild sets the ith child for the plan.
+	SetChild(i int, child LogicalPlan)
 }
 
 // PhysicalPlan is a tree of the physical operators.
@@ -138,6 +147,9 @@ type PhysicalPlan interface {
 
 	// SetChildren sets the children for the plan.
 	SetChildren(...PhysicalPlan)
+
+	// SetChild sets the ith child for the plan.
+	SetChild(i int, child PhysicalPlan)
 
 	// ResolveIndices resolves the indices for columns. After doing this, the columns can evaluate the rows by their indices.
 	ResolveIndices() error
@@ -245,6 +257,11 @@ type basePlan struct {
 	stats *property.StatsInfo
 }
 
+// OutputNames returns the outputting names of each column.
+func (p *basePlan) OutputNames() []*types.FieldName {
+	return nil
+}
+
 func (p *basePlan) replaceExprColumns(replace map[string]*expression.Column) {
 }
 
@@ -258,8 +275,10 @@ func (p *basePlan) statsInfo() *property.StatsInfo {
 	return p.stats
 }
 
-func (p *basePlan) ExplainID() string {
-	return fmt.Sprintf("%s_%d", p.tp, p.id)
+func (p *basePlan) ExplainID() fmt.Stringer {
+	return stringutil.MemoizeStr(func() string {
+		return p.tp + "_" + strconv.Itoa(p.id)
+	})
 }
 
 // Schema implements Plan Schema interface.
@@ -292,7 +311,18 @@ func (p *basePhysicalPlan) SetChildren(children ...PhysicalPlan) {
 	p.children = children
 }
 
-func (p *basePlan) context() sessionctx.Context {
+// SetChild implements LogicalPlan SetChild interface.
+func (p *baseLogicalPlan) SetChild(i int, child LogicalPlan) {
+	p.children[i] = child
+}
+
+// SetChild implements PhysicalPlan SetChild interface.
+func (p *basePhysicalPlan) SetChild(i int, child PhysicalPlan) {
+	p.children[i] = child
+}
+
+// Context implements Plan Context interface.
+func (p *basePlan) SCtx() sessionctx.Context {
 	return p.ctx
 }
 
@@ -301,5 +331,5 @@ func (p *baseLogicalPlan) findColumn(column *ast.ColumnName) (*expression.Column
 	if err == nil && col == nil {
 		err = errors.Errorf("column %s not found", column.Name.O)
 	}
-	return col, idx, errors.Trace(err)
+	return col, idx, err
 }

@@ -14,6 +14,7 @@
 package binloginfo
 
 import (
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -27,8 +28,9 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
-	binlog "github.com/pingcap/tipb/go-binlog"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tipb/go-binlog"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
@@ -40,6 +42,8 @@ func init() {
 // shared by all sessions.
 var pumpsClient *pumpcli.PumpsClient
 var pumpsClientLock sync.RWMutex
+var shardPat = regexp.MustCompile(`SHARD_ROW_ID_BITS\s*=\s*\d+\s*`)
+var preSplitPat = regexp.MustCompile(`PRE_SPLIT_REGIONS\s*=\s*\d+\s*`)
 
 // BinlogInfo contains binlog data and binlog client.
 type BinlogInfo struct {
@@ -80,7 +84,7 @@ var ignoreError uint32
 // DisableSkipBinlogFlag disable the skipBinlog flag.
 func DisableSkipBinlogFlag() {
 	atomic.StoreUint32(&skipBinlog, 0)
-	log.Warn("[binloginfo] disable the skipBinlog flag")
+	logutil.BgLogger().Warn("[binloginfo] disable the skipBinlog flag")
 }
 
 // SetIgnoreError sets the ignoreError flag, this function called when TiDB start
@@ -108,9 +112,9 @@ func (info *BinlogInfo) WriteBinlog(clusterID uint64) error {
 	// it will retry in PumpsClient if write binlog fail.
 	err := info.Client.WriteBinlog(info.Data)
 	if err != nil {
-		log.Errorf("write binlog fail %v", errors.ErrorStack(err))
+		logutil.BgLogger().Error("write binlog failed", zap.Error(err))
 		if atomic.LoadUint32(&ignoreError) == 1 {
-			log.Error("write binlog fail but error ignored")
+			logutil.BgLogger().Error("write binlog fail but error ignored")
 			metrics.CriticalErrorCounter.Add(1)
 			// If error happens once, we'll stop writing binlog.
 			atomic.CompareAndSwapUint32(&skipBinlog, skip, skip+1)
@@ -134,7 +138,7 @@ func SetDDLBinlog(client *pumpcli.PumpsClient, txn kv.Transaction, jobID int64, 
 		return
 	}
 
-	ddlQuery = addSpecialComment(ddlQuery)
+	ddlQuery = AddSpecialComment(ddlQuery)
 	info := &BinlogInfo{
 		Data: &binlog.Binlog{
 			Tp:       binlog.BinlogType_Prewrite,
@@ -148,18 +152,52 @@ func SetDDLBinlog(client *pumpcli.PumpsClient, txn kv.Transaction, jobID int64, 
 
 const specialPrefix = `/*!90000 `
 
-func addSpecialComment(ddlQuery string) string {
+// AddSpecialComment uses to add comment for table option in DDL query.
+// Export for testing.
+func AddSpecialComment(ddlQuery string) string {
 	if strings.Contains(ddlQuery, specialPrefix) {
 		return ddlQuery
 	}
+	return addSpecialCommentByRegexps(ddlQuery, shardPat, preSplitPat)
+}
+
+// addSpecialCommentByRegexps uses to add special comment for the worlds in the ddlQuery with match the regexps.
+func addSpecialCommentByRegexps(ddlQuery string, regs ...*regexp.Regexp) string {
 	upperQuery := strings.ToUpper(ddlQuery)
-	reg, err := regexp.Compile(`SHARD_ROW_ID_BITS\s*=\s*\d+`)
-	terror.Log(err)
-	loc := reg.FindStringIndex(upperQuery)
-	if len(loc) < 2 {
-		return ddlQuery
+	var specialComments []string
+	minIdx := math.MaxInt64
+	for i := 0; i < len(regs); {
+		reg := regs[i]
+		loc := reg.FindStringIndex(upperQuery)
+		if len(loc) < 2 {
+			i++
+			continue
+		}
+		specialComments = append(specialComments, ddlQuery[loc[0]:loc[1]])
+		if loc[0] < minIdx {
+			minIdx = loc[0]
+		}
+		ddlQuery = ddlQuery[:loc[0]] + ddlQuery[loc[1]:]
+		upperQuery = upperQuery[:loc[0]] + upperQuery[loc[1]:]
 	}
-	return ddlQuery[:loc[0]] + specialPrefix + ddlQuery[loc[0]:loc[1]] + ` */` + ddlQuery[loc[1]:]
+	if minIdx != math.MaxInt64 {
+		query := ddlQuery[:minIdx] + specialPrefix
+		for _, comment := range specialComments {
+			if query[len(query)-1] != ' ' {
+				query += " "
+			}
+			query += comment
+		}
+		if query[len(query)-1] != ' ' {
+			query += " "
+		}
+		query += "*/"
+		if len(ddlQuery[minIdx:]) > 0 {
+			return query + " " + ddlQuery[minIdx:]
+		}
+		return query
+	}
+	return ddlQuery
 }
 
 // MockPumpsClient creates a PumpsClient, used for test.

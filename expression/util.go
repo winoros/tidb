@@ -28,6 +28,8 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 	"golang.org/x/tools/container/intsets"
 )
 
@@ -39,6 +41,19 @@ func Filter(result []Expression, input []Expression, filter func(Expression) boo
 		}
 	}
 	return result
+}
+
+// FilterOutInPlace do the filtering out in place.
+// The remained are the ones who doesn't match the filter, storing in the original slice.
+// The filteredOut are the ones match the filter, storing in a new slice.
+func FilterOutInPlace(input []Expression, filter func(Expression) bool) (remained, filteredOut []Expression) {
+	for i := len(input) - 1; i >= 0; i-- {
+		if filter(input[i]) {
+			filteredOut = append(filteredOut, input[i])
+			input = append(input[:i], input[i+1:]...)
+		}
+	}
+	return input, filteredOut
 }
 
 // ExtractColumns extracts all columns from an expression.
@@ -273,6 +288,14 @@ var symmetricOp = map[opcode.Op]opcode.Op{
 	opcode.NullEQ: opcode.NullEQ,
 }
 
+func doPushDownNot(ctx sessionctx.Context, exprs []Expression, not bool) []Expression {
+	newExprs := make([]Expression, 0, len(exprs))
+	for _, expr := range exprs {
+		newExprs = append(newExprs, PushDownNot(ctx, expr, not))
+	}
+	return newExprs
+}
+
 // PushDownNot pushes the `not` function down to the expression's arguments.
 func PushDownNot(ctx sessionctx.Context, expr Expression, not bool) Expression {
 	if f, ok := expr.(*ScalarFunction); ok {
@@ -283,34 +306,22 @@ func PushDownNot(ctx sessionctx.Context, expr Expression, not bool) Expression {
 			if not {
 				return NewFunctionInternal(f.GetCtx(), oppositeOp[f.FuncName.L], f.GetType(), f.GetArgs()...)
 			}
-			for i, arg := range f.GetArgs() {
-				f.GetArgs()[i] = PushDownNot(f.GetCtx(), arg, false)
-			}
-			return f
+			newArgs := doPushDownNot(f.GetCtx(), f.GetArgs(), false)
+			return NewFunctionInternal(f.GetCtx(), f.FuncName.L, f.GetType(), newArgs...)
 		case ast.LogicAnd:
 			if not {
-				args := f.GetArgs()
-				for i, a := range args {
-					args[i] = PushDownNot(f.GetCtx(), a, true)
-				}
-				return NewFunctionInternal(f.GetCtx(), ast.LogicOr, f.GetType(), args...)
+				newArgs := doPushDownNot(f.GetCtx(), f.GetArgs(), true)
+				return NewFunctionInternal(f.GetCtx(), ast.LogicOr, f.GetType(), newArgs...)
 			}
-			for i, arg := range f.GetArgs() {
-				f.GetArgs()[i] = PushDownNot(f.GetCtx(), arg, false)
-			}
-			return f
+			newArgs := doPushDownNot(f.GetCtx(), f.GetArgs(), false)
+			return NewFunctionInternal(f.GetCtx(), f.FuncName.L, f.GetType(), newArgs...)
 		case ast.LogicOr:
 			if not {
-				args := f.GetArgs()
-				for i, a := range args {
-					args[i] = PushDownNot(f.GetCtx(), a, true)
-				}
-				return NewFunctionInternal(f.GetCtx(), ast.LogicAnd, f.GetType(), args...)
+				newArgs := doPushDownNot(f.GetCtx(), f.GetArgs(), true)
+				return NewFunctionInternal(f.GetCtx(), ast.LogicAnd, f.GetType(), newArgs...)
 			}
-			for i, arg := range f.GetArgs() {
-				f.GetArgs()[i] = PushDownNot(f.GetCtx(), arg, false)
-			}
-			return f
+			newArgs := doPushDownNot(f.GetCtx(), f.GetArgs(), false)
+			return NewFunctionInternal(f.GetCtx(), f.FuncName.L, f.GetType(), newArgs...)
 		}
 	}
 	if not {
@@ -530,50 +541,37 @@ func (s *exprStack) len() int {
 	return len(s.stack)
 }
 
-// ColumnSliceIsIntersect checks whether two column slice is intersected.
-func ColumnSliceIsIntersect(s1, s2 []*Column) bool {
-	intSet := map[int64]struct{}{}
-	for _, col := range s1 {
-		intSet[col.UniqueID] = struct{}{}
-	}
-	for _, col := range s2 {
-		if _, ok := intSet[col.UniqueID]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 // DatumToConstant generates a Constant expression from a Datum.
 func DatumToConstant(d types.Datum, tp byte) *Constant {
 	return &Constant{Value: d, RetType: types.NewFieldType(tp)}
 }
 
-// GetParamExpression generate a getparam function expression.
-func GetParamExpression(ctx sessionctx.Context, v *driver.ParamMarkerExpr) (Expression, error) {
+// ParamMarkerExpression generate a getparam function expression.
+func ParamMarkerExpression(ctx sessionctx.Context, v *driver.ParamMarkerExpr) (Expression, error) {
 	useCache := ctx.GetSessionVars().StmtCtx.UseCache
 	tp := types.NewFieldType(mysql.TypeUnspecified)
 	types.DefaultParamTypeForValue(v.GetValue(), tp)
 	value := &Constant{Value: v.Datum, RetType: tp}
 	if useCache {
-		f, err := NewFunctionBase(ctx, ast.GetParam, &v.Type,
-			DatumToConstant(types.NewIntDatum(int64(v.Order)), mysql.TypeLonglong))
-		if err != nil {
-			return nil, err
+		value.ParamMarker = &ParamMarker{
+			order: v.Order,
+			ctx:   ctx,
 		}
-		f.GetType().Tp = v.Type.Tp
-		value.DeferredExpr = f
 	}
 	return value, nil
 }
 
 // DisableParseJSONFlag4Expr disables ParseToJSONFlag for `expr` except Column.
 // We should not *PARSE* a string as JSON under some scenarios. ParseToJSONFlag
-// is 0 for JSON column yet, so we can skip it. Moreover, Column.RetType refers
-// to the infoschema, if we modify it, data race may happen if another goroutine
-// read from the infoschema at the same time.
+// is 0 for JSON column yet(as well as JSON correlated column), so we can skip
+// it. Moreover, Column.RetType refers to the infoschema, if we modify it, data
+// race may happen if another goroutine read from the infoschema at the same
+// time.
 func DisableParseJSONFlag4Expr(expr Expression) {
 	if _, isColumn := expr.(*Column); isColumn {
+		return
+	}
+	if _, isCorCol := expr.(*CorrelatedColumn); isCorCol {
 		return
 	}
 	expr.GetType().Flag &= ^mysql.ParseToJSONFlag
@@ -589,7 +587,7 @@ func PosFromPositionExpr(ctx sessionctx.Context, v *ast.PositionExpr) (int, bool
 	if v.P == nil {
 		return v.N, false, nil
 	}
-	value, err := GetParamExpression(ctx, v.P.(*driver.ParamMarkerExpr))
+	value, err := ParamMarkerExpression(ctx, v.P.(*driver.ParamMarkerExpr))
 	if err != nil {
 		return 0, true, err
 	}
@@ -634,22 +632,22 @@ func BuildNotNullExpr(ctx sessionctx.Context, expr Expression) Expression {
 	return notNull
 }
 
-// isMutableEffectsExpr checks if expr contains function which is mutable or has side effects.
-func isMutableEffectsExpr(expr Expression) bool {
+// IsMutableEffectsExpr checks if expr contains function which is mutable or has side effects.
+func IsMutableEffectsExpr(expr Expression) bool {
 	switch x := expr.(type) {
 	case *ScalarFunction:
 		if _, ok := mutableEffectsFunctions[x.FuncName.L]; ok {
 			return true
 		}
 		for _, arg := range x.GetArgs() {
-			if isMutableEffectsExpr(arg) {
+			if IsMutableEffectsExpr(arg) {
 				return true
 			}
 		}
 	case *Column:
 	case *Constant:
 		if x.DeferredExpr != nil {
-			return isMutableEffectsExpr(x.DeferredExpr)
+			return IsMutableEffectsExpr(x.DeferredExpr)
 		}
 	}
 	return false
@@ -663,10 +661,43 @@ func RemoveDupExprs(ctx sessionctx.Context, exprs []Expression) []Expression {
 	sc := ctx.GetSessionVars().StmtCtx
 	for _, expr := range exprs {
 		key := string(expr.HashCode(sc))
-		if _, ok := exists[key]; !ok || isMutableEffectsExpr(expr) {
+		if _, ok := exists[key]; !ok || IsMutableEffectsExpr(expr) {
 			res = append(res, expr)
 			exists[key] = struct{}{}
 		}
 	}
 	return res
+}
+
+// GetUint64FromConstant gets a uint64 from constant expression.
+func GetUint64FromConstant(expr Expression) (uint64, bool, bool) {
+	con, ok := expr.(*Constant)
+	if !ok {
+		logutil.BgLogger().Warn("not a constant expression", zap.String("expression", expr.ExplainInfo()))
+		return 0, false, false
+	}
+	dt := con.Value
+	if con.ParamMarker != nil {
+		dt = con.ParamMarker.GetUserVar()
+	} else if con.DeferredExpr != nil {
+		var err error
+		dt, err = con.DeferredExpr.Eval(chunk.Row{})
+		if err != nil {
+			logutil.BgLogger().Warn("eval deferred expr failed", zap.Error(err))
+			return 0, false, false
+		}
+	}
+	switch dt.Kind() {
+	case types.KindNull:
+		return 0, true, true
+	case types.KindInt64:
+		val := dt.GetInt64()
+		if val < 0 {
+			return 0, false, false
+		}
+		return uint64(val), false, true
+	case types.KindUint64:
+		return dt.GetUint64(), false, true
+	}
+	return 0, false, false
 }

@@ -18,6 +18,9 @@
 package expression
 
 import (
+	"sync"
+
+	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/mysql"
@@ -31,14 +34,27 @@ import (
 
 // baseBuiltinFunc will be contained in every struct that implement builtinFunc interface.
 type baseBuiltinFunc struct {
-	args   []Expression
-	ctx    sessionctx.Context
-	tp     *types.FieldType
-	pbCode tipb.ScalarFuncSig
+	bufAllocator columnBufferAllocator
+	args         []Expression
+	ctx          sessionctx.Context
+	tp           *types.FieldType
+	pbCode       tipb.ScalarFuncSig
+
+	childrenVectorizedOnce *sync.Once
+	childrenVectorized     bool
 }
 
 func (b *baseBuiltinFunc) PbCode() tipb.ScalarFuncSig {
 	return b.pbCode
+}
+
+// implicitArgs returns the implicit arguments of this function.
+// implicit arguments means some functions contain extra inner fields which will not
+// contain in `tipb.Expr.children` but must be pushed down to coprocessor
+func (b *baseBuiltinFunc) implicitArgs() []types.Datum {
+	// We will not use a field to store them because of only
+	// a few functions contain implicit parameters
+	return nil
 }
 
 func (b *baseBuiltinFunc) setPbCode(c tipb.ScalarFuncSig) {
@@ -50,6 +66,9 @@ func newBaseBuiltinFunc(ctx sessionctx.Context, args []Expression) baseBuiltinFu
 		panic("ctx should not be nil")
 	}
 	return baseBuiltinFunc{
+		bufAllocator:           newLocalSliceBuffer(len(args)),
+		childrenVectorizedOnce: new(sync.Once),
+
 		args: args,
 		ctx:  ctx,
 		tp:   types.NewFieldType(mysql.TypeUnspecified),
@@ -119,21 +138,21 @@ func newBaseBuiltinFuncWithTp(ctx sessionctx.Context, args []Expression, retType
 		fieldType = &types.FieldType{
 			Tp:      mysql.TypeDatetime,
 			Flen:    mysql.MaxDatetimeWidthWithFsp,
-			Decimal: types.MaxFsp,
+			Decimal: int(types.MaxFsp),
 			Flag:    mysql.BinaryFlag,
 		}
 	case types.ETTimestamp:
 		fieldType = &types.FieldType{
 			Tp:      mysql.TypeTimestamp,
 			Flen:    mysql.MaxDatetimeWidthWithFsp,
-			Decimal: types.MaxFsp,
+			Decimal: int(types.MaxFsp),
 			Flag:    mysql.BinaryFlag,
 		}
 	case types.ETDuration:
 		fieldType = &types.FieldType{
 			Tp:      mysql.TypeDuration,
 			Flen:    mysql.MaxDurationWidthWithFsp,
-			Decimal: types.MaxFsp,
+			Decimal: int(types.MaxFsp),
 			Flag:    mysql.BinaryFlag,
 		}
 	case types.ETJson:
@@ -152,6 +171,9 @@ func newBaseBuiltinFuncWithTp(ctx sessionctx.Context, args []Expression, retType
 		fieldType.Charset, fieldType.Collate = charset.GetDefaultCharsetAndCollate()
 	}
 	return baseBuiltinFunc{
+		bufAllocator:           newLocalSliceBuffer(len(args)),
+		childrenVectorizedOnce: new(sync.Once),
+
 		args: args,
 		ctx:  ctx,
 		tp:   fieldType,
@@ -162,32 +184,77 @@ func (b *baseBuiltinFunc) getArgs() []Expression {
 	return b.args
 }
 
+func (b *baseBuiltinFunc) vecEvalInt(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalInt() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalReal(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalReal() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalString() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalDecimal(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalDecimal() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalTime(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalTime() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalDuration() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vecEvalJSON(input *chunk.Chunk, result *chunk.Column) error {
+	return errors.Errorf("baseBuiltinFunc.vecEvalJSON() should never be called, please contact the TiDB team for help")
+}
+
 func (b *baseBuiltinFunc) evalInt(row chunk.Row) (int64, bool, error) {
-	panic("baseBuiltinFunc.evalInt() should never be called.")
+	return 0, false, errors.Errorf("baseBuiltinFunc.evalInt() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalReal(row chunk.Row) (float64, bool, error) {
-	panic("baseBuiltinFunc.evalReal() should never be called.")
+	return 0, false, errors.Errorf("baseBuiltinFunc.evalReal() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalString(row chunk.Row) (string, bool, error) {
-	panic("baseBuiltinFunc.evalString() should never be called.")
+	return "", false, errors.Errorf("baseBuiltinFunc.evalString() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
-	panic("baseBuiltinFunc.evalDecimal() should never be called.")
+	return nil, false, errors.Errorf("baseBuiltinFunc.evalDecimal() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalTime(row chunk.Row) (types.Time, bool, error) {
-	panic("baseBuiltinFunc.evalTime() should never be called.")
+	return types.Time{}, false, errors.Errorf("baseBuiltinFunc.evalTime() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalDuration(row chunk.Row) (types.Duration, bool, error) {
-	panic("baseBuiltinFunc.evalDuration() should never be called.")
+	return types.Duration{}, false, errors.Errorf("baseBuiltinFunc.evalDuration() should never be called, please contact the TiDB team for help")
 }
 
 func (b *baseBuiltinFunc) evalJSON(row chunk.Row) (json.BinaryJSON, bool, error) {
-	panic("baseBuiltinFunc.evalJSON() should never be called.")
+	return json.BinaryJSON{}, false, errors.Errorf("baseBuiltinFunc.evalJSON() should never be called, please contact the TiDB team for help")
+}
+
+func (b *baseBuiltinFunc) vectorized() bool {
+	return false
+}
+
+func (b *baseBuiltinFunc) isChildrenVectorized() bool {
+	b.childrenVectorizedOnce.Do(func() {
+		b.childrenVectorized = true
+		for _, arg := range b.args {
+			if !arg.Vectorized() {
+				b.childrenVectorized = false
+				break
+			}
+		}
+	})
+	return b.childrenVectorized
 }
 
 func (b *baseBuiltinFunc) getRetTp() *types.FieldType {
@@ -230,6 +297,8 @@ func (b *baseBuiltinFunc) cloneFrom(from *baseBuiltinFunc) {
 	b.ctx = from.ctx
 	b.tp = from.tp
 	b.pbCode = from.pbCode
+	b.bufAllocator = newLocalSliceBuffer(len(b.args))
+	b.childrenVectorizedOnce = new(sync.Once)
 }
 
 func (b *baseBuiltinFunc) Clone() builtinFunc {
@@ -244,6 +313,17 @@ type baseBuiltinCastFunc struct {
 	inUnion bool
 }
 
+// implicitArgs returns the implicit arguments of cast functions
+func (b *baseBuiltinCastFunc) implicitArgs() []types.Datum {
+	args := b.baseBuiltinFunc.implicitArgs()
+	if b.inUnion {
+		args = append(args, types.NewIntDatum(1))
+	} else {
+		args = append(args, types.NewIntDatum(0))
+	}
+	return args
+}
+
 func (b *baseBuiltinCastFunc) cloneFrom(from *baseBuiltinCastFunc) {
 	b.baseBuiltinFunc.cloneFrom(&from.baseBuiltinFunc)
 	b.inUnion = from.inUnion
@@ -256,8 +336,40 @@ func newBaseBuiltinCastFunc(builtinFunc baseBuiltinFunc, inUnion bool) baseBuilt
 	}
 }
 
+// vecBuiltinFunc contains all vectorized methods for a builtin function.
+type vecBuiltinFunc interface {
+	// vectorized returns if this builtin function itself supports vectorized evaluation.
+	vectorized() bool
+
+	// isChildrenVectorized returns if its all children support vectorized evaluation.
+	isChildrenVectorized() bool
+
+	// vecEvalInt evaluates this builtin function in a vectorized manner.
+	vecEvalInt(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalReal evaluates this builtin function in a vectorized manner.
+	vecEvalReal(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalString evaluates this builtin function in a vectorized manner.
+	vecEvalString(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalDecimal evaluates this builtin function in a vectorized manner.
+	vecEvalDecimal(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalTime evaluates this builtin function in a vectorized manner.
+	vecEvalTime(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalDuration evaluates this builtin function in a vectorized manner.
+	vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error
+
+	// vecEvalJSON evaluates this builtin function in a vectorized manner.
+	vecEvalJSON(input *chunk.Chunk, result *chunk.Column) error
+}
+
 // builtinFunc stands for a particular function signature.
 type builtinFunc interface {
+	vecBuiltinFunc
+
 	// evalInt evaluates int result of builtinFunc by given row.
 	evalInt(row chunk.Row) (val int64, isNull bool, err error)
 	// evalReal evaluates real representation of builtinFunc by given row.
@@ -284,6 +396,10 @@ type builtinFunc interface {
 	setPbCode(tipb.ScalarFuncSig)
 	// PbCode returns PbCode of this signature.
 	PbCode() tipb.ScalarFuncSig
+	// implicitArgs returns the implicit parameters of a function.
+	// implicit arguments means some functions contain extra inner fields which will not
+	// contain in `tipb.Expr.children` but must be pushed down to coprocessor
+	implicitArgs() []types.Datum
 	// Clone returns a copy of itself.
 	Clone() builtinFunc
 }
@@ -442,6 +558,7 @@ var funcs = map[string]functionClass{
 	ast.Mid:             &substringFunctionClass{baseFunctionClass{ast.Mid, 3, 3}},
 	ast.MakeSet:         &makeSetFunctionClass{baseFunctionClass{ast.MakeSet, 2, -1}},
 	ast.Oct:             &octFunctionClass{baseFunctionClass{ast.Oct, 1, 1}},
+	ast.OctetLength:     &lengthFunctionClass{baseFunctionClass{ast.OctetLength, 1, 1}},
 	ast.Ord:             &ordFunctionClass{baseFunctionClass{ast.Ord, 1, 1}},
 	ast.Position:        &locateFunctionClass{baseFunctionClass{ast.Position, 2, 2}},
 	ast.Quote:           &quoteFunctionClass{baseFunctionClass{ast.Quote, 1, 1}},
@@ -470,6 +587,7 @@ var funcs = map[string]functionClass{
 	// information functions
 	ast.ConnectionID: &connectionIDFunctionClass{baseFunctionClass{ast.ConnectionID, 0, 0}},
 	ast.CurrentUser:  &currentUserFunctionClass{baseFunctionClass{ast.CurrentUser, 0, 0}},
+	ast.CurrentRole:  &currentRoleFunctionClass{baseFunctionClass{ast.CurrentRole, 0, 0}},
 	ast.Database:     &databaseFunctionClass{baseFunctionClass{ast.Database, 0, 0}},
 	// This function is a synonym for DATABASE().
 	// See http://dev.mysql.com/doc/refman/5.7/en/information-functions.html#function_schema

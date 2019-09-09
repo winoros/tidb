@@ -15,6 +15,7 @@ package structure
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strconv"
 
@@ -55,7 +56,7 @@ func (t *TxStructure) HSet(key []byte, field []byte, value []byte) error {
 // HGet gets the value of a hash field.
 func (t *TxStructure) HGet(key []byte, field []byte) ([]byte, error) {
 	dataKey := t.encodeHashDataKey(key, field)
-	value, err := t.reader.Get(dataKey)
+	value, err := t.reader.Get(context.TODO(), dataKey)
 	if kv.ErrNotExist.Equal(err) {
 		err = nil
 	}
@@ -216,6 +217,23 @@ func (t *TxStructure) HGetAll(key []byte) ([]HashPair, error) {
 	return res, errors.Trace(err)
 }
 
+// HGetLastN gets latest N fields and values in hash.
+func (t *TxStructure) HGetLastN(key []byte, num int) ([]HashPair, error) {
+	res := make([]HashPair, 0, num)
+	err := t.iterReverseHash(key, func(field []byte, value []byte) (bool, error) {
+		pair := HashPair{
+			Field: append([]byte{}, field...),
+			Value: append([]byte{}, value...),
+		}
+		res = append(res, pair)
+		if len(res) >= num {
+			return false, nil
+		}
+		return true, nil
+	})
+	return res, errors.Trace(err)
+}
+
 // HClear removes the hash value of the key.
 func (t *TxStructure) HClear(key []byte) error {
 	metaKey := t.encodeHashMetaKey(key)
@@ -268,11 +286,43 @@ func (t *TxStructure) iterateHash(key []byte, fn func(k []byte, v []byte) error)
 	return nil
 }
 
+func (t *TxStructure) iterReverseHash(key []byte, fn func(k []byte, v []byte) (bool, error)) error {
+	dataPrefix := t.hashDataKeyPrefix(key)
+	it, err := t.reader.IterReverse(dataPrefix.PrefixNext())
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	var field []byte
+	for it.Valid() {
+		if !it.Key().HasPrefix(dataPrefix) {
+			break
+		}
+
+		_, field, err = t.decodeHashDataKey(it.Key())
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		more, err := fn(field, it.Value())
+		if !more || err != nil {
+			return errors.Trace(err)
+		}
+
+		err = it.Next()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
+}
+
 func (t *TxStructure) loadHashMeta(metaKey []byte) (hashMeta, error) {
-	v, err := t.reader.Get(metaKey)
+	v, err := t.reader.Get(context.TODO(), metaKey)
 	if kv.ErrNotExist.Equal(err) {
 		err = nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return hashMeta{}, errors.Trace(err)
 	}
 
@@ -290,11 +340,12 @@ func (t *TxStructure) loadHashMeta(metaKey []byte) (hashMeta, error) {
 }
 
 func (t *TxStructure) loadHashValue(dataKey []byte) ([]byte, error) {
-	v, err := t.reader.Get(dataKey)
+	v, err := t.reader.Get(context.TODO(), dataKey)
 	if kv.ErrNotExist.Equal(err) {
 		err = nil
 		v = nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return nil, errors.Trace(err)
 	}
 

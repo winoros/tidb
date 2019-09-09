@@ -19,12 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
-	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
@@ -35,7 +34,7 @@ import (
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 type DDLForTest interface {
@@ -83,7 +82,7 @@ func (d *ddl) restartWorkers(ctx context.Context) {
 		go util.WithRecovery(func() { w.start(d.ddlCtx) },
 			func(r interface{}) {
 				if r != nil {
-					log.Errorf("[ddl-%s] ddl %s meet panic", w, d.uuid)
+					log.Error("[ddl] restart DDL worker meet panic", zap.String("worker", w.String()), zap.String("ID", d.uuid))
 				}
 			})
 		asyncNotify(worker.ddlJobCh)
@@ -94,7 +93,7 @@ func TestT(t *testing.T) {
 	CustomVerboseFlag = true
 	*CustomParallelSuiteFlag = true
 	logLevel := os.Getenv("log_level")
-	logutil.InitLogger(logutil.NewLogConfig(logLevel, "highlight", "", logutil.EmptyFileLogConfig, false))
+	logutil.InitLogger(logutil.NewLogConfig(logLevel, "", "", logutil.EmptyFileLogConfig, false))
 	autoid.SetStep(5000)
 	ReorgWaitTimeout = 30 * time.Millisecond
 
@@ -113,11 +112,6 @@ func testNewContext(d *ddl) sessionctx.Context {
 	ctx := mock.NewContext()
 	ctx.Store = d.store
 	return ctx
-}
-
-func testNewDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
-	infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
-	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease, nil)
 }
 
 func getSchemaVer(c *C, ctx sessionctx.Context) int64 {

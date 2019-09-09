@@ -14,9 +14,12 @@
 package execdetails
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
 )
 
@@ -33,7 +36,18 @@ func TestString(t *testing.T) {
 			PrewriteTime:      time.Second,
 			CommitTime:        time.Second,
 			LocalLatchTime:    time.Second,
-			TotalBackoffTime:  time.Second,
+			CommitBackoffTime: int64(time.Second),
+			Mu: struct {
+				sync.Mutex
+				BackoffTypes []fmt.Stringer
+			}{BackoffTypes: []fmt.Stringer{
+				stringutil.MemoizeStr(func() string {
+					return "backoff1"
+				}),
+				stringutil.MemoizeStr(func() string {
+					return "backoff2"
+				}),
+			}},
 			ResolveLockTime:   1000000000, // 10^9 ns = 1s
 			WriteKeys:         1,
 			WriteSize:         1,
@@ -41,7 +55,8 @@ func TestString(t *testing.T) {
 			TxnRetry:          1,
 		},
 	}
-	expected := "process_time:2.005s wait_time:1s backoff_time:1s request_count:1 total_keys:100 processed_keys:10 prewrite_time:1s commit_time:1s get_commit_ts_time:1s total_backoff_time:1s resolve_lock_time:1s local_latch_wait_time:1s write_keys:1 write_size:1 prewrite_region:1 txn_retry:1"
+	expected := "Process_time: 2.005 Wait_time: 1 Backoff_time: 1 Request_count: 1 Total_keys: 100 Process_keys: 10 Prewrite_time: 1 Commit_time: 1 " +
+		"Get_commit_ts_time: 1 Commit_backoff_time: 1 Backoff_types: [backoff1 backoff2] Resolve_lock_time: 1 Local_latch_wait_time: 1 Write_keys: 1 Write_size: 1 Prewrite_region: 1 Txn_retry: 1"
 	if str := detail.String(); str != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", str, expected)
 	}
@@ -52,7 +67,8 @@ func TestString(t *testing.T) {
 }
 
 func mockExecutorExecutionSummary(TimeProcessedNs, NumProducedRows, NumIterations uint64) *tipb.ExecutorExecutionSummary {
-	return &tipb.ExecutorExecutionSummary{&TimeProcessedNs, &NumProducedRows, &NumIterations, nil}
+	return &tipb.ExecutorExecutionSummary{TimeProcessedNs: &TimeProcessedNs, NumProducedRows: &NumProducedRows,
+		NumIterations: &NumIterations, XXX_unrecognized: nil}
 }
 
 func TestCopRuntimeStats(t *testing.T) {
@@ -64,10 +80,28 @@ func TestCopRuntimeStats(t *testing.T) {
 	if stats.ExistsCopStats("table_scan") != true {
 		t.Fatal("exist")
 	}
-	if stats.GetCopStats("table_scan").String() != "proc max:2ns, min:1ns, p80:2ns, p95:2ns, rows:3, iters:3, tasks:2" {
+	cop := stats.GetCopStats("table_scan")
+	if cop.String() != "proc max:2ns, min:1ns, p80:2ns, p95:2ns, rows:3, iters:3, tasks:2" {
 		t.Fatal("table_scan")
 	}
+	copStats := cop.stats["8.8.8.8"]
+	if copStats == nil {
+		t.Fatal("cop stats is nil")
+	}
+	copStats[0].SetRowNum(10)
+	copStats[0].Record(time.Second, 10)
+	if copStats[0].String() != "time:1.000000001s, loops:2, rows:20" {
+		t.Fatalf("cop stats string is not expect, got: %v", copStats[0].String())
+	}
+
 	if stats.GetCopStats("agg").String() != "proc max:4ns, min:3ns, p80:4ns, p95:4ns, rows:7, iters:7, tasks:2" {
 		t.Fatal("agg")
+	}
+	rootStats := stats.GetRootStats("table_reader")
+	if rootStats == nil {
+		t.Fatal("table_reader")
+	}
+	if stats.ExistsRootStats("table_reader") == false {
+		t.Fatal("table_reader not exists")
 	}
 }

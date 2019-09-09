@@ -15,7 +15,6 @@ package mocktikv
 
 import (
 	"math"
-	"strings"
 	"testing"
 
 	. "github.com/pingcap/check"
@@ -40,6 +39,7 @@ type testMVCCLevelDB struct {
 }
 
 var (
+	_ = Suite(&testMockTiKVSuite{})
 	_ = Suite(&testMVCCLevelDB{})
 	_ = Suite(testMarshal{})
 )
@@ -95,7 +95,12 @@ func (s *testMockTiKVSuite) mustGetRC(c *C, key string, ts uint64, expect string
 }
 
 func (s *testMockTiKVSuite) mustPutOK(c *C, key, value string, startTS, commitTS uint64) {
-	errs := s.store.Prewrite(putMutations(key, value), []byte(key), startTS, 0)
+	req := &kvrpcpb.PrewriteRequest{
+		Mutations:    putMutations(key, value),
+		PrimaryLock:  []byte(key),
+		StartVersion: startTS,
+	}
+	errs := s.store.Prewrite(req)
 	for _, err := range errs {
 		c.Assert(err, IsNil)
 	}
@@ -110,7 +115,12 @@ func (s *testMockTiKVSuite) mustDeleteOK(c *C, key string, startTS, commitTS uin
 			Key: []byte(key),
 		},
 	}
-	errs := s.store.Prewrite(mutations, []byte(key), startTS, 0)
+	req := &kvrpcpb.PrewriteRequest{
+		Mutations:    mutations,
+		PrimaryLock:  []byte(key),
+		StartVersion: startTS,
+	}
+	errs := s.store.Prewrite(req)
 	for _, err := range errs {
 		c.Assert(err, IsNil)
 	}
@@ -147,7 +157,16 @@ func (s *testMockTiKVSuite) mustRangeReverseScanOK(c *C, start, end string, limi
 }
 
 func (s *testMockTiKVSuite) mustPrewriteOK(c *C, mutations []*kvrpcpb.Mutation, primary string, startTS uint64) {
-	errs := s.store.Prewrite(mutations, []byte(primary), startTS, 0)
+	s.mustPrewriteWithTTLOK(c, mutations, primary, startTS, 0)
+}
+
+func (s *testMockTiKVSuite) mustPrewriteWithTTLOK(c *C, mutations []*kvrpcpb.Mutation, primary string, startTS uint64, ttl uint64) {
+	req := &kvrpcpb.PrewriteRequest{
+		Mutations:    mutations,
+		PrimaryLock:  []byte(primary),
+		StartVersion: startTS,
+	}
+	errs := s.store.Prewrite(req)
 	for _, err := range errs {
 		c.Assert(err, IsNil)
 	}
@@ -185,6 +204,10 @@ func (s *testMockTiKVSuite) mustResolveLock(c *C, startTS, commitTS uint64) {
 
 func (s *testMockTiKVSuite) mustBatchResolveLock(c *C, txnInfos map[uint64]uint64) {
 	c.Assert(s.store.BatchResolveLock(nil, nil, txnInfos), IsNil)
+}
+
+func (s *testMockTiKVSuite) mustGC(c *C, safePoint uint64) {
+	c.Assert(s.store.GC(nil, nil, safePoint), IsNil)
 }
 
 func (s *testMockTiKVSuite) mustDeleteRange(c *C, startKey, endKey string) {
@@ -413,7 +436,12 @@ func (s *testMockTiKVSuite) TestCommitConflict(c *C) {
 	// A prewrite.
 	s.mustPrewriteOK(c, putMutations("x", "A"), "x", 5)
 	// B prewrite and find A's lock.
-	errs := s.store.Prewrite(putMutations("x", "B"), []byte("x"), 10, 0)
+	req := &kvrpcpb.PrewriteRequest{
+		Mutations:    putMutations("x", "B"),
+		PrimaryLock:  []byte("x"),
+		StartVersion: 10,
+	}
+	errs := s.store.Prewrite(req)
 	c.Assert(errs[0], NotNil)
 	// B find rollback A because A exist too long.
 	s.mustRollbackOK(c, [][]byte{[]byte("x")}, 5)
@@ -469,10 +497,59 @@ func (s *testMockTiKVSuite) TestBatchResolveLock(c *C) {
 	s.mustScanLock(c, 30, nil)
 }
 
+func (s *testMockTiKVSuite) TestGC(c *C) {
+	var safePoint uint64 = 100
+
+	// Prepare data
+	s.mustPutOK(c, "k1", "v1", 1, 2)
+	s.mustPutOK(c, "k1", "v2", 11, 12)
+
+	s.mustPutOK(c, "k2", "v1", 1, 2)
+	s.mustPutOK(c, "k2", "v2", 11, 12)
+	s.mustPutOK(c, "k2", "v3", 101, 102)
+
+	s.mustPutOK(c, "k3", "v1", 1, 2)
+	s.mustPutOK(c, "k3", "v2", 11, 12)
+	s.mustDeleteOK(c, "k3", 101, 102)
+
+	s.mustPutOK(c, "k4", "v1", 1, 2)
+	s.mustDeleteOK(c, "k4", 11, 12)
+
+	// Check prepared data
+	s.mustGetOK(c, "k1", 5, "v1")
+	s.mustGetOK(c, "k1", 15, "v2")
+	s.mustGetOK(c, "k2", 5, "v1")
+	s.mustGetOK(c, "k2", 15, "v2")
+	s.mustGetOK(c, "k2", 105, "v3")
+	s.mustGetOK(c, "k3", 5, "v1")
+	s.mustGetOK(c, "k3", 15, "v2")
+	s.mustGetNone(c, "k3", 105)
+	s.mustGetOK(c, "k4", 5, "v1")
+	s.mustGetNone(c, "k4", 105)
+
+	s.mustGC(c, safePoint)
+
+	s.mustGetNone(c, "k1", 5)
+	s.mustGetOK(c, "k1", 15, "v2")
+	s.mustGetNone(c, "k2", 5)
+	s.mustGetOK(c, "k2", 15, "v2")
+	s.mustGetOK(c, "k2", 105, "v3")
+	s.mustGetNone(c, "k3", 5)
+	s.mustGetOK(c, "k3", 15, "v2")
+	s.mustGetNone(c, "k3", 105)
+	s.mustGetNone(c, "k4", 5)
+	s.mustGetNone(c, "k4", 105)
+}
+
 func (s *testMockTiKVSuite) TestRollbackAndWriteConflict(c *C) {
 	s.mustPutOK(c, "test", "test", 1, 3)
-
-	errs := s.store.Prewrite(putMutations("lock", "lock", "test", "test1"), []byte("test"), 2, 2)
+	req := &kvrpcpb.PrewriteRequest{
+		Mutations:    putMutations("lock", "lock", "test", "test1"),
+		PrimaryLock:  []byte("test"),
+		StartVersion: 2,
+		LockTtl:      2,
+	}
+	errs := s.store.Prewrite(req)
 	s.mustWriteWriteConflict(c, errs, 1)
 
 	s.mustPutOK(c, "test", "test2", 5, 8)
@@ -480,8 +557,13 @@ func (s *testMockTiKVSuite) TestRollbackAndWriteConflict(c *C) {
 	// simulate `getTxnStatus` for txn 2.
 	err := s.store.Cleanup([]byte("test"), 2)
 	c.Assert(err, IsNil)
-
-	errs = s.store.Prewrite(putMutations("test", "test3"), []byte("test"), 6, 1)
+	req = &kvrpcpb.PrewriteRequest{
+		Mutations:    putMutations("test", "test3"),
+		PrimaryLock:  []byte("test"),
+		StartVersion: 6,
+		LockTtl:      1,
+	}
+	errs = s.store.Prewrite(req)
 	s.mustWriteWriteConflict(c, errs, 0)
 }
 
@@ -512,7 +594,8 @@ func (s *testMockTiKVSuite) TestDeleteRange(c *C) {
 
 func (s *testMockTiKVSuite) mustWriteWriteConflict(c *C, errs []error, i int) {
 	c.Assert(errs[i], NotNil)
-	c.Assert(strings.Contains(errs[i].Error(), "write conflict"), IsTrue)
+	_, ok := errs[i].(*ErrConflict)
+	c.Assert(ok, IsTrue)
 }
 
 func (s *testMockTiKVSuite) TestRC(c *C) {
@@ -563,4 +646,46 @@ func (s testMarshal) TestMarshalmvccValue(c *C) {
 	c.Assert(v.startTS, Equals, v1.startTS)
 	c.Assert(v.commitTS, Equals, v1.commitTS)
 	c.Assert(string(v.value), Equals, string(v.value))
+}
+
+func (s *testMVCCLevelDB) TestErrors(c *C) {
+	c.Assert((&ErrKeyAlreadyExist{}).Error(), Equals, `key already exist, key: ""`)
+	c.Assert(ErrAbort("txn").Error(), Equals, "abort: txn")
+	c.Assert(ErrAlreadyCommitted(0).Error(), Equals, "txn already committed")
+	c.Assert((&ErrConflict{}).Error(), Equals, "write conflict")
+}
+
+func (s *testMVCCLevelDB) TestMvccGetByKey(c *C) {
+	s.mustPrewriteOK(c, putMutations("q1", "v5"), "p1", 5)
+	debugger, ok := s.store.(MVCCDebugger)
+	c.Assert(ok, IsTrue)
+	mvccInfo := debugger.MvccGetByKey([]byte("q1"))
+	except := &kvrpcpb.MvccInfo{
+		Lock: &kvrpcpb.MvccLock{
+			Type:       kvrpcpb.Op_Put,
+			StartTs:    5,
+			Primary:    []byte("p1"),
+			ShortValue: []byte("v5"),
+		},
+	}
+	c.Assert(mvccInfo, DeepEquals, except)
+}
+
+func (s *testMVCCLevelDB) TestTxnHeartBeat(c *C) {
+	s.mustPrewriteWithTTLOK(c, putMutations("pk", "val"), "pk", 5, 666)
+
+	// Update the ttl
+	ttl, err := s.store.TxnHeartBeat([]byte("pk"), 5, 888)
+	c.Assert(err, IsNil)
+	c.Assert(ttl, Greater, uint64(666))
+
+	// Advise ttl is small
+	ttl, err = s.store.TxnHeartBeat([]byte("pk"), 5, 300)
+	c.Assert(err, IsNil)
+	c.Assert(ttl, Greater, uint64(300))
+
+	// The lock has already been clean up
+	c.Assert(s.store.Cleanup([]byte("pk"), 5), IsNil)
+	_, err = s.store.TxnHeartBeat([]byte("pk"), 5, 1000)
+	c.Assert(err, NotNil)
 }

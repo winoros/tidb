@@ -15,10 +15,8 @@ package executor
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/infoschema"
@@ -26,7 +24,21 @@ import (
 	"github.com/pingcap/tidb/planner"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
+)
+
+var (
+	stmtNodeCounterUse      = metrics.StmtNodeCounter.WithLabelValues("Use")
+	stmtNodeCounterShow     = metrics.StmtNodeCounter.WithLabelValues("Show")
+	stmtNodeCounterBegin    = metrics.StmtNodeCounter.WithLabelValues("Begin")
+	stmtNodeCounterCommit   = metrics.StmtNodeCounter.WithLabelValues("Commit")
+	stmtNodeCounterRollback = metrics.StmtNodeCounter.WithLabelValues("Rollback")
+	stmtNodeCounterInsert   = metrics.StmtNodeCounter.WithLabelValues("Insert")
+	stmtNodeCounterReplace  = metrics.StmtNodeCounter.WithLabelValues("Replace")
+	stmtNodeCounterDelete   = metrics.StmtNodeCounter.WithLabelValues("Delete")
+	stmtNodeCounterUpdate   = metrics.StmtNodeCounter.WithLabelValues("Update")
+	stmtNodeCounterSelect   = metrics.StmtNodeCounter.WithLabelValues("Select")
 )
 
 // Compiler compiles an ast.StmtNode to a physical plan.
@@ -39,77 +51,68 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (*ExecStm
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("executor.Compile", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
 	infoSchema := GetInfoSchema(c.Ctx)
-	if err := plannercore.Preprocess(c.Ctx, stmtNode, infoSchema, false); err != nil {
-		return nil, errors.Trace(err)
+	if err := plannercore.Preprocess(c.Ctx, stmtNode, infoSchema); err != nil {
+		return nil, err
 	}
 
-	finalPlan, err := planner.Optimize(c.Ctx, stmtNode, infoSchema)
+	finalPlan, err := planner.Optimize(ctx, c.Ctx, stmtNode, infoSchema)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	CountStmtNode(stmtNode, c.Ctx.GetSessionVars().InRestrictedSQL)
-	isExpensive := logExpensiveQuery(stmtNode, finalPlan)
-
+	lowerPriority := needLowerPriority(finalPlan)
 	return &ExecStmt{
-		InfoSchema: infoSchema,
-		Plan:       finalPlan,
-		Expensive:  isExpensive,
-		Cacheable:  plannercore.Cacheable(stmtNode),
-		Text:       stmtNode.Text(),
-		StmtNode:   stmtNode,
-		Ctx:        c.Ctx,
+		InfoSchema:    infoSchema,
+		Plan:          finalPlan,
+		LowerPriority: lowerPriority,
+		Cacheable:     plannercore.Cacheable(stmtNode),
+		Text:          stmtNode.Text(),
+		StmtNode:      stmtNode,
+		Ctx:           c.Ctx,
+		outputNames:   finalPlan.OutputNames(),
 	}, nil
 }
 
-func logExpensiveQuery(stmtNode ast.StmtNode, finalPlan plannercore.Plan) (expensive bool) {
-	expensive = isExpensiveQuery(finalPlan)
-	if !expensive {
-		return
-	}
-
-	const logSQLLen = 1024
-	sql := stmtNode.Text()
-	if len(sql) > logSQLLen {
-		sql = fmt.Sprintf("%s len(%d)", sql[:logSQLLen], len(sql))
-	}
-	log.Warnf("[EXPENSIVE_QUERY] %s", sql)
-	return
-}
-
-func isExpensiveQuery(p plannercore.Plan) bool {
+// needLowerPriority checks whether it's needed to lower the execution priority
+// of a query.
+// If the estimated output row count of any operator in the physical plan tree
+// is greater than the specific threshold, we'll set it to lowPriority when
+// sending it to the coprocessor.
+func needLowerPriority(p plannercore.Plan) bool {
 	switch x := p.(type) {
 	case plannercore.PhysicalPlan:
-		return isPhysicalPlanExpensive(x)
+		return isPhysicalPlanNeedLowerPriority(x)
 	case *plannercore.Execute:
-		return isExpensiveQuery(x.Plan)
+		return needLowerPriority(x.Plan)
 	case *plannercore.Insert:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	case *plannercore.Delete:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	case *plannercore.Update:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	}
 	return false
 }
 
-func isPhysicalPlanExpensive(p plannercore.PhysicalPlan) bool {
-	expensiveRowThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
-	if int64(p.StatsCount()) > expensiveRowThreshold {
+func isPhysicalPlanNeedLowerPriority(p plannercore.PhysicalPlan) bool {
+	expensiveThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
+	if int64(p.StatsCount()) > expensiveThreshold {
 		return true
 	}
 
 	for _, child := range p.Children() {
-		if isPhysicalPlanExpensive(child) {
+		if isPhysicalPlanNeedLowerPriority(child) {
 			return true
 		}
 	}
@@ -124,7 +127,30 @@ func CountStmtNode(stmtNode ast.StmtNode, inRestrictedSQL bool) {
 	}
 
 	typeLabel := GetStmtLabel(stmtNode)
-	metrics.StmtNodeCounter.WithLabelValues(typeLabel).Inc()
+	switch typeLabel {
+	case "Use":
+		stmtNodeCounterUse.Inc()
+	case "Show":
+		stmtNodeCounterShow.Inc()
+	case "Begin":
+		stmtNodeCounterBegin.Inc()
+	case "Commit":
+		stmtNodeCounterCommit.Inc()
+	case "Rollback":
+		stmtNodeCounterRollback.Inc()
+	case "Insert":
+		stmtNodeCounterInsert.Inc()
+	case "Replace":
+		stmtNodeCounterReplace.Inc()
+	case "Delete":
+		stmtNodeCounterDelete.Inc()
+	case "Update":
+		stmtNodeCounterUpdate.Inc()
+	case "Select":
+		stmtNodeCounterSelect.Inc()
+	default:
+		metrics.StmtNodeCounter.WithLabelValues(typeLabel).Inc()
+	}
 
 	if !config.GetGlobalConfig().Status.RecordQPSbyDB {
 		return
@@ -188,6 +214,22 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 				dbLabelSet[db] = struct{}{}
 			}
 		}
+	case *ast.CreateBindingStmt:
+		if x.OriginSel != nil {
+			originSelect := x.OriginSel.(*ast.SelectStmt)
+			dbLabels := getDbFromResultNode(originSelect.From.TableRefs)
+			for _, db := range dbLabels {
+				dbLabelSet[db] = struct{}{}
+			}
+		}
+
+		if len(dbLabelSet) == 0 && x.HintedSel != nil {
+			hintedSelect := x.HintedSel.(*ast.SelectStmt)
+			dbLabels := getDbFromResultNode(hintedSelect.From.TableRefs)
+			for _, db := range dbLabels {
+				dbLabelSet[db] = struct{}{}
+			}
+		}
 	}
 
 	return dbLabelSet
@@ -241,6 +283,8 @@ func GetStmtLabel(stmtNode ast.StmtNode) string {
 		return "AnalyzeTable"
 	case *ast.BeginStmt:
 		return "Begin"
+	case *ast.ChangeStmt:
+		return "Change"
 	case *ast.CommitStmt:
 		return "Commit"
 	case *ast.CreateDatabaseStmt:
@@ -294,6 +338,8 @@ func GetStmtLabel(stmtNode ast.StmtNode) string {
 		return "Prepare"
 	case *ast.UseStmt:
 		return "Use"
+	case *ast.CreateBindingStmt:
+		return "CreateBinding"
 	}
 	return "other"
 }
@@ -305,7 +351,7 @@ func GetInfoSchema(ctx sessionctx.Context) infoschema.InfoSchema {
 	var is infoschema.InfoSchema
 	if snap := sessVar.SnapshotInfoschema; snap != nil {
 		is = snap.(infoschema.InfoSchema)
-		log.Infof("con:%d use snapshot schema %d", sessVar.ConnectionID, is.SchemaMetaVersion())
+		logutil.BgLogger().Info("use snapshot schema", zap.Uint64("conn", sessVar.ConnectionID), zap.Int64("schemaVersion", is.SchemaMetaVersion()))
 	} else {
 		is = sessVar.TxnCtx.InfoSchema.(infoschema.InfoSchema)
 	}

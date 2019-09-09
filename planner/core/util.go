@@ -16,6 +16,7 @@ package core
 import (
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/types"
 )
 
 // AggregateFuncExtractor visits Expr tree.
@@ -43,6 +44,31 @@ func (a *AggregateFuncExtractor) Leave(n ast.Node) (ast.Node, bool) {
 	case *ast.AggregateFuncExpr:
 		a.inAggregateFuncExpr = false
 		a.AggFuncs = append(a.AggFuncs, v)
+	}
+	return n, true
+}
+
+// WindowFuncExtractor visits Expr tree.
+// It converts ColunmNameExpr to WindowFuncExpr and collects WindowFuncExpr.
+type WindowFuncExtractor struct {
+	// WindowFuncs is the collected WindowFuncExprs.
+	windowFuncs []*ast.WindowFuncExpr
+}
+
+// Enter implements Visitor interface.
+func (a *WindowFuncExtractor) Enter(n ast.Node) (ast.Node, bool) {
+	switch n.(type) {
+	case *ast.SelectStmt, *ast.UnionStmt:
+		return n, true
+	}
+	return n, false
+}
+
+// Leave implements Visitor interface.
+func (a *WindowFuncExtractor) Leave(n ast.Node) (ast.Node, bool) {
+	switch v := n.(type) {
+	case *ast.WindowFuncExpr:
+		a.windowFuncs = append(a.windowFuncs, v)
 	}
 	return n, true
 }
@@ -88,7 +114,13 @@ func (s *physicalSchemaProducer) SetSchema(schema *expression.Schema) {
 // baseSchemaProducer stores the schema for the base plans who can produce schema directly.
 type baseSchemaProducer struct {
 	schema *expression.Schema
+	names  []*types.FieldName
 	basePlan
+}
+
+// OutputNames returns the outputting names of each column.
+func (s *baseSchemaProducer) OutputNames() []*types.FieldName {
+	return s.names
 }
 
 // Schema implements the Plan.Schema interface.
@@ -126,4 +158,28 @@ func buildPhysicalJoinSchema(joinType JoinType, join PhysicalPlan) *expression.S
 		return newSchema
 	}
 	return expression.MergeSchema(join.Children()[0].Schema(), join.Children()[1].Schema())
+}
+
+// GetStatsInfo gets the statistics info from a physical plan tree.
+func GetStatsInfo(i interface{}) map[string]uint64 {
+	p := i.(Plan)
+	var physicalPlan PhysicalPlan
+	switch x := p.(type) {
+	case *Insert:
+		physicalPlan = x.SelectPlan
+	case *Update:
+		physicalPlan = x.SelectPlan
+	case *Delete:
+		physicalPlan = x.SelectPlan
+	case PhysicalPlan:
+		physicalPlan = x
+	}
+
+	if physicalPlan == nil {
+		return nil
+	}
+
+	statsInfos := make(map[string]uint64)
+	statsInfos = CollectPlanStatsVersion(physicalPlan, statsInfos)
+	return statsInfos
 }

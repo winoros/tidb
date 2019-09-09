@@ -15,13 +15,17 @@ package logutil
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/opentracing/opentracing-go"
+	tlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pingcap/errors"
 	zaplog "github.com/pingcap/log"
 	log "github.com/sirupsen/logrus"
@@ -129,30 +133,9 @@ func stringToLogLevel(level string) log.Level {
 	return defaultLogLevel
 }
 
-// logTypeToColor converts the Level to a color string.
-func logTypeToColor(level log.Level) string {
-	switch level {
-	case log.DebugLevel:
-		return "[0;37"
-	case log.InfoLevel:
-		return "[0;36"
-	case log.WarnLevel:
-		return "[0;33"
-	case log.ErrorLevel:
-		return "[0;31"
-	case log.FatalLevel:
-		return "[0;31"
-	case log.PanicLevel:
-		return "[0;31"
-	}
-
-	return "[0;37"
-}
-
 // textFormatter is for compatibility with ngaut/log
 type textFormatter struct {
 	DisableTimestamp bool
-	EnableColors     bool
 	EnableEntryOrder bool
 }
 
@@ -163,11 +146,6 @@ func (f *textFormatter) Format(entry *log.Entry) ([]byte, error) {
 		b = entry.Buffer
 	} else {
 		b = &bytes.Buffer{}
-	}
-
-	if f.EnableColors {
-		colorStr := logTypeToColor(entry.Level)
-		fmt.Fprintf(b, "\033%sm ", colorStr)
 	}
 
 	if !f.DisableTimestamp {
@@ -199,9 +177,28 @@ func (f *textFormatter) Format(entry *log.Entry) ([]byte, error) {
 
 	b.WriteByte('\n')
 
-	if f.EnableColors {
-		b.WriteString("\033[0m")
+	return b.Bytes(), nil
+}
+
+const (
+	// SlowLogTimeFormat is the time format for slow log.
+	SlowLogTimeFormat = time.RFC3339Nano
+	// OldSlowLogTimeFormat is the first version of the the time format for slow log, This is use for compatibility.
+	OldSlowLogTimeFormat = "2006-01-02-15:04:05.999999999 -0700"
+)
+
+type slowLogFormatter struct{}
+
+func (f *slowLogFormatter) Format(entry *log.Entry) ([]byte, error) {
+	var b *bytes.Buffer
+	if entry.Buffer != nil {
+		b = entry.Buffer
+	} else {
+		b = &bytes.Buffer{}
 	}
+
+	fmt.Fprintf(b, "# Time: %s\n", entry.Time.Format(SlowLogTimeFormat))
+	fmt.Fprintf(b, "%s\n", entry.Message)
 	return b.Bytes(), nil
 }
 
@@ -210,22 +207,6 @@ func stringToLogFormatter(format string, disableTimestamp bool) log.Formatter {
 	case "text":
 		return &textFormatter{
 			DisableTimestamp: disableTimestamp,
-		}
-	case "json":
-		return &log.JSONFormatter{
-			TimestampFormat:  defaultLogTimeFormat,
-			DisableTimestamp: disableTimestamp,
-		}
-	case "console":
-		return &log.TextFormatter{
-			FullTimestamp:    true,
-			TimestampFormat:  defaultLogTimeFormat,
-			DisableTimestamp: disableTimestamp,
-		}
-	case "highlight":
-		return &textFormatter{
-			DisableTimestamp: disableTimestamp,
-			EnableColors:     true,
 		}
 	default:
 		return &textFormatter{}
@@ -263,8 +244,8 @@ func initFileLog(cfg *zaplog.FileLogConfig, logger *log.Logger) error {
 // SlowQueryLogger is used to log slow query, InitLogger will modify it according to config file.
 var SlowQueryLogger = log.StandardLogger()
 
-// SlowQueryZapLogger is used to log slow query, InitZapLogger will set it according to config file.
-var SlowQueryZapLogger *zap.Logger
+// SlowQueryZapLogger is used to log slow query, InitZapLogger will modify it according to config file.
+var SlowQueryZapLogger = zaplog.L()
 
 // InitLogger initializes PD's logger.
 func InitLogger(cfg *LogConfig) error {
@@ -290,15 +271,7 @@ func InitLogger(cfg *LogConfig) error {
 		if err := initFileLog(&tmp, SlowQueryLogger); err != nil {
 			return errors.Trace(err)
 		}
-		hooks := make(log.LevelHooks)
-		hooks.Add(&contextHook{})
-		SlowQueryLogger.Hooks = hooks
-		slowQueryFormatter := stringToLogFormatter(cfg.Format, cfg.DisableTimestamp)
-		ft, ok := slowQueryFormatter.(*textFormatter)
-		if ok {
-			ft.EnableEntryOrder = true
-		}
-		SlowQueryLogger.Formatter = slowQueryFormatter
+		SlowQueryLogger.Formatter = &slowLogFormatter{}
 	}
 
 	return nil
@@ -344,4 +317,68 @@ func SetLevel(level string) error {
 	}
 	zaplog.SetLevel(l.Level())
 	return nil
+}
+
+type ctxLogKeyType struct{}
+
+var ctxLogKey = ctxLogKeyType{}
+
+// Logger gets a contextual logger from current context.
+// contextual logger will output common fields from context.
+func Logger(ctx context.Context) *zap.Logger {
+	if ctxlogger, ok := ctx.Value(ctxLogKey).(*zap.Logger); ok {
+		return ctxlogger
+	}
+	return zaplog.L()
+}
+
+// BgLogger is alias of `logutil.BgLogger()`
+func BgLogger() *zap.Logger {
+	return zaplog.L()
+}
+
+// WithConnID attaches connId to context.
+func WithConnID(ctx context.Context, connID uint32) context.Context {
+	var logger *zap.Logger
+	if ctxLogger, ok := ctx.Value(ctxLogKey).(*zap.Logger); ok {
+		logger = ctxLogger
+	} else {
+		logger = zaplog.L()
+	}
+	return context.WithValue(ctx, ctxLogKey, logger.With(zap.Uint32("conn", connID)))
+}
+
+// WithKeyValue attaches key/value to context.
+func WithKeyValue(ctx context.Context, key, value string) context.Context {
+	var logger *zap.Logger
+	if ctxLogger, ok := ctx.Value(ctxLogKey).(*zap.Logger); ok {
+		logger = ctxLogger
+	} else {
+		logger = zaplog.L()
+	}
+	return context.WithValue(ctx, ctxLogKey, logger.With(zap.String(key, value)))
+}
+
+// TraceEventKey presents the TraceEventKey in span log.
+const TraceEventKey = "event"
+
+// Event records event in current tracing span.
+func Event(ctx context.Context, event string) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span.LogFields(tlog.String(TraceEventKey, event))
+	}
+}
+
+// Eventf records event in current tracing span with format support.
+func Eventf(ctx context.Context, format string, args ...interface{}) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span.LogFields(tlog.String(TraceEventKey, fmt.Sprintf(format, args...)))
+	}
+}
+
+// SetTag sets tag kv-pair in current tracing span
+func SetTag(ctx context.Context, key string, value interface{}) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span.SetTag(key, value)
+	}
 }

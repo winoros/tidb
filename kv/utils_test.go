@@ -14,6 +14,8 @@
 package kv
 
 import (
+	"context"
+
 	. "github.com/pingcap/check"
 )
 
@@ -32,7 +34,8 @@ func (s testUtilsSuite) TestIncInt64(c *C) {
 	c.Check(err, IsNil)
 	c.Check(v, Equals, int64(11))
 
-	mb.Set(key, []byte("not int"))
+	err = mb.Set(key, []byte("not int"))
+	c.Check(err, IsNil)
 	_, err = IncInt64(mb, key, 1)
 	c.Check(err, NotNil)
 }
@@ -40,13 +43,13 @@ func (s testUtilsSuite) TestIncInt64(c *C) {
 func (s testUtilsSuite) TestGetInt64(c *C) {
 	mb := NewMemDbBuffer(DefaultTxnMembufCap)
 	key := Key("key")
-	v, err := GetInt64(mb, key)
+	v, err := GetInt64(context.TODO(), mb, key)
 	c.Check(v, Equals, int64(0))
 	c.Check(err, IsNil)
 
 	_, err = IncInt64(mb, key, 15)
 	c.Check(err, IsNil)
-	v, err = GetInt64(mb, key)
+	v, err = GetInt64(context.TODO(), mb, key)
 	c.Check(v, Equals, int64(15))
 	c.Check(err, IsNil)
 }

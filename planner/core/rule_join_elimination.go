@@ -14,9 +14,11 @@
 package core
 
 import (
+	"context"
+
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/set"
 )
 
 type outerJoinEliminator struct {
@@ -29,7 +31,7 @@ type outerJoinEliminator struct {
 // 2. outer join elimination with duplicate agnostic aggregate functions: For example left outer join.
 //    If the parent only use the columns from left table with 'distinct' label. The left outer join can
 //    be eliminated.
-func (o *outerJoinEliminator) tryToEliminateOuterJoin(p *LogicalJoin, aggCols []*expression.Column, parentSchema *expression.Schema) LogicalPlan {
+func (o *outerJoinEliminator) tryToEliminateOuterJoin(p *LogicalJoin, aggCols []*expression.Column, parentCols []*expression.Column) (LogicalPlan, bool, error) {
 	var innerChildIdx int
 	switch p.JoinType {
 	case LeftOuterJoin:
@@ -37,61 +39,63 @@ func (o *outerJoinEliminator) tryToEliminateOuterJoin(p *LogicalJoin, aggCols []
 	case RightOuterJoin:
 		innerChildIdx = 0
 	default:
-		return p
+		return p, false, nil
 	}
 
 	outerPlan := p.children[1^innerChildIdx]
 	innerPlan := p.children[innerChildIdx]
+	outerUniqueIDs := set.NewInt64Set()
+	for _, outerCol := range outerPlan.Schema().Columns {
+		outerUniqueIDs.Insert(outerCol.UniqueID)
+	}
+	matched := o.isColsAllFromOuterTable(parentCols, outerUniqueIDs)
+	if !matched {
+		return p, false, nil
+	}
 	// outer join elimination with duplicate agnostic aggregate functions
-	if o.isAggColsAllFromOuterTable(outerPlan, aggCols) {
-		return outerPlan
+	matched = o.isColsAllFromOuterTable(aggCols, outerUniqueIDs)
+	if matched {
+		return outerPlan, true, nil
 	}
 	// outer join elimination without duplicate agnostic aggregate functions
-	if !o.isParentColsAllFromOuterTable(outerPlan, parentSchema) {
-		return p
-	}
 	innerJoinKeys := o.extractInnerJoinKeys(p, innerChildIdx)
-	if o.isInnerJoinKeysContainUniqueKey(innerPlan, innerJoinKeys) {
-		return outerPlan
+	contain, err := o.isInnerJoinKeysContainUniqueKey(innerPlan, innerJoinKeys)
+	if err != nil {
+		return p, false, err
 	}
-	if o.isInnerJoinKeysContainIndex(innerPlan, innerJoinKeys) {
-		return outerPlan
+	if contain {
+		return outerPlan, true, nil
 	}
-	return p
+	contain, err = o.isInnerJoinKeysContainIndex(innerPlan, innerJoinKeys)
+	if err != nil {
+		return p, false, err
+	}
+	if contain {
+		return outerPlan, true, nil
+	}
+
+	return p, false, nil
 }
 
 // extract join keys as a schema for inner child of a outer join
 func (o *outerJoinEliminator) extractInnerJoinKeys(join *LogicalJoin, innerChildIdx int) *expression.Schema {
-	var joinKeys []*expression.Column
+	joinKeys := make([]*expression.Column, 0, len(join.EqualConditions))
 	for _, eqCond := range join.EqualConditions {
 		joinKeys = append(joinKeys, eqCond.GetArgs()[innerChildIdx].(*expression.Column))
 	}
 	return expression.NewSchema(joinKeys...)
 }
 
-func (o *outerJoinEliminator) isAggColsAllFromOuterTable(outerPlan LogicalPlan, aggCols []*expression.Column) bool {
-	if len(aggCols) == 0 {
+// check whether the cols all from outer plan
+func (o *outerJoinEliminator) isColsAllFromOuterTable(cols []*expression.Column, outerUniqueIDs set.Int64Set) bool {
+	// There are two cases "return false" here:
+	// 1. If cols represents aggCols, then "len(cols) == 0" means not all aggregate functions are duplicate agnostic before.
+	// 2. If cols represents parentCols, then "len(cols) == 0" means no parent logical plan of this join plan.
+	if len(cols) == 0 {
 		return false
 	}
-	for _, col := range aggCols {
-		columnName := &ast.ColumnName{Schema: col.DBName, Table: col.TblName, Name: col.ColName}
-		if c, err := outerPlan.Schema().FindColumn(columnName); c == nil {
-			log.Warn(err)
-			return false
-		}
-	}
-	return true
-}
-
-// check whether schema cols of join's parent plan are all from outer join table
-func (o *outerJoinEliminator) isParentColsAllFromOuterTable(outerPlan LogicalPlan, parentSchema *expression.Schema) bool {
-	if parentSchema == nil {
-		return false
-	}
-	for _, col := range parentSchema.Columns {
-		columnName := &ast.ColumnName{Schema: col.DBName, Table: col.TblName, Name: col.ColName}
-		if c, err := outerPlan.Schema().FindColumn(columnName); c == nil {
-			log.Warn(err)
+	for _, col := range cols {
+		if !outerUniqueIDs.Exist(col.UniqueID) {
 			return false
 		}
 	}
@@ -99,29 +103,32 @@ func (o *outerJoinEliminator) isParentColsAllFromOuterTable(outerPlan LogicalPla
 }
 
 // check whether one of unique keys sets is contained by inner join keys
-func (o *outerJoinEliminator) isInnerJoinKeysContainUniqueKey(innerPlan LogicalPlan, joinKeys *expression.Schema) bool {
+func (o *outerJoinEliminator) isInnerJoinKeysContainUniqueKey(innerPlan LogicalPlan, joinKeys *expression.Schema) (bool, error) {
 	for _, keyInfo := range innerPlan.Schema().Keys {
 		joinKeysContainKeyInfo := true
 		for _, col := range keyInfo {
 			columnName := &ast.ColumnName{Schema: col.DBName, Table: col.TblName, Name: col.ColName}
-			if c, err := joinKeys.FindColumn(columnName); c == nil {
-				log.Warn(err)
+			c, err := joinKeys.FindColumn(columnName)
+			if err != nil {
+				return false, err
+			}
+			if c == nil {
 				joinKeysContainKeyInfo = false
 				break
 			}
 		}
 		if joinKeysContainKeyInfo {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // check whether one of index sets is contained by inner join index
-func (o *outerJoinEliminator) isInnerJoinKeysContainIndex(innerPlan LogicalPlan, joinKeys *expression.Schema) bool {
+func (o *outerJoinEliminator) isInnerJoinKeysContainIndex(innerPlan LogicalPlan, joinKeys *expression.Schema) (bool, error) {
 	ds, ok := innerPlan.(*DataSource)
 	if !ok {
-		return false
+		return false, nil
 	}
 	for _, path := range ds.possibleAccessPaths {
 		if path.isTablePath {
@@ -134,64 +141,103 @@ func (o *outerJoinEliminator) isInnerJoinKeysContainIndex(innerPlan LogicalPlan,
 		joinKeysContainIndex := true
 		for _, idxCol := range idx.Columns {
 			columnName := &ast.ColumnName{Schema: ds.DBName, Table: ds.tableInfo.Name, Name: idxCol.Name}
-			if c, err := joinKeys.FindColumn(columnName); c == nil {
-				log.Warn(err)
+			c, err := joinKeys.FindColumn(columnName)
+			if err != nil {
+				return false, err
+			}
+			if c == nil {
 				joinKeysContainIndex = false
 				break
 			}
 		}
 		if joinKeysContainIndex {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-// Check whether a LogicalPlan is a LogicalAggregation and its all aggregate functions is duplicate agnostic.
-// Also, check all the args are expression.Column.
-func (o *outerJoinEliminator) isDuplicateAgnosticAgg(p LogicalPlan) (_ bool, cols []*expression.Column) {
+// getDupAgnosticAggCols checks whether a LogicalPlan is LogicalAggregation.
+// It extracts all the columns from the duplicate agnostic aggregate functions.
+// The returned column set is nil if not all the aggregate functions are duplicate agnostic.
+// Only the following functions are considered to be duplicate agnostic:
+//   1. MAX(arg)
+//   2. MIN(arg)
+//   3. FIRST_ROW(arg)
+//   4. Other agg functions with DISTINCT flag, like SUM(DISTINCT arg)
+func (o *outerJoinEliminator) getDupAgnosticAggCols(
+	p LogicalPlan,
+	oldAggCols []*expression.Column, // Reuse the original buffer.
+) (isAgg bool, newAggCols []*expression.Column) {
 	agg, ok := p.(*LogicalAggregation)
 	if !ok {
 		return false, nil
 	}
-	cols = agg.groupByCols
+	newAggCols = oldAggCols[:0]
 	for _, aggDesc := range agg.AggFuncs {
 		if !aggDesc.HasDistinct &&
 			aggDesc.Name != ast.AggFuncFirstRow &&
 			aggDesc.Name != ast.AggFuncMax &&
 			aggDesc.Name != ast.AggFuncMin {
-			return false, nil
+			// If not all aggregate functions are duplicate agnostic,
+			// we should clean the aggCols, so `return true, newAggCols[:0]`.
+			return true, newAggCols[:0]
 		}
 		for _, expr := range aggDesc.Args {
-			if col, ok := expr.(*expression.Column); ok {
-				cols = append(cols, col)
-			} else {
-				return false, nil
-			}
+			newAggCols = append(newAggCols, expression.ExtractColumns(expr)...)
 		}
 	}
-	return true, cols
+	return true, newAggCols
 }
 
-func (o *outerJoinEliminator) doOptimize(p LogicalPlan, aggCols []*expression.Column, parentSchema *expression.Schema) LogicalPlan {
-	// check the duplicate agnostic aggregate functions
-	if ok, newCols := o.isDuplicateAgnosticAgg(p); ok {
+func (o *outerJoinEliminator) doOptimize(p LogicalPlan, aggCols []*expression.Column, parentCols []*expression.Column) (LogicalPlan, error) {
+	var err error
+	var isEliminated bool
+	for join, isJoin := p.(*LogicalJoin); isJoin; join, isJoin = p.(*LogicalJoin) {
+		p, isEliminated, err = o.tryToEliminateOuterJoin(join, aggCols, parentCols)
+		if err != nil {
+			return p, err
+		}
+		if !isEliminated {
+			break
+		}
+	}
+
+	switch x := p.(type) {
+	case *LogicalProjection:
+		parentCols = parentCols[:0]
+		for _, expr := range x.Exprs {
+			parentCols = append(parentCols, expression.ExtractColumns(expr)...)
+		}
+	case *LogicalAggregation:
+		parentCols = append(parentCols[:0], x.groupByCols...)
+		for _, aggDesc := range x.AggFuncs {
+			for _, expr := range aggDesc.Args {
+				parentCols = append(parentCols, expression.ExtractColumns(expr)...)
+			}
+		}
+	default:
+		parentCols = append(parentCols[:0], p.Schema().Columns...)
+	}
+
+	if ok, newCols := o.getDupAgnosticAggCols(p, aggCols); ok {
 		aggCols = newCols
 	}
 
-	newChildren := make([]LogicalPlan, 0, len(p.Children()))
-	for _, child := range p.Children() {
-		newChild := o.doOptimize(child, aggCols, p.Schema())
-		newChildren = append(newChildren, newChild)
+	for i, child := range p.Children() {
+		newChild, err := o.doOptimize(child, aggCols, parentCols)
+		if err != nil {
+			return nil, err
+		}
+		p.SetChild(i, newChild)
 	}
-	p.SetChildren(newChildren...)
-	join, isJoin := p.(*LogicalJoin)
-	if !isJoin {
-		return p
-	}
-	return o.tryToEliminateOuterJoin(join, aggCols, parentSchema)
+	return p, nil
 }
 
-func (o *outerJoinEliminator) optimize(p LogicalPlan) (LogicalPlan, error) {
-	return o.doOptimize(p, nil, nil), nil
+func (o *outerJoinEliminator) optimize(ctx context.Context, p LogicalPlan) (LogicalPlan, error) {
+	return o.doOptimize(p, nil, nil)
+}
+
+func (*outerJoinEliminator) name() string {
+	return "outer_join_eliminate"
 }

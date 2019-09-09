@@ -13,16 +13,16 @@
 
 package kv
 
-import (
-	"github.com/pingcap/errors"
-)
+import "context"
 
 // UnionStore is a store that wraps a snapshot for read and a BufferStore for buffered write.
 // Also, it provides some transaction related utilities.
 type UnionStore interface {
 	MemBuffer
-	// Returns related condition pair
-	LookupConditionPair(k Key) *conditionPair
+	// GetKeyExistErrInfo gets the key exist error info for the lazy check.
+	GetKeyExistErrInfo(k Key) *existErrInfo
+	// DeleteKeyExistErrInfo deletes the key exist error info for the lazy check.
+	DeleteKeyExistErrInfo(k Key)
 	// WalkBuffer iterates all buffered kv pairs.
 	WalkBuffer(f func(k Key, v []byte) error) error
 	// SetOption sets an option with a value, when val is nil, uses the default
@@ -36,6 +36,16 @@ type UnionStore interface {
 	GetMemBuffer() MemBuffer
 }
 
+// AssertionType is the type of a assertion.
+type AssertionType int
+
+// The AssertionType constants.
+const (
+	None AssertionType = iota
+	Exist
+	NotExist
+)
+
 // Option is used for customizing kv store's behaviors during a transaction.
 type Option int
 
@@ -45,38 +55,45 @@ type Options interface {
 	Get(opt Option) (v interface{}, ok bool)
 }
 
-// conditionPair is used to store lazy check condition.
-// If condition not match (value is not equal as expected one), returns err.
-type conditionPair struct {
-	key   Key
-	value []byte
-	err   error
+type existErrInfo struct {
+	idxName string
+	value   string
 }
 
-func (c *conditionPair) ShouldNotExist() bool {
-	return len(c.value) == 0
+// NewExistErrInfo is used to new an existErrInfo
+func NewExistErrInfo(idxName string, value string) *existErrInfo {
+	return &existErrInfo{idxName: idxName, value: value}
 }
 
-func (c *conditionPair) Err() error {
-	return c.err
+// GetIdxName gets the index name of the existed error.
+func (e *existErrInfo) GetIdxName() string {
+	return e.idxName
+}
+
+// GetValue gets the existed value of the existed error.
+func (e *existErrInfo) GetValue() string {
+	return e.value
+}
+
+// Err generates the error for existErrInfo
+func (e *existErrInfo) Err() error {
+	return ErrKeyExists.FastGen("Duplicate entry '%s' for key '%s'", e.value, e.idxName)
 }
 
 // unionStore is an in-memory Store which contains a buffer for write and a
 // snapshot for read.
 type unionStore struct {
 	*BufferStore
-	snapshot           Snapshot                  // for read
-	lazyConditionPairs map[string]*conditionPair // for delay check
-	opts               options
+	keyExistErrs map[string]*existErrInfo // for the lazy check
+	opts         options
 }
 
 // NewUnionStore builds a new UnionStore.
 func NewUnionStore(snapshot Snapshot) UnionStore {
 	return &unionStore{
-		BufferStore:        NewBufferStore(snapshot, DefaultTxnMembufCap),
-		snapshot:           snapshot,
-		lazyConditionPairs: make(map[string]*conditionPair),
-		opts:               make(map[Option]interface{}),
+		BufferStore:  NewBufferStore(snapshot, DefaultTxnMembufCap),
+		keyExistErrs: make(map[string]*existErrInfo),
+		opts:         make(map[Option]interface{}),
 	}
 }
 
@@ -108,12 +125,12 @@ type lazyMemBuffer struct {
 	cap int
 }
 
-func (lmb *lazyMemBuffer) Get(k Key) ([]byte, error) {
+func (lmb *lazyMemBuffer) Get(ctx context.Context, k Key) ([]byte, error) {
 	if lmb.mb == nil {
 		return nil, ErrNotExist
 	}
 
-	return lmb.mb.Get(k)
+	return lmb.mb.Get(ctx, k)
 }
 
 func (lmb *lazyMemBuffer) Set(key Key, value []byte) error {
@@ -171,24 +188,20 @@ func (lmb *lazyMemBuffer) SetCap(cap int) {
 }
 
 // Get implements the Retriever interface.
-func (us *unionStore) Get(k Key) ([]byte, error) {
-	v, err := us.MemBuffer.Get(k)
+func (us *unionStore) Get(ctx context.Context, k Key) ([]byte, error) {
+	v, err := us.MemBuffer.Get(ctx, k)
 	if IsErrNotFound(err) {
 		if _, ok := us.opts.Get(PresumeKeyNotExists); ok {
 			e, ok := us.opts.Get(PresumeKeyNotExistsError)
-			if ok && e != nil {
-				us.markLazyConditionPair(k, nil, e.(error))
-			} else {
-				us.markLazyConditionPair(k, nil, ErrKeyExists)
+			if ok {
+				us.keyExistErrs[string(k)] = e.(*existErrInfo)
 			}
 			return nil, ErrNotExist
 		}
-	}
-	if IsErrNotFound(err) {
-		v, err = us.BufferStore.r.Get(k)
+		v, err = us.BufferStore.r.Get(ctx, k)
 	}
 	if err != nil {
-		return v, errors.Trace(err)
+		return v, err
 	}
 	if len(v) == 0 {
 		return nil, ErrNotExist
@@ -196,21 +209,15 @@ func (us *unionStore) Get(k Key) ([]byte, error) {
 	return v, nil
 }
 
-// markLazyConditionPair marks a kv pair for later check.
-// If condition not match, should return e as error.
-func (us *unionStore) markLazyConditionPair(k Key, v []byte, e error) {
-	us.lazyConditionPairs[string(k)] = &conditionPair{
-		key:   k.Clone(),
-		value: v,
-		err:   e,
-	}
-}
-
-func (us *unionStore) LookupConditionPair(k Key) *conditionPair {
-	if c, ok := us.lazyConditionPairs[string(k)]; ok {
+func (us *unionStore) GetKeyExistErrInfo(k Key) *existErrInfo {
+	if c, ok := us.keyExistErrs[string(k)]; ok {
 		return c
 	}
 	return nil
+}
+
+func (us *unionStore) DeleteKeyExistErrInfo(k Key) {
+	delete(us.keyExistErrs, string(k))
 }
 
 // SetOption implements the UnionStore SetOption interface.

@@ -16,43 +16,45 @@ package executor
 import (
 	"context"
 
-	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	plannercore "github.com/pingcap/tidb/planner/core"
-	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/ranger"
 )
 
 func (b *executorBuilder) buildPointGet(p *plannercore.PointGetPlan) Executor {
 	startTS, err := b.getStartTS()
 	if err != nil {
-		b.err = errors.Trace(err)
+		b.err = err
 		return nil
 	}
-	return &PointGetExecutor{
-		ctx:     b.ctx,
-		schema:  p.Schema(),
-		tblInfo: p.TblInfo,
-		idxInfo: p.IndexInfo,
-		idxVals: p.IndexValues,
-		handle:  p.Handle,
-		startTS: startTS,
+	e := &PointGetExecutor{
+		baseExecutor: newBaseExecutor(b.ctx, p.Schema(), p.ExplainID()),
+		tblInfo:      p.TblInfo,
+		idxInfo:      p.IndexInfo,
+		idxVals:      p.IndexValues,
+		handle:       p.Handle,
+		startTS:      startTS,
+		lock:         p.Lock,
 	}
+	b.isSelectForUpdate = p.IsForUpdate
+	e.base().initCap = 1
+	e.base().maxChunkSize = 1
+	return e
 }
 
 // PointGetExecutor executes point select query.
 type PointGetExecutor struct {
-	ctx      sessionctx.Context
-	schema   *expression.Schema
-	tps      []*types.FieldType
+	baseExecutor
+
 	tblInfo  *model.TableInfo
 	handle   int64
 	idxInfo  *model.IndexInfo
@@ -60,6 +62,7 @@ type PointGetExecutor struct {
 	startTS  uint64
 	snapshot kv.Snapshot
 	done     bool
+	lock     bool
 }
 
 // Open implements the Executor interface.
@@ -73,38 +76,65 @@ func (e *PointGetExecutor) Close() error {
 }
 
 // Next implements the Executor interface.
-func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
 	if e.done {
 		return nil
 	}
 	e.done = true
+	snapshotTS := e.startTS
+	if e.lock {
+		snapshotTS = e.ctx.GetSessionVars().TxnCtx.GetForUpdateTS()
+	}
 	var err error
-	e.snapshot, err = e.ctx.GetStore().GetSnapshot(kv.Version{Ver: e.startTS})
+	e.snapshot, err = e.ctx.GetStore().GetSnapshot(kv.Version{Ver: snapshotTS})
 	if err != nil {
-		return errors.Trace(err)
+		return err
+	}
+	if e.ctx.GetSessionVars().ReplicaRead.IsFollowerRead() {
+		e.snapshot.SetOption(kv.ReplicaRead, kv.ReplicaReadFollower)
 	}
 	if e.idxInfo != nil {
-		idxKey, err1 := e.encodeIndexKey()
-		if err1 != nil {
-			return errors.Trace(err1)
-		}
-		handleVal, err1 := e.get(idxKey)
+		idxKey, err1 := encodeIndexKey(e.base(), e.tblInfo, e.idxInfo, e.idxVals)
 		if err1 != nil && !kv.ErrNotExist.Equal(err1) {
-			return errors.Trace(err1)
+			return err1
+		}
+
+		handleVal, err1 := e.get(ctx, idxKey)
+		if err1 != nil && !kv.ErrNotExist.Equal(err1) {
+			return err1
 		}
 		if len(handleVal) == 0 {
-			return nil
+			return e.lockKeyIfNeeded(ctx, idxKey)
 		}
 		e.handle, err1 = tables.DecodeHandle(handleVal)
 		if err1 != nil {
-			return errors.Trace(err1)
+			return err1
 		}
+
+		// The injection is used to simulate following scenario:
+		// 1. Session A create a point get query but pause before second time `GET` kv from backend
+		// 2. Session B create an UPDATE query to update the record that will be obtained in step 1
+		// 3. Then point get retrieve data from backend after step 2 finished
+		// 4. Check the result
+		failpoint.InjectContext(ctx, "pointGetRepeatableReadTest-step1", func() {
+			if ch, ok := ctx.Value("pointGetRepeatableReadTest").(chan struct{}); ok {
+				// Make `UPDATE` continue
+				close(ch)
+			}
+			// Wait `UPDATE` finished
+			failpoint.InjectContext(ctx, "pointGetRepeatableReadTest-step2", nil)
+		})
 	}
+
 	key := tablecodec.EncodeRowKeyWithHandle(e.tblInfo.ID, e.handle)
-	val, err := e.get(key)
+	val, err := e.get(ctx, key)
 	if err != nil && !kv.ErrNotExist.Equal(err) {
-		return errors.Trace(err)
+		return err
+	}
+	err = e.lockKeyIfNeeded(ctx, key)
+	if err != nil {
+		return err
 	}
 	if len(val) == 0 {
 		if e.idxInfo != nil {
@@ -113,90 +143,94 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.RecordBatch) err
 		}
 		return nil
 	}
-	return e.decodeRowValToChunk(val, req.Chunk)
+	return decodeRowValToChunk(e.base(), e.tblInfo, e.handle, val, req)
 }
 
-func (e *PointGetExecutor) encodeIndexKey() ([]byte, error) {
-	for i := range e.idxVals {
-		colInfo := e.tblInfo.Columns[e.idxInfo.Columns[i].Offset]
-		casted, err := table.CastValue(e.ctx, e.idxVals[i], colInfo)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		e.idxVals[i] = casted
+func (e *PointGetExecutor) lockKeyIfNeeded(ctx context.Context, key []byte) error {
+	if e.lock {
+		return doLockKeys(ctx, e.ctx, key)
 	}
-	encodedIdxVals, err := codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, nil, e.idxVals...)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return tablecodec.EncodeIndexSeekKey(e.tblInfo.ID, e.idxInfo.ID, encodedIdxVals), nil
+	return nil
 }
 
-func (e *PointGetExecutor) get(key kv.Key) (val []byte, err error) {
+func (e *PointGetExecutor) get(ctx context.Context, key kv.Key) (val []byte, err error) {
 	txn, err := e.ctx.Txn(true)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	if txn != nil && txn.Valid() && !txn.IsReadOnly() {
-		return txn.Get(key)
+		// We cannot use txn.Get directly here because the snapshot in txn and the snapshot of e.snapshot may be
+		// different for pessimistic transaction.
+		val, err = txn.GetMemBuffer().Get(ctx, key)
+		if err == nil {
+			return val, err
+		}
+		if !kv.IsErrNotFound(err) {
+			return nil, err
+		}
+		// fallthrough to snapshot get.
 	}
-	return e.snapshot.Get(key)
+	return e.snapshot.Get(ctx, key)
 }
 
-func (e *PointGetExecutor) decodeRowValToChunk(rowVal []byte, chk *chunk.Chunk) error {
-	//  One column could be filled for multi-times in the schema. e.g. select b, b, c, c from t where a = 1.
-	// We need to set the positions in the schema for the same column.
-	colID2DecodedPos := make(map[int64]int, e.schema.Len())
-	decodedPos2SchemaPos := make([][]int, 0, e.schema.Len())
-	for schemaPos, col := range e.schema.Columns {
-		if decodedPos, ok := colID2DecodedPos[col.ID]; !ok {
-			colID2DecodedPos[col.ID] = len(colID2DecodedPos)
-			decodedPos2SchemaPos = append(decodedPos2SchemaPos, []int{schemaPos})
+func encodeIndexKey(e *baseExecutor, tblInfo *model.TableInfo, idxInfo *model.IndexInfo, idxVals []types.Datum) (_ []byte, err error) {
+	sc := e.ctx.GetSessionVars().StmtCtx
+	for i := range idxVals {
+		colInfo := tblInfo.Columns[idxInfo.Columns[i].Offset]
+		if colInfo.Tp == mysql.TypeString || colInfo.Tp == mysql.TypeVarString || colInfo.Tp == mysql.TypeVarchar {
+			idxVals[i], err = ranger.HandlePadCharToFullLength(sc, &colInfo.FieldType, idxVals[i])
 		} else {
-			decodedPos2SchemaPos[decodedPos] = append(decodedPos2SchemaPos[decodedPos], schemaPos)
+			idxVals[i], err = table.CastValue(e.ctx, idxVals[i], colInfo)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
-	decodedVals, err := tablecodec.CutRowNew(rowVal, colID2DecodedPos)
+
+	encodedIdxVals, err := codec.EncodeKey(sc, nil, idxVals...)
 	if err != nil {
-		return errors.Trace(err)
+		return nil, err
 	}
-	if decodedVals == nil {
-		decodedVals = make([][]byte, len(colID2DecodedPos))
+	return tablecodec.EncodeIndexSeekKey(tblInfo.ID, idxInfo.ID, encodedIdxVals), nil
+}
+
+func decodeRowValToChunk(e *baseExecutor, tblInfo *model.TableInfo, handle int64, rowVal []byte, chk *chunk.Chunk) error {
+	colID2CutPos := make(map[int64]int, e.schema.Len())
+	for _, col := range e.schema.Columns {
+		if _, ok := colID2CutPos[col.ID]; !ok {
+			colID2CutPos[col.ID] = len(colID2CutPos)
+		}
+	}
+	cutVals, err := tablecodec.CutRowNew(rowVal, colID2CutPos)
+	if err != nil {
+		return err
+	}
+	if cutVals == nil {
+		cutVals = make([][]byte, len(colID2CutPos))
 	}
 	decoder := codec.NewDecoder(chk, e.ctx.GetSessionVars().Location())
-	for id, decodedPos := range colID2DecodedPos {
-		schemaPoses := decodedPos2SchemaPos[decodedPos]
-		firstPos := schemaPoses[0]
-		if e.tblInfo.PKIsHandle && mysql.HasPriKeyFlag(e.schema.Columns[firstPos].RetType.Flag) {
-			chk.AppendInt64(firstPos, e.handle)
-			// Fill other positions.
-			for i := 1; i < len(schemaPoses); i++ {
-				chk.MakeRef(firstPos, schemaPoses[i])
-			}
+	for i, col := range e.schema.Columns {
+		if tblInfo.PKIsHandle && mysql.HasPriKeyFlag(col.RetType.Flag) {
+			chk.AppendInt64(i, handle)
 			continue
 		}
-		// ExtraHandleID is added when building plan, we can make sure that there's only one column's ID is this.
-		if id == model.ExtraHandleID {
-			chk.AppendInt64(firstPos, e.handle)
+		if col.ID == model.ExtraHandleID {
+			chk.AppendInt64(i, handle)
 			continue
 		}
-		if len(decodedVals[decodedPos]) == 0 {
-			// This branch only entered for updating and deleting. It won't have one column in multiple positions.
-			colInfo := getColInfoByID(e.tblInfo, id)
+		cutPos := colID2CutPos[col.ID]
+		if len(cutVals[cutPos]) == 0 {
+			colInfo := getColInfoByID(tblInfo, col.ID)
 			d, err1 := table.GetColOriginDefaultValue(e.ctx, colInfo)
 			if err1 != nil {
-				return errors.Trace(err1)
+				return err1
 			}
-			chk.AppendDatum(firstPos, &d)
+			chk.AppendDatum(i, &d)
 			continue
 		}
-		_, err = decoder.DecodeOne(decodedVals[decodedPos], firstPos, e.schema.Columns[firstPos].RetType)
+		_, err = decoder.DecodeOne(cutVals[cutPos], i, col.RetType)
 		if err != nil {
-			return errors.Trace(err)
-		}
-		// Fill other positions.
-		for i := 1; i < len(schemaPoses); i++ {
-			chk.MakeRef(firstPos, schemaPoses[i])
+			return err
 		}
 	}
 	return nil
@@ -209,23 +243,4 @@ func getColInfoByID(tbl *model.TableInfo, colID int64) *model.ColumnInfo {
 		}
 	}
 	return nil
-}
-
-// Schema implements the Executor interface.
-func (e *PointGetExecutor) Schema() *expression.Schema {
-	return e.schema
-}
-
-func (e *PointGetExecutor) retTypes() []*types.FieldType {
-	if e.tps == nil {
-		e.tps = make([]*types.FieldType, e.schema.Len())
-		for i := range e.schema.Columns {
-			e.tps[i] = e.schema.Columns[i].RetType
-		}
-	}
-	return e.tps
-}
-
-func (e *PointGetExecutor) newFirstChunk() *chunk.Chunk {
-	return chunk.New(e.retTypes(), 1, 1)
 }

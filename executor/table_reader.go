@@ -15,56 +15,88 @@ package executor
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/distsql"
+	"github.com/pingcap/tidb/kv"
 	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/ranger"
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
 )
 
 // make sure `TableReaderExecutor` implements `Executor`.
 var _ Executor = &TableReaderExecutor{}
 
+// selectResultHook is used to hack distsql.SelectWithRuntimeStats safely for testing.
+type selectResultHook struct {
+	selectResultFunc func(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request,
+		fieldTypes []*types.FieldType, fb *statistics.QueryFeedback, copPlanIDs []fmt.Stringer) (distsql.SelectResult, error)
+}
+
+func (sr selectResultHook) SelectResult(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request,
+	fieldTypes []*types.FieldType, fb *statistics.QueryFeedback, copPlanIDs []fmt.Stringer) (distsql.SelectResult, error) {
+	if sr.selectResultFunc == nil {
+		return distsql.SelectWithRuntimeStats(ctx, sctx, kvReq, fieldTypes, fb, copPlanIDs)
+	}
+	return sr.selectResultFunc(ctx, sctx, kvReq, fieldTypes, fb, copPlanIDs)
+}
+
 // TableReaderExecutor sends DAG request and reads table data from kv layer.
 type TableReaderExecutor struct {
 	baseExecutor
 
-	table           table.Table
-	physicalTableID int64
-	keepOrder       bool
-	desc            bool
-	ranges          []*ranger.Range
-	dagPB           *tipb.DAGRequest
+	table  table.Table
+	ranges []*ranger.Range
+	// kvRanges are only use for union scan.
+	kvRanges []kv.KeyRange
+	dagPB    *tipb.DAGRequest
 	// columns are only required by union scan.
 	columns []*model.ColumnInfo
 
 	// resultHandler handles the order of the result. Since (MAXInt64, MAXUint64] stores before [0, MaxInt64] physically
 	// for unsigned int.
 	resultHandler *tableResultHandler
-	streaming     bool
 	feedback      *statistics.QueryFeedback
+	plans         []plannercore.PhysicalPlan
 
+	memTracker       *memory.Tracker
+	selectResultHook // for testing
+
+	keepOrder bool
+	desc      bool
+	streaming bool
 	// corColInFilter tells whether there's correlated column in filter.
 	corColInFilter bool
 	// corColInAccess tells whether there's correlated column in access conditions.
 	corColInAccess bool
-	plans          []plannercore.PhysicalPlan
 }
 
 // Open initialzes necessary variables for using this executor.
 func (e *TableReaderExecutor) Open(ctx context.Context) error {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("TableReaderExecutor.Open", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
+	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaDistSQL)
+	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
+
 	var err error
 	if e.corColInFilter {
 		e.dagPB.Executors, _, err = constructDistExec(e.ctx, e.plans)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 	}
 	if e.runtimeStats != nil {
@@ -77,20 +109,24 @@ func (e *TableReaderExecutor) Open(ctx context.Context) error {
 		pkTP := ts.Table.GetPkColInfo().FieldType
 		e.ranges, err = ranger.BuildTableRange(access, e.ctx.GetSessionVars().StmtCtx, &pkTP)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 	}
 
 	e.resultHandler = &tableResultHandler{}
-	if e.feedback != nil && e.feedback.Hist() != nil {
+	if e.feedback != nil && e.feedback.Hist != nil {
 		// EncodeInt don't need *statement.Context.
-		e.ranges = e.feedback.Hist().SplitRange(nil, e.ranges, false)
+		var ok bool
+		e.ranges, ok = e.feedback.Hist.SplitRange(nil, e.ranges, false)
+		if !ok {
+			e.feedback.Invalidate()
+		}
 	}
-	firstPartRanges, secondPartRanges := splitRanges(e.ranges, e.keepOrder)
+	firstPartRanges, secondPartRanges := splitRanges(e.ranges, e.keepOrder, e.desc)
 	firstResult, err := e.buildResp(ctx, firstPartRanges)
 	if err != nil {
 		e.feedback.Invalidate()
-		return errors.Trace(err)
+		return err
 	}
 	if len(secondPartRanges) == 0 {
 		e.resultHandler.open(nil, firstResult)
@@ -100,7 +136,7 @@ func (e *TableReaderExecutor) Open(ctx context.Context) error {
 	secondResult, err = e.buildResp(ctx, secondPartRanges)
 	if err != nil {
 		e.feedback.Invalidate()
-		return errors.Trace(err)
+		return err
 	}
 	e.resultHandler.open(firstResult, secondResult)
 	return nil
@@ -108,60 +144,66 @@ func (e *TableReaderExecutor) Open(ctx context.Context) error {
 
 // Next fills data into the chunk passed by its caller.
 // The task was actually done by tableReaderHandler.
-func (e *TableReaderExecutor) Next(ctx context.Context, req *chunk.RecordBatch) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("tableReader.Next", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
-	if e.runtimeStats != nil {
-		start := time.Now()
-		defer func() { e.runtimeStats.Record(time.Since(start), req.NumRows()) }()
-	}
-	if err := e.resultHandler.nextChunk(ctx, req.Chunk); err != nil {
+func (e *TableReaderExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
+	logutil.Eventf(ctx, "table scan table: %s, range: %v", stringutil.MemoizeStr(func() string {
+		var tableName string
+		if meta := e.table.Meta(); meta != nil {
+			tableName = meta.Name.L
+		}
+		return tableName
+	}), e.ranges)
+	if err := e.resultHandler.nextChunk(ctx, req); err != nil {
 		e.feedback.Invalidate()
 		return err
 	}
-	return errors.Trace(nil)
+	return nil
 }
 
 // Close implements the Executor Close interface.
 func (e *TableReaderExecutor) Close() error {
-	err := e.resultHandler.Close()
+	var err error
+	if e.resultHandler != nil {
+		err = e.resultHandler.Close()
+	}
 	if e.runtimeStats != nil {
-		copStats := e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootStats(e.plans[0].ExplainID())
+		copStats := e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootStats(e.plans[0].ExplainID().String())
 		copStats.SetRowNum(e.feedback.Actual())
 	}
 	e.ctx.StoreQueryFeedback(e.feedback)
-	return errors.Trace(err)
+	return err
 }
 
 // buildResp first builds request and sends it to tikv using distsql.Select. It uses SelectResut returned by the callee
 // to fetch all results.
 func (e *TableReaderExecutor) buildResp(ctx context.Context, ranges []*ranger.Range) (distsql.SelectResult, error) {
 	var builder distsql.RequestBuilder
-	kvReq, err := builder.SetTableRanges(e.physicalTableID, ranges, e.feedback).
+	kvReq, err := builder.SetTableRanges(getPhysicalTableID(e.table), ranges, e.feedback).
 		SetDAGRequest(e.dagPB).
 		SetDesc(e.desc).
 		SetKeepOrder(e.keepOrder).
 		SetStreaming(e.streaming).
 		SetFromSessionVars(e.ctx.GetSessionVars()).
+		SetMemTracker(e.memTracker).
 		Build()
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
-	result, err := distsql.SelectWithRuntimeStats(ctx, e.ctx, kvReq, e.retTypes(), e.feedback, getPhysicalPlanIDs(e.plans))
+	e.kvRanges = append(e.kvRanges, kvReq.KeyRanges...)
+	result, err := e.SelectResult(ctx, e.ctx, kvReq, retTypes(e), e.feedback, getPhysicalPlanIDs(e.plans))
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	result.Fetch(ctx)
 	return result, nil
 }
 
 type tableResultHandler struct {
-	// If the pk is unsigned and we have KeepOrder=true.
-	// optionalResult handles the request whose range is in signed int range.
-	// result handles the request whose range is exceed signed int range.
-	// Otherwise, we just set optionalFinished true and the result handles the whole ranges.
+	// If the pk is unsigned and we have KeepOrder=true and want ascending order,
+	// `optionalResult` will handles the request whose range is in signed int range, and
+	// `result` will handle the request whose range is exceed signed int range.
+	// If we want descending order, `optionalResult` will handles the request whose range is exceed signed, and
+	// the `result` will handle the request whose range is in signed.
+	// Otherwise, we just set `optionalFinished` true and the `result` handles the whole ranges.
 	optionalResult distsql.SelectResult
 	result         distsql.SelectResult
 
@@ -183,7 +225,7 @@ func (tr *tableResultHandler) nextChunk(ctx context.Context, chk *chunk.Chunk) e
 	if !tr.optionalFinished {
 		err := tr.optionalResult.Next(ctx, chk)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 		if chk.NumRows() > 0 {
 			return nil
@@ -197,7 +239,7 @@ func (tr *tableResultHandler) nextRaw(ctx context.Context) (data []byte, err err
 	if !tr.optionalFinished {
 		data, err = tr.optionalResult.NextRaw(ctx)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		if data != nil {
 			return data, nil
@@ -206,7 +248,7 @@ func (tr *tableResultHandler) nextRaw(ctx context.Context) (data []byte, err err
 	}
 	data, err = tr.result.NextRaw(ctx)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	return data, nil
 }
@@ -214,5 +256,5 @@ func (tr *tableResultHandler) nextRaw(ctx context.Context) (data []byte, err err
 func (tr *tableResultHandler) Close() error {
 	err := closeAll(tr.optionalResult, tr.result)
 	tr.optionalResult, tr.result = nil, nil
-	return errors.Trace(err)
+	return err
 }

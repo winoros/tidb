@@ -14,6 +14,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 )
@@ -92,9 +93,9 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			id = "MergeInnerJoin"
 		}
 		str = id + "{" + strings.Join(children, "->") + "}"
-		for i := range x.LeftKeys {
-			l := x.LeftKeys[i].String()
-			r := x.RightKeys[i].String()
+		for i := range x.LeftJoinKeys {
+			l := x.LeftJoinKeys[i].String()
+			r := x.RightJoinKeys[i].String()
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
 	case *LogicalApply, *PhysicalApply:
@@ -112,12 +113,8 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = "Lock"
 	case *ShowDDL:
 		str = "ShowDDL"
-	case *Show:
-		if len(x.Conditions) == 0 {
-			str = "Show"
-		} else {
-			str = fmt.Sprintf("Show(%s)", x.Conditions)
-		}
+	case *LogicalShow, *PhysicalShow:
+		str = "Show"
 	case *LogicalSort, *PhysicalSort:
 		str = "Sort"
 	case *LogicalJoin:
@@ -194,6 +191,18 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			r := x.InnerJoinKeys[i]
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
+	case *PhysicalIndexMergeJoin:
+		last := len(idxs) - 1
+		idx := idxs[last]
+		children := strs[idx:]
+		strs = strs[:idx]
+		idxs = idxs[:last]
+		str = "IndexMergeJoin{" + strings.Join(children, "->") + "}"
+		for i := range x.OuterJoinKeys {
+			l := x.OuterJoinKeys[i]
+			r := x.InnerJoinKeys[i]
+			str += fmt.Sprintf("(%s,%s)", l, r)
+		}
 	case *Analyze:
 		str = "Analyze{"
 		var children []string
@@ -221,7 +230,9 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			str = fmt.Sprintf("%s->Insert", ToString(x.SelectPlan))
 		}
 	case *LogicalWindow:
-		str = fmt.Sprintf("Window(%s)", x.WindowFuncDesc.String())
+		buffer := bytes.NewBufferString("")
+		formatWindowFuncDescs(buffer, x.WindowFuncDescs)
+		str = fmt.Sprintf("Window(%s)", buffer.String())
 	case *PhysicalWindow:
 		str = fmt.Sprintf("Window(%s)", x.ExplainInfo())
 	default:

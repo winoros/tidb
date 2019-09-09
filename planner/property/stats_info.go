@@ -25,14 +25,9 @@ type StatsInfo struct {
 	Cardinality []float64
 
 	HistColl *statistics.HistColl
-	// UsePseudoStats indicates whether the StatsInfo is calculated using the
-	// pseudo statistics on a table.
-	UsePseudoStats bool
-}
-
-// NewSimpleStats creates a simple StatsInfo with rowCount.
-func NewSimpleStats(rowCount float64) *StatsInfo {
-	return &StatsInfo{RowCount: rowCount}
+	// StatsVersion indicates the statistics version of a table.
+	// If the StatsInfo is calculated using the pseudo statistics on a table, StatsVersion will be PseudoVersion.
+	StatsVersion uint64
 }
 
 // String implements fmt.Stringer interface.
@@ -48,10 +43,10 @@ func (s *StatsInfo) Count() int64 {
 // Scale receives a selectivity and multiplies it with RowCount and Cardinality.
 func (s *StatsInfo) Scale(factor float64) *StatsInfo {
 	profile := &StatsInfo{
-		RowCount:       s.RowCount * factor,
-		Cardinality:    make([]float64, len(s.Cardinality)),
-		HistColl:       s.HistColl,
-		UsePseudoStats: s.UsePseudoStats,
+		RowCount:     s.RowCount * factor,
+		Cardinality:  make([]float64, len(s.Cardinality)),
+		HistColl:     s.HistColl,
+		StatsVersion: s.StatsVersion,
 	}
 	for i := range profile.Cardinality {
 		profile.Cardinality[i] = s.Cardinality[i] * factor
@@ -63,7 +58,7 @@ func (s *StatsInfo) Scale(factor float64) *StatsInfo {
 // smaller than the derived cnt.
 // TODO: try to use a better way to do this.
 func (s *StatsInfo) ScaleByExpectCnt(expectCnt float64) *StatsInfo {
-	if expectCnt > s.RowCount {
+	if expectCnt >= s.RowCount {
 		return s
 	}
 	if s.RowCount > 1.0 { // if s.RowCount is too small, it will cause overflow
