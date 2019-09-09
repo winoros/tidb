@@ -91,26 +91,29 @@ func (ds *DataSource) getStatsByFilter(conds expression.CNFExprs) (*property.Sta
 		HistColl:       ds.statisticTable.GenerateHistCollFromColumnInfo(ds.Columns, ds.schema.Columns),
 		UsePseudoStats: ds.statisticTable.Pseudo,
 	}
-	for i, col := range ds.Columns {
-		hist, ok := ds.statisticTable.Columns[col.ID]
-		if ok && hist.Count > 0 {
-			factor := float64(ds.statisticTable.Count) / float64(hist.Count)
-			profile.Cardinality[i] = float64(hist.NDV) * factor
-		} else {
-			profile.Cardinality[i] = profile.RowCount * distinctFactor
-		}
-	}
-	ds.stats = profile
 	selectivity, nodes, err := profile.HistColl.Selectivity(ds.ctx, conds)
 	if err != nil {
 		log.Warnf("An error happened: %v, we have to use the default selectivity", err.Error())
 		selectivity = selectionFactor
 	}
-	if ds.ctx.GetSessionVars().OptimizerSelectivityLevel >= 1 && ds.stats.HistColl != nil {
-		finalHist := ds.stats.HistColl.NewHistCollBySelectivity(ds.ctx.GetSessionVars().StmtCtx, nodes)
-		return profile, finalHist
+	profile.RowCount *= selectivity
+	var finalHist *statistics.HistColl
+	if ds.ctx.GetSessionVars().OptimizerSelectivityLevel >= 1 && profile.HistColl != nil {
+		finalHist = profile.HistColl.NewHistCollBySelectivity(ds.ctx.GetSessionVars().StmtCtx, selectivity, nodes)
+		for i, col := range ds.schema.Columns {
+			if c, ok := finalHist.Columns[col.UniqueID]; ok && c.Count > 0 {
+				profile.Cardinality[i] = float64(c.NDV)
+			} else {
+				profile.Cardinality[i] = profile.RowCount * distinctFactor
+			}
+		}
+	} else {
+		for i := range ds.Columns {
+			profile.Cardinality[i] = profile.RowCount * distinctFactor
+		}
 	}
-	return profile.Scale(selectivity), nil
+
+	return profile.Scale(selectivity), finalHist
 }
 
 // DeriveStats implement LogicalPlan DeriveStats interface.
