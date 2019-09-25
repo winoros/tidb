@@ -15,6 +15,7 @@ package core
 
 import (
 	"math"
+	"sort"
 
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
@@ -466,6 +467,7 @@ func (p *LogicalJoin) deriveInnerJoinStatsWithHist(leftKeys, rightKeys []*expres
 
 	finalNdv, leftNdv, rightNdv := math.MaxFloat64, float64(1), float64(1)
 	newColID2Hist := make(map[int64]*statistics.Column)
+	selectivities := make([]float64, 0, len(leftKeys))
 
 	// TODO: Support using index histogram to calculate the NDV after join and the final row count.
 	for i := range leftKeys {
@@ -510,10 +512,23 @@ func (p *LogicalJoin) deriveInnerJoinStatsWithHist(leftKeys, rightKeys []*expres
 			leftNdv = leftProfile.Cardinality[lPos]
 			rightNdv = rightProfile.Cardinality[rPos]
 		}
+		selectivities = append(selectivities, finalNdv/leftNdv/rightNdv)
+	}
+	sort.Float64s(selectivities)
+	ret := selectivities[len(selectivities)-1]
+	for i, j := len(selectivities)-2, 2; i >= 0 && j <= 4; i, j = i-1, j+1 {
+		switch j {
+		case 2:
+			ret *= math.Sqrt(selectivities[i])
+		case 3:
+			ret *= math.Cbrt(selectivities[i])
+		case 4:
+			ret *= math.Sqrt(math.Sqrt(selectivities[i]))
+		}
 	}
 	var count float64 = 0
 	if leftNdv != 0 || rightNdv != 0 {
-		count = leftProfile.RowCount / leftNdv * rightProfile.RowCount / rightNdv * finalNdv
+		count = leftProfile.RowCount * rightProfile.RowCount * ret
 	}
 
 	// Update left column map in `HistColl`.
