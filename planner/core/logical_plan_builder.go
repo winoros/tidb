@@ -25,6 +25,7 @@ import (
 
 	"github.com/cznic/mathutil"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/format"
@@ -46,6 +47,7 @@ import (
 	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/plancodec"
+	"go.uber.org/zap"
 )
 
 const (
@@ -2949,6 +2951,7 @@ func (b *PlanBuilder) buildUpdate(ctx context.Context, update *ast.UpdateStmt) (
 	copy(proj.schema.Columns, p.Schema().Columns[:oldSchemaLen])
 	proj.SetChildren(p)
 	p = proj
+	log.Warn("update finish build result set", zap.String("names", fmt.Sprintf("%v", fmt.Sprintf("%v", proj.names))), zap.String("cols", proj.schema.String()))
 
 	var updateTableList []*ast.TableName
 	updateTableList = extractTableList(update.TableRefs.TableRefs, updateTableList, true)
@@ -2957,6 +2960,7 @@ func (b *PlanBuilder) buildUpdate(ctx context.Context, update *ast.UpdateStmt) (
 		return nil, err
 	}
 	p = np
+	log.Warn("update finish build result set", zap.String("names", fmt.Sprintf("%v", fmt.Sprintf("%v", p.OutputNames()))), zap.String("cols", p.Schema().String()))
 
 	updt := Update{
 		OrderedList:               orderedList,
@@ -2969,6 +2973,7 @@ func (b *PlanBuilder) buildUpdate(ctx context.Context, update *ast.UpdateStmt) (
 	if err != nil {
 		return nil, err
 	}
+	log.Warn("update finish covert to physical plan", zap.String("cols", updt.SelectPlan.Schema().String()), zap.String("physical plan string", ToString(updt.SelectPlan)))
 	err = updt.ResolveIndices()
 	if err != nil {
 		return nil, err
@@ -2980,8 +2985,10 @@ func (b *PlanBuilder) buildUpdate(ctx context.Context, update *ast.UpdateStmt) (
 	tblID2table := make(map[int64]table.Table)
 	for id := range tblID2Handle {
 		tblID2table[id], _ = b.is.TableByID(id)
+		log.Warn("table in update", zap.Int64("table id", id), zap.String("table name", tblID2table[id].Meta().Name.L))
 	}
 	updt.TblColPosInfos, err = buildColumns2Handle(updt.OutputNames(), tblID2Handle, tblID2table, true)
+	log.Warn("update finish build the position info of Table cols", zap.String("position info", fmt.Sprintf("%v", updt.TblColPosInfos)))
 	return updt, err
 }
 

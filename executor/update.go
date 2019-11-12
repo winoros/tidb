@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
@@ -27,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"go.uber.org/zap"
 )
 
 // UpdateExec represents a new update executor.
@@ -173,13 +175,16 @@ func (e *UpdateExec) fetchChunkRows(ctx context.Context) error {
 	if !e.allAssignmentsAreConstant {
 		composeFunc = e.composeNewRow
 	}
+	rowCnt := 0
 	for {
 		err := Next(ctx, e.children[0], chk)
 		if err != nil {
 			return err
 		}
+		rowCnt += chk.NumRows()
 
 		if chk.NumRows() == 0 {
+			log.Warn("update's child exec finished", zap.Int("child rows num", rowCnt))
 			break
 		}
 		for rowIdx := 0; rowIdx < chk.NumRows(); rowIdx++ {
