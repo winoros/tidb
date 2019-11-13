@@ -52,6 +52,8 @@ type UpdateExec struct {
 	tblColPosInfos            plannercore.TblColPosInfoSlice
 	evalBuffer                chunk.MutRow
 	allAssignmentsAreConstant bool
+
+	testingArg int
 }
 
 func (e *UpdateExec) exec(ctx context.Context, schema *expression.Schema) ([]types.Datum, error) {
@@ -74,6 +76,11 @@ func (e *UpdateExec) exec(ctx context.Context, schema *expression.Schema) ([]typ
 		}
 		handleDatum := row[content.HandleOrdinal]
 		if e.canNotUpdate(handleDatum) {
+			if e.testingArg < 10 {
+				s, _ := types.DatumsToString(row, true)
+				log.Warn("the row cannot update", zap.String("row content", s))
+				e.testingArg++
+			}
 			continue
 		}
 		handle := row[content.HandleOrdinal].GetInt64()
@@ -88,6 +95,10 @@ func (e *UpdateExec) exec(ctx context.Context, schema *expression.Schema) ([]typ
 			}
 		}
 		if !updatable {
+			if e.testingArg < 10 {
+				log.Warn("no assignments", zap.Int64("table id", content.TblID), zap.Int("start pos in row", content.Start), zap.Int("end pos in row", content.End), zap.Int("row id pos in row", content.HandleOrdinal))
+				e.testingArg++
+			}
 			// If there's nothing to update, we can just skip current row
 			continue
 		}
