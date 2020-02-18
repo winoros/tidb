@@ -635,7 +635,7 @@ func (imw *innerMergeWorker) constructDatumLookupKey(task *lookUpMergeJoinTask, 
 			}
 			return nil, err
 		}
-		cmp, err := outerValue.CompareDatum(sc, &innerValue)
+		cmp, err := outerValue.CompareDatumWithCollation(sc, &innerValue, innerColType.Collate, innerColType.Collate)
 		if err != nil {
 			return nil, err
 		}

@@ -14,8 +14,11 @@
 package types
 
 import (
+	"bytes"
 	"math"
 	"time"
+
+	"github.com/pingcap/tidb/util/collate"
 )
 
 // CompareInt64 returns an integer comparing the int64 x to y.
@@ -120,6 +123,12 @@ func CompareString(x, y string) int {
 	}
 
 	return 1
+}
+
+func CompareStringWithCollation(x, y string, xCollation, yCollation string) int {
+	xCollator := collate.GetCollator(xCollation)
+	yCollator := collate.GetCollator(yCollation)
+	return bytes.Compare(xCollator.Key(x, collate.EmptyOption), yCollator.Key(y, collate.EmptyOption))
 }
 
 // CompareDuration returns an integer comparing the duration x to y.

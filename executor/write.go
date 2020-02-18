@@ -94,7 +94,7 @@ func updateRecord(ctx context.Context, sctx sessionctx.Context, h int64, oldData
 
 	// 3. Compare datum, then handle some flags.
 	for i, col := range t.Cols() {
-		cmp, err := newData[i].CompareDatum(sc, &oldData[i])
+		cmp, err := newData[i].CompareDatumWithCollation(sc, &oldData[i], col.ToInfo().FieldType.Collate, col.ToInfo().FieldType.Collate)
 		if err != nil {
 			return false, false, 0, err
 		}

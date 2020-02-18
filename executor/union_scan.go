@@ -261,7 +261,7 @@ func (us *UnionScanExec) compare(a, b []types.Datum) (int, error) {
 	for _, colOff := range us.usedIndex {
 		aColumn := a[colOff]
 		bColumn := b[colOff]
-		cmp, err := aColumn.CompareDatum(sc, &bColumn)
+		cmp, err := aColumn.CompareDatumWithCollation(sc, &bColumn, us.retFieldTypes[colOff].Collate, us.retFieldTypes[colOff].Collate)
 		if err != nil {
 			return 0, err
 		}

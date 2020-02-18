@@ -1114,14 +1114,14 @@ func tryToConvertConstantInt(ctx sessionctx.Context, targetFieldType *types.Fiel
 	}, false
 }
 
-// RefineComparedConstant changes a non-integer constant argument to its ceiling or floor result by the given op.
+// RefineComparedConstantForIntType changes a non-integer constant argument to its ceiling or floor result by the given op.
 // isExceptional indicates whether the 'int column [cmp] const' might be true/false.
 // If isExceptional is true, ExecptionalVal is returned. Or, CorrectVal is returned.
 // CorrectVal: The computed result. If the constant can be converted to int without exception, return the val. Else return 'con'(the input).
 // ExceptionalVal : It is used to get more information to check whether 'int column [cmp] const' is true/false
 // 					If the op == LT,LE,GT,GE and it gets an Overflow when converting, return inf/-inf.
 // 					If the op == EQ,NullEQ and the constant can never be equal to the int column, return ‘con’(the input, a non-int constant).
-func RefineComparedConstant(ctx sessionctx.Context, targetFieldType types.FieldType, con *Constant, op opcode.Op) (_ *Constant, isExceptional bool) {
+func RefineComparedConstantForIntType(ctx sessionctx.Context, targetFieldType types.FieldType, con *Constant, op opcode.Op) (_ *Constant, isExceptional bool) {
 	dt, err := con.Eval(chunk.Row{})
 	if err != nil {
 		return con, false
@@ -1217,7 +1217,7 @@ func (c *compareFunctionClass) refineArgs(ctx sessionctx.Context, args []Express
 	isPositiveInfinite, isNegativeInfinite := false, false
 	// int non-constant [cmp] non-int constant
 	if arg0IsInt && !arg0IsCon && !arg1IsInt && arg1IsCon {
-		arg1, isExceptional = RefineComparedConstant(ctx, *arg0Type, arg1, c.op)
+		arg1, isExceptional = RefineComparedConstantForIntType(ctx, *arg0Type, arg1, c.op)
 		finalArg1 = arg1
 		if isExceptional && arg1.GetType().EvalType() == types.ETInt {
 			// Judge it is inf or -inf
@@ -1236,7 +1236,7 @@ func (c *compareFunctionClass) refineArgs(ctx sessionctx.Context, args []Express
 	}
 	// non-int constant [cmp] int non-constant
 	if arg1IsInt && !arg1IsCon && !arg0IsInt && arg0IsCon {
-		arg0, isExceptional = RefineComparedConstant(ctx, *arg1Type, arg0, symmetricOp[c.op])
+		arg0, isExceptional = RefineComparedConstantForIntType(ctx, *arg1Type, arg0, symmetricOp[c.op])
 		finalArg0 = arg0
 		if isExceptional && arg0.GetType().EvalType() == types.ETInt {
 			if arg0.Value.GetInt64()&1 == 1 {

@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
 )
 
 func validInterval(sc *stmtctx.StatementContext, low, high point) (bool, error) {
@@ -94,9 +95,14 @@ func convertPoint(sc *stmtctx.StatementContext, point point, tp *types.FieldType
 	if err != nil {
 		return point, errors.Trace(err)
 	}
-	valCmpCasted, err := point.value.CompareDatum(sc, &casted)
-	if err != nil {
-		return point, errors.Trace(err)
+	var valCmpCasted int
+	if tp.EvalType() != types.ETString {
+		valCmpCasted, err = point.value.CompareDatum(sc, &casted)
+		if err != nil {
+			return point, errors.Trace(err)
+		}
+	} else {
+		casted.SetBytes(collate.GetCollator(tp.Collate).Key(casted.GetString(), collate.EmptyOption))
 	}
 	point.value = casted
 	if valCmpCasted == 0 {

@@ -48,6 +48,7 @@ func (t *topNSorter) Less(i, j int) bool {
 		v1 := t.rows[i].key[index]
 		v2 := t.rows[j].key[index]
 
+		// Use `CompareDatumWithCollation` instead.
 		ret, err := v1.CompareDatum(t.sc, &v2)
 		if err != nil {
 			t.err = errors.Trace(err)

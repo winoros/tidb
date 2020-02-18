@@ -980,9 +980,15 @@ func (ijHelper *indexJoinBuildHelper) findUsefulEqAndInFilters(innerPlan *DataSo
 	var remainedEqOrIn []expression.Expression
 	// Extract the eq/in functions of possible join key.
 	// you can see the comment of ExtractEqAndInCondition to get the meaning of the second return value.
+	tpSlice := make([]*types.FieldType, 0, len(ijHelper.curNotUsedIndexCols))
+	for _, col := range ijHelper.curNotUsedIndexCols {
+		tpSlice = append(tpSlice, col.RetType)
+	}
 	usefulEqOrInFilters, remainedEqOrIn, remainingRangeCandidates, _ = ranger.ExtractEqAndInCondition(
-		innerPlan.ctx, innerPlan.pushedDownConds,
+		innerPlan.ctx,
+		innerPlan.pushedDownConds,
 		ijHelper.curNotUsedIndexCols,
+		tpSlice,
 		ijHelper.curNotUsedColLens,
 	)
 	uselessFilters = append(uselessFilters, remainedEqOrIn...)

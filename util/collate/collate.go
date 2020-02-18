@@ -23,6 +23,12 @@ var (
 	collatorIDMap       map[int]Collator
 	newCollationEnabled bool
 	setCollationOnce    sync.Once
+	EmptyOption         = CollatorOption{}
+)
+
+const (
+	DefaultCollation   = "binary"
+	DefaultCollationID = 63
 )
 
 // CollatorOption is the option of collator.

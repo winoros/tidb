@@ -48,7 +48,7 @@ func (mmf *maxMinFunction) Update(evalCtx *AggEvaluateContext, sc *stmtctx.State
 		return nil
 	}
 	var c int
-	c, err = evalCtx.Value.CompareDatum(sc, &value)
+	c, err = evalCtx.Value.CompareDatumWithCollation(sc, &value, mmf.RetTp.Collate, mmf.RetTp.Collate)
 	if err != nil {
 		return err
 	}

@@ -75,6 +75,7 @@ type pointSorter struct {
 	points []point
 	err    error
 	sc     *stmtctx.StatementContext
+	tp     *types.FieldType
 }
 
 func (r *pointSorter) Len() int {
@@ -84,15 +85,15 @@ func (r *pointSorter) Len() int {
 func (r *pointSorter) Less(i, j int) bool {
 	a := r.points[i]
 	b := r.points[j]
-	less, err := rangePointLess(r.sc, a, b)
+	less, err := rangePointLess(r.sc, a, b, r.tp)
 	if err != nil {
 		r.err = err
 	}
 	return less
 }
 
-func rangePointLess(sc *stmtctx.StatementContext, a, b point) (bool, error) {
-	cmp, err := a.value.CompareDatum(sc, &b.value)
+func rangePointLess(sc *stmtctx.StatementContext, a, b point, tp *types.FieldType) (bool, error) {
+	cmp, err := a.value.CompareDatumWithCollation(sc, &b.value, tp.Collate, tp.Collate)
 	if cmp != 0 {
 		return cmp < 0, nil
 	}
@@ -148,6 +149,7 @@ func NullRange() []*Range {
 type builder struct {
 	err error
 	sc  *stmtctx.StatementContext
+	tp  *types.FieldType
 }
 
 func (r *builder) build(expr expression.Expression) []point {
@@ -359,7 +361,7 @@ func (r *builder) buildFromIn(expr *expression.ScalarFunction) ([]point, bool) {
 		endPoint := point{value: types.NewDatum(dt.GetValue())}
 		rangePoints = append(rangePoints, startPoint, endPoint)
 	}
-	sorter := pointSorter{points: rangePoints, sc: r.sc}
+	sorter := pointSorter{points: rangePoints, sc: r.sc, tp: r.tp}
 	sort.Sort(&sorter)
 	if sorter.err != nil {
 		r.err = sorter.err
@@ -549,7 +551,7 @@ func (r *builder) mergeSorted(a, b []point) []point {
 	ret := make([]point, 0, len(a)+len(b))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
-		less, err := rangePointLess(r.sc, a[i], b[j])
+		less, err := rangePointLess(r.sc, a[i], b[j], r.tp)
 		if err != nil {
 			r.err = err
 			return nil

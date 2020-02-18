@@ -341,7 +341,7 @@ func (c *Constant) Equal(ctx sessionctx.Context, b Expression) bool {
 	if err1 != nil || err2 != nil {
 		return false
 	}
-	con, err := c.Value.CompareDatum(ctx.GetSessionVars().StmtCtx, &y.Value)
+	con, err := c.Value.CompareDatumWithCollation(ctx.GetSessionVars().StmtCtx, &y.Value, c.RetType.Collate, b.GetType().Collate)
 	if err != nil || con != 0 {
 		return false
 	}

@@ -287,6 +287,7 @@ func (e *streamAggExec) meetNewGroup(row [][]byte) (bool, error) {
 			return false, errors.Trace(err)
 		}
 		if matched {
+			// Use `CompareDatumWithCollation` instead.
 			c, err := d.CompareDatum(e.evalCtx.sc, &e.nextGroupByRow[i])
 			if err != nil {
 				return false, errors.Trace(err)

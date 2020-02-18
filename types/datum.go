@@ -522,6 +522,20 @@ func (d *Datum) CompareDatum(sc *stmtctx.StatementContext, ad *Datum) (int, erro
 	}
 }
 
+func (d *Datum) CompareDatumWithCollation(
+	sc *stmtctx.StatementContext,
+	ad *Datum,
+	selfCollate, rhsCollate string,
+) (int, error) {
+	if ad.k == KindString {
+		if selfCollate == "" {
+			selfCollate = mysql.DefaultCollationName
+		}
+		return d.compareStringWithFieldType(sc, ad.GetString(), selfCollate, rhsCollate)
+	}
+	return d.CompareDatum(sc, ad)
+}
+
 func (d *Datum) compareInt64(sc *stmtctx.StatementContext, i int64) (int, error) {
 	switch d.k {
 	case KindMaxValue:
@@ -617,6 +631,43 @@ func (d *Datum) compareString(sc *stmtctx.StatementContext, s string) (int, erro
 		return CompareString(d.GetMysqlEnum().String(), s), nil
 	case KindBinaryLiteral, KindMysqlBit:
 		return CompareString(d.GetBinaryLiteral().ToString(), s), nil
+	default:
+		fVal, err := StrToFloat(sc, s)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		return d.compareFloat64(sc, fVal)
+	}
+}
+
+func (d *Datum) compareStringWithFieldType(
+	sc *stmtctx.StatementContext,
+	s string,
+	selfCollate, rhsCollate string,
+) (int, error) {
+	switch d.k {
+	case KindNull, KindMinNotNull:
+		return -1, nil
+	case KindMaxValue:
+		return 1, nil
+	case KindString, KindBytes:
+		return CompareStringWithCollation(d.GetString(), s, selfCollate, rhsCollate), nil
+	case KindMysqlDecimal:
+		dec := new(MyDecimal)
+		err := sc.HandleTruncate(dec.FromString(hack.Slice(s)))
+		return d.GetMysqlDecimal().Compare(dec), errors.Trace(err)
+	case KindMysqlTime:
+		dt, err := ParseDatetime(sc, s)
+		return d.GetMysqlTime().Compare(dt), errors.Trace(err)
+	case KindMysqlDuration:
+		dur, err := ParseDuration(sc, s, MaxFsp)
+		return d.GetMysqlDuration().Compare(dur), errors.Trace(err)
+	case KindMysqlSet:
+		return CompareStringWithCollation(d.GetMysqlSet().String(), s, selfCollate, rhsCollate), nil
+	case KindMysqlEnum:
+		return CompareStringWithCollation(d.GetMysqlEnum().String(), s, selfCollate, rhsCollate), nil
+	case KindBinaryLiteral, KindMysqlBit:
+		return CompareStringWithCollation(d.GetBinaryLiteral().ToString(), s, selfCollate, rhsCollate), nil
 	default:
 		fVal, err := StrToFloat(sc, s)
 		if err != nil {

@@ -146,7 +146,7 @@ func detachCNFCondAndBuildRangeForIndex(sctx sessionctx.Context, conditions []ex
 	)
 	res := &DetachRangeResult{}
 
-	accessConds, filterConds, newConditions, emptyRange := ExtractEqAndInCondition(sctx, conditions, cols, lengths)
+	accessConds, filterConds, newConditions, emptyRange := ExtractEqAndInCondition(sctx, conditions, cols, tpSlice, lengths)
 	if emptyRange {
 		return res, nil
 	}
@@ -201,8 +201,13 @@ func detachCNFCondAndBuildRangeForIndex(sctx sessionctx.Context, conditions []ex
 // newConditions: We'll simplify the given conditions if there're multiple in conditions or eq conditions on the same column.
 //   e.g. if there're a in (1, 2, 3) and a in (2, 3, 4). This two will be combined to a in (2, 3) and pushed to newConditions.
 // bool: indicate whether there's nil range when merging eq and in conditions.
-func ExtractEqAndInCondition(sctx sessionctx.Context, conditions []expression.Expression,
-	cols []*expression.Column, lengths []int) ([]expression.Expression, []expression.Expression, []expression.Expression, bool) {
+func ExtractEqAndInCondition(
+	sctx sessionctx.Context,
+	conditions []expression.Expression,
+	cols []*expression.Column,
+	tpSlice []*types.FieldType,
+	lengths []int,
+) ([]expression.Expression, []expression.Expression, []expression.Expression, bool) {
 	var filters []expression.Expression
 	rb := builder{sc: sctx.GetSessionVars().StmtCtx}
 	accesses := make([]expression.Expression, len(cols))
@@ -225,6 +230,7 @@ func ExtractEqAndInCondition(sctx sessionctx.Context, conditions []expression.Ex
 			mergedAccesses[offset] = accesses[offset]
 			points[offset] = rb.build(accesses[offset])
 		}
+		rb.tp = tpSlice[offset]
 		points[offset] = rb.intersection(points[offset], rb.build(cond))
 		// Early termination if false expression found
 		if len(points[offset]) == 0 {
@@ -265,7 +271,7 @@ func detachDNFCondAndBuildRangeForIndex(sctx sessionctx.Context, condition *expr
 		shouldReserve: lengths[0] != types.UnspecifiedLength,
 		length:        lengths[0],
 	}
-	rb := builder{sc: sc}
+	rb := builder{sc: sc, tp: newTpSlice[0]}
 	dnfItems := expression.FlattenDNFConditions(condition)
 	newAccessItems := make([]expression.Expression, 0, len(dnfItems))
 	var totalRanges []*Range
