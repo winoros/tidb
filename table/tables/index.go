@@ -322,7 +322,7 @@ func (c *index) Create(sctx sessionctx.Context, rm kv.RetrieverMutator, indexedV
 			// The len of the idxVal is always >= 10 since len (restoredValue) > 0.
 			tailLen += 8
 			idxVal = append(idxVal, EncodeHandle(h)...)
-		} else {
+		} else if len(idxVal) < 10 {
 			// Padding the len to 10
 			paddingLen := 10 - len(idxVal)
 			tailLen += paddingLen
