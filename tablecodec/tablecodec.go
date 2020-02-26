@@ -644,6 +644,7 @@ func decodeIndexKvNewCollation(key, value []byte, colsLen int, hdStatus HandleSt
 	for i, col := range columns {
 		colIDs[col.ID] = i
 	}
+	// We don't need to decode handle here, and colIDs >= 0 always.
 	rd := rowcodec.NewByteDecoder(columns, -1, nil, nil)
 	vLen := len(value)
 	tailLen := int(value[0])
@@ -655,11 +656,7 @@ func decodeIndexKvNewCollation(key, value []byte, colsLen int, hdStatus HandleSt
 	if tailLen < 8 {
 		// In non-unique index.
 		if handleExists(hdStatus) {
-			_, b, err := CutIndexKeyNew(key, colsLen)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			resultValues = append(resultValues, b)
+			resultValues = append(resultValues, key[len(key)-9:])
 		}
 	} else {
 		// In unique index.
@@ -805,7 +802,7 @@ func IsUntouchedIndexKValue(k, v []byte) bool {
 	tailLen := int(v[0])
 	if tailLen < 8 {
 		// Non-unique index.
-		return vLen == 11
+		return tailLen >= 1 && v[vLen-1] == kv.UnCommitIndexKVFlag
 	}
 	// Unique index
 	return v[0] == 1 || v[0] == 9

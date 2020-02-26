@@ -135,7 +135,7 @@ func getKeysNeedCheckOneRow(ctx sessionctx.Context, t table.Table, row []types.D
 		}
 		// Pass handle = 0 to GenIndexKey,
 		// due to we only care about distinct key.
-		key, _, distinct, err1 := v.GenIndexKey(ctx.GetSessionVars().StmtCtx,
+		key, distinct, err1 := v.GenIndexKey(ctx.GetSessionVars().StmtCtx,
 			colVals, 0, nil)
 		if err1 != nil {
 			return nil, err1
