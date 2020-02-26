@@ -648,7 +648,7 @@ func decodeIndexKvNewCollation(key, value []byte, colsLen int, hdStatus HandleSt
 	rd := rowcodec.NewByteDecoder(columns, -1, nil, nil)
 	vLen := len(value)
 	tailLen := int(value[0])
-	resultValues, err := rd.DecodeToBytes(colIDs, -1, value[1:vLen-tailLen], nil)
+	resultValues, err := rd.DecodeToBytesNoHandle(colIDs, value[1:vLen-tailLen])
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -805,7 +805,7 @@ func IsUntouchedIndexKValue(k, v []byte) bool {
 		return tailLen >= 1 && v[vLen-1] == kv.UnCommitIndexKVFlag
 	}
 	// Unique index
-	return v[0] == 1 || v[0] == 9
+	return tailLen == 9
 }
 
 // GenTablePrefix composes table record and index prefix: "t[tableID]".

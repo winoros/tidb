@@ -262,6 +262,7 @@ type indexScanExec struct {
 	start          int
 	counts         []int64
 	execDetail     *execDetail
+	colInfos       []rowcodec.ColInfo
 
 	src executor
 }
@@ -370,17 +371,7 @@ func (e *indexScanExec) getRowFromPoint(ran kv.KeyRange) ([][]byte, error) {
 	if len(val) == 0 {
 		return nil, nil
 	}
-	colInfos := make([]rowcodec.ColInfo, 0, len(e.Columns))
-	for i := range e.Columns {
-		col := e.Columns[i]
-		colInfos = append(colInfos, rowcodec.ColInfo{
-			ID:         col.ColumnId,
-			Tp:         col.Tp,
-			Flag:       col.Flag,
-			IsPKHandle: col.GetPkHandle(),
-		})
-	}
-	return tablecodec.DecodeIndexKV(ran.StartKey, val, e.colsLen, e.hdStatus, colInfos)
+	return tablecodec.DecodeIndexKV(ran.StartKey, val, e.colsLen, e.hdStatus, e.colInfos)
 }
 
 func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
@@ -419,17 +410,7 @@ func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 		}
 		e.seekKey = []byte(kv.Key(pair.Key).PrefixNext())
 	}
-	colInfos := make([]rowcodec.ColInfo, 0, len(e.Columns))
-	for i := range e.Columns {
-		col := e.Columns[i]
-		colInfos = append(colInfos, rowcodec.ColInfo{
-			ID:         col.ColumnId,
-			Tp:         col.Tp,
-			Flag:       col.Flag,
-			IsPKHandle: col.GetPkHandle(),
-		})
-	}
-	return tablecodec.DecodeIndexKV(pair.Key, pair.Value, e.colsLen, e.hdStatus, colInfos)
+	return tablecodec.DecodeIndexKV(pair.Key, pair.Value, e.colsLen, e.hdStatus, e.colInfos)
 }
 
 type selectionExec struct {

@@ -126,9 +126,7 @@ func NewIndex(physicalID int64, tblInfo *model.TableInfo, indexInfo *model.Index
 		// The prefix can't encode from tblInfo.ID, because table partition may change the id to partition id.
 		prefix: tablecodec.EncodeTableIndexPrefix(physicalID, indexInfo.ID),
 	}
-	if collate.NewCollationEnabled() {
-		index.containNonBinaryString = index.checkContainNonBinaryString()
-	}
+	index.containNonBinaryString = index.checkContainNonBinaryString()
 	return index
 }
 
