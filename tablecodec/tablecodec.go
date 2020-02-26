@@ -643,6 +643,7 @@ func decodeIndexKvNewCollation(key, value []byte, colsLen int, hdStatus HandleSt
 	for i, col := range columns {
 		colIDs[col.ID] = i
 	}
+	// We don't need to decode handle here, and colIDs >= 0 always.
 	rd := rowcodec.NewByteDecoder(columns, -1, nil, nil)
 	vLen := len(value)
 	tailLen := int(value[0])
