@@ -13,7 +13,6 @@
 
 package expression
 
-import "C"
 import (
 	"math"
 

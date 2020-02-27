@@ -15,6 +15,7 @@ package collate
 
 import (
 	"strings"
+	"sync/atomic"
 
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/util/logutil"
@@ -24,8 +25,9 @@ import (
 var (
 	collatorMap         map[string]Collator
 	collatorIDMap       map[int]Collator
-	id2NameMap          map[int32]string
-	newCollationEnabled bool
+	newCollatorMap      map[string]Collator
+	newCollatorIDMap    map[int]Collator
+	newCollationEnabled int32
 )
 
 // DefaultLen is set for datum if the string datum don't know its length.
@@ -60,33 +62,16 @@ func EnableNewCollations() {
 // SetNewCollationEnabledForTest sets if the new collation are enabled in test.
 // Note: Be careful to use this function, if this functions is used in tests, make sure the tests are serial.
 func SetNewCollationEnabledForTest(flag bool) {
-	newCollationEnabled = flag
-	if newCollationEnabled {
-		collatorMap["utf8mb4_bin"] = &binPaddingCollator{}
-		collatorMap["utf8_bin"] = &binPaddingCollator{}
-		collatorMap["utf8mb4_general_ci"] = &generalCICollator{}
-		collatorMap["utf8_general_ci"] = &generalCICollator{}
-
-		collatorIDMap[46] = &binPaddingCollator{}
-		collatorIDMap[83] = &binPaddingCollator{}
-		collatorIDMap[45] = &generalCICollator{}
-		collatorIDMap[33] = &generalCICollator{}
-	} else {
-		collatorMap["utf8mb4_bin"] = &binCollator{}
-		collatorMap["utf8_bin"] = &binCollator{}
-		collatorMap["utf8mb4_general_ci"] = &binCollator{}
-		collatorMap["utf8_general_ci"] = &binCollator{}
-
-		collatorIDMap[46] = &binCollator{}
-		collatorIDMap[83] = &binCollator{}
-		collatorIDMap[45] = &binCollator{}
-		collatorIDMap[33] = &binCollator{}
+	if flag {
+		atomic.StoreInt32(&newCollationEnabled, 1)
+		return
 	}
+	atomic.StoreInt32(&newCollationEnabled, 0)
 }
 
 // NewCollationEnabled returns if the new collations are enabled.
 func NewCollationEnabled() bool {
-	return newCollationEnabled
+	return atomic.LoadInt32(&newCollationEnabled) == 1
 }
 
 // RewriteNewCollationIDIfNeeded rewrites a collation id if the new collations are enabled.
@@ -95,7 +80,7 @@ func NewCollationEnabled() bool {
 // the protocol definition.
 // When new collations are not enabled, collation id remains the same.
 func RewriteNewCollationIDIfNeeded(id int32) int32 {
-	if newCollationEnabled {
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
 		if id < 0 {
 			logutil.BgLogger().Warn("Unexpected negative collation ID for rewrite.", zap.Int32("ID", id))
 		} else {
@@ -107,7 +92,7 @@ func RewriteNewCollationIDIfNeeded(id int32) int32 {
 
 // RestoreCollationIDIfNeeded restores a collation id if the new collations are enabled.
 func RestoreCollationIDIfNeeded(id int32) int32 {
-	if newCollationEnabled {
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
 		if id > 0 {
 			logutil.BgLogger().Warn("Unexpected positive collation ID for restore.", zap.Int32("ID", id))
 		} else {
@@ -119,6 +104,13 @@ func RestoreCollationIDIfNeeded(id int32) int32 {
 
 // GetCollator get the collator according to collate, it will return the binary collator if the corresponding collator doesn't exist.
 func GetCollator(collate string) Collator {
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
+		ctor, ok := newCollatorMap[collate]
+		if !ok {
+			return newCollatorMap["utf8mb4_bin"]
+		}
+		return ctor
+	}
 	ctor, ok := collatorMap[collate]
 	if !ok {
 		return collatorMap["utf8mb4_bin"]
@@ -128,6 +120,13 @@ func GetCollator(collate string) Collator {
 
 // GetCollatorByID get the collator according to id, it will return the binary collator if the corresponding collator doesn't exist.
 func GetCollatorByID(id int) Collator {
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
+		ctor, ok := newCollatorIDMap[id]
+		if !ok {
+			return newCollatorMap["utf8mb4_bin"]
+		}
+		return ctor
+	}
 	ctor, ok := collatorIDMap[id]
 	if !ok {
 		return collatorMap["utf8mb4_bin"]
@@ -184,7 +183,8 @@ func (bpc *binPaddingCollator) Key(str string, opt CollatorOption) []byte {
 func init() {
 	collatorMap = make(map[string]Collator)
 	collatorIDMap = make(map[int]Collator)
-	id2NameMap = make(map[int32]string)
+	newCollatorMap = make(map[string]Collator)
+	newCollatorIDMap = make(map[int]Collator)
 
 	collatorMap["binary"] = &binCollator{}
 	collatorMap["utf8mb4_bin"] = &binCollator{}
@@ -199,9 +199,15 @@ func init() {
 	collatorIDMap[45] = &binCollator{}
 	collatorIDMap[33] = &binCollator{}
 
-	id2NameMap[63] = "binary"
-	id2NameMap[45] = "utf8mb4_general_ci"
-	id2NameMap[33] = "utf8_general_ci"
-	id2NameMap[83] = "utf8_bin"
-	id2NameMap[46] = "utf8mb4_bin"
+	newCollatorMap["binary"] = &binCollator{}
+	newCollatorMap["utf8mb4_bin"] = &binPaddingCollator{}
+	newCollatorMap["utf8_bin"] = &binPaddingCollator{}
+	newCollatorMap["utf8mb4_general_ci"] = &generalCICollator{}
+	newCollatorMap["utf8_general_ci"] = &generalCICollator{}
+
+	newCollatorIDMap[63] = &binCollator{}
+	newCollatorIDMap[46] = &binPaddingCollator{}
+	newCollatorIDMap[83] = &binPaddingCollator{}
+	newCollatorIDMap[45] = &generalCICollator{}
+	newCollatorIDMap[33] = &generalCICollator{}
 }
