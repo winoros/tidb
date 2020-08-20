@@ -29,7 +29,7 @@ type testFeedbackSuite struct {
 
 func newFeedback(lower, upper, count int64) Feedback {
 	low, upp := types.NewIntDatum(lower), types.NewIntDatum(upper)
-	return Feedback{&low, &upp, count, 0}
+	return Feedback{&low, &upp, count, 0, 0}
 }
 
 func genFeedbacks(lower, upper int64) []Feedback {
@@ -176,6 +176,7 @@ func (s *testFeedbackSuite) TestMergeBuckets(c *C) {
 	tests := []struct {
 		points       []int64
 		counts       []int64
+		ndvs         []int64
 		isNewBuckets []bool
 		bucketCount  int
 		result       string
@@ -185,27 +186,29 @@ func (s *testFeedbackSuite) TestMergeBuckets(c *C) {
 			counts:       []int64{1},
 			isNewBuckets: []bool{false},
 			bucketCount:  1,
-			result:       "column:0 ndv:0 totColSize:0\nnum: 1 lower_bound: 1 upper_bound: 2 repeats: 0",
+			result:       "column:0 ndv:0 totColSize:0\nnum: 1 lower_bound: 1 upper_bound: 2 repeats: 0 ndv: 0",
 		},
 		{
 			points:       []int64{1, 2, 2, 3, 3, 4},
 			counts:       []int64{100000, 1, 1},
+			ndvs:         []int64{1, 1, 1},
 			isNewBuckets: []bool{false, false, false},
 			bucketCount:  2,
 			result: "column:0 ndv:0 totColSize:0\n" +
-				"num: 100000 lower_bound: 1 upper_bound: 2 repeats: 0\n" +
-				"num: 2 lower_bound: 2 upper_bound: 4 repeats: 0",
+				"num: 100000 lower_bound: 1 upper_bound: 2 repeats: 0 ndv: 1\n" +
+				"num: 2 lower_bound: 2 upper_bound: 4 repeats: 0 ndv: 2",
 		},
 		// test do not Merge if the result bucket count is too large
 		{
 			points:       []int64{1, 2, 2, 3, 3, 4, 4, 5},
 			counts:       []int64{1, 1, 100000, 100000},
+			ndvs:         []int64{1, 1, 1, 1},
 			isNewBuckets: []bool{false, false, false, false},
 			bucketCount:  3,
 			result: "column:0 ndv:0 totColSize:0\n" +
-				"num: 2 lower_bound: 1 upper_bound: 3 repeats: 0\n" +
-				"num: 100000 lower_bound: 3 upper_bound: 4 repeats: 0\n" +
-				"num: 100000 lower_bound: 4 upper_bound: 5 repeats: 0",
+				"num: 2 lower_bound: 1 upper_bound: 3 repeats: 0 ndv: 1\n" +
+				"num: 100000 lower_bound: 3 upper_bound: 4 repeats: 0 ndv: 1\n" +
+				"num: 100000 lower_bound: 4 upper_bound: 5 repeats: 0 ndv: 1",
 		},
 	}
 	for _, t := range tests {
@@ -213,7 +216,7 @@ func (s *testFeedbackSuite) TestMergeBuckets(c *C) {
 		totalCount := int64(0)
 		for i := 0; i < len(t.counts); i++ {
 			lower, upper := types.NewIntDatum(t.points[2*i]), types.NewIntDatum(t.points[2*i+1])
-			bkts = append(bkts, bucket{&lower, &upper, t.counts[i], 0})
+			bkts = append(bkts, bucket{&lower, &upper, t.counts[i], 0, t.ndvs[i]})
 			totalCount += t.counts[i]
 		}
 		defaultBucketCount = t.bucketCount
@@ -232,8 +235,8 @@ func encodeInt(v int64) *types.Datum {
 func (s *testFeedbackSuite) TestFeedbackEncoding(c *C) {
 	hist := NewHistogram(0, 0, 0, 0, types.NewFieldType(mysql.TypeLong), 0, 0)
 	q := &QueryFeedback{Hist: hist, Tp: PkType}
-	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(3), 1, 0})
-	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(5), 1, 0})
+	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(3), 1, 0, 1})
+	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(5), 1, 0, 1})
 	val, err := EncodeFeedback(q)
 	c.Assert(err, IsNil)
 	rq := &QueryFeedback{}
@@ -246,8 +249,8 @@ func (s *testFeedbackSuite) TestFeedbackEncoding(c *C) {
 
 	hist.Tp = types.NewFieldType(mysql.TypeBlob)
 	q = &QueryFeedback{Hist: hist}
-	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(3), 1, 0})
-	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(1), 1, 0})
+	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(3), 1, 0, 1})
+	q.Feedback = append(q.Feedback, Feedback{encodeInt(0), encodeInt(1), 1, 0, 1})
 	val, err = EncodeFeedback(q)
 	c.Assert(err, IsNil)
 	rq = &QueryFeedback{}
@@ -266,6 +269,9 @@ func (q *QueryFeedback) Equal(rq *QueryFeedback) bool {
 	for i, fb := range q.Feedback {
 		rfb := rq.Feedback[i]
 		if fb.Count != rfb.Count {
+			return false
+		}
+		if fb.Ndv != rfb.Ndv {
 			return false
 		}
 		if fb.Lower.Kind() == types.KindInt64 {
