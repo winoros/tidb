@@ -71,6 +71,8 @@ type PhysicalTableReader struct {
 
 	// StoreType indicates table read from which type of store.
 	StoreType kv.StoreType
+
+	Hist *statistics.Histogram
 }
 
 // GetPhysicalTableReader returns PhysicalTableReader for logical TiKVSingleGather.

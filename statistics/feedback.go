@@ -16,9 +16,11 @@ package statistics
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cznic/mathutil"
@@ -57,6 +59,42 @@ type QueryFeedback struct {
 	actual     int64 // actual is the actual scan count of corresponding query.
 	Valid      bool  // Valid represents the whether this query feedback is still Valid.
 	desc       bool  // desc represents the corresponding query is desc scan.
+}
+
+func(fb *Feedback) Clone() *Feedback {
+	return &Feedback{
+		Lower:  fb.Lower.Clone(),
+		Upper:  fb.Upper.Clone(),
+		Count:  fb.Count,
+		Repeat: fb.Repeat,
+	}
+}
+
+
+func (fb *Feedback) String(isUnsigned bool) string {
+	builder := &strings.Builder{}
+	fmt.Fprint(builder, "[")
+	if isUnsigned {
+		fb.Lower.SetUint64(uint64(fb.Lower.GetInt64()))
+		fb.Upper.SetUint64(uint64(fb.Upper.GetInt64()))
+	}
+	fmt.Fprintf(builder, "%s", types.DatumsToStrNoErr([]types.Datum{*fb.Lower, *fb.Upper}))
+	fmt.Fprintf(builder, "count: %v, repeat: %v", fb.Count, fb.Repeat)
+	fmt.Fprint(builder, "]")
+	return builder.String()
+}
+
+func (q *QueryFeedback) String(isUnsigned bool) string {
+	builder := &strings.Builder{}
+	fmt.Fprint(builder, "[")
+	for i, fb := range q.Feedback {
+		if i > 0 {
+			fmt.Fprint(builder, ",")
+		}
+		fmt.Fprintf(builder, "%s", fb.String(isUnsigned))
+	}
+	fmt.Fprint(builder, "]")
+	return builder.String()
 }
 
 // NewQueryFeedback returns a new query feedback.
@@ -667,6 +705,17 @@ func UpdateHistogram(h *Histogram, feedback *QueryFeedback) *Histogram {
 		hist.NDV = int64(hist.TotalRowCount())
 	}
 	return hist
+}
+
+func UpdateHistogramTest(h *Histogram, feedback *QueryFeedback) bool {
+	buckets, isNewBuckets, totalCount := splitBuckets(h, feedback)
+	buckets = mergeBuckets(buckets, isNewBuckets, float64(totalCount))
+	for _, bkt := range buckets {
+		if bkt.Count < 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateCMSketch updates the CMSketch by feedback.

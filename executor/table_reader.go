@@ -20,6 +20,7 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
@@ -34,6 +35,7 @@ import (
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
+	"go.uber.org/zap"
 )
 
 // make sure `TableReaderExecutor` implements `Executor`.
@@ -90,6 +92,8 @@ type TableReaderExecutor struct {
 	virtualColumnRetFieldTypes []*types.FieldType
 	// batchCop indicates whether use super batch coprocessor request, only works for TiFlash engine.
 	batchCop bool
+
+	hist *statistics.Histogram
 }
 
 // Open initialzes necessary variables for using this executor.
@@ -185,6 +189,22 @@ func (e *TableReaderExecutor) Close() error {
 	if e.runtimeStats != nil {
 		copStats := e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootStats(e.plans[0].ExplainID().String())
 		copStats.SetRowNum(e.feedback.Actual())
+	}
+	if e.hist != nil && e.hist.Len() > 0 && e.feedback.Valid {
+		_, ranFB := statistics.SplitFeedbackByQueryType(e.feedback.Feedback)
+		clonedRanFb := make([]statistics.Feedback, 0, len(ranFB))
+		for _, fb := range ranFB {
+			clonedRanFb = append(clonedRanFb, *fb.Clone())
+		}
+		newFB := &statistics.QueryFeedback{Feedback: ranFB}
+		newFB = newFB.DecodeIntValues()
+		isUnsigned := false
+		if mysql.HasUnsignedFlag(e.hist.Tp.Flag) {
+			isUnsigned = true
+		}
+		if statistics.UpdateHistogramTest(e.hist, newFB) {
+			logutil.BgLogger().Warn("close table reader but feedback is broken", zap.String("hist", e.hist.ToString(0)), zap.String("feedback", newFB.String(isUnsigned)))
+		}
 	}
 	e.ctx.StoreQueryFeedback(e.feedback)
 	return err

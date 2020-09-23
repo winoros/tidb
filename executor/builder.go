@@ -2290,6 +2290,7 @@ func buildNoRangeTableReader(b *executorBuilder, v *plannercore.PhysicalTableRea
 		corColInAccess: b.corColInAccess(v.TablePlans[0]),
 		plans:          v.TablePlans,
 		storeType:      v.StoreType,
+		hist:           v.Hist,
 	}
 	e.setBatchCop(v)
 	e.buildVirtualColumnInfo()

@@ -677,6 +677,11 @@ func finishCopTask(ctx sessionctx.Context, task task) task {
 		}.Init(ctx, t.tablePlan.SelectBlockOffset())
 		p.stats = t.tablePlan.statsInfo()
 		ts.Columns = ExpandVirtualColumn(ts.Columns, ts.schema, ts.Table.Columns)
+		for _, hist := range p.stats.HistColl.Columns {
+			if hist.IsHandle {
+				p.Hist = &hist.Histogram
+			}
+		}
 		newTask.p = p
 	}
 
