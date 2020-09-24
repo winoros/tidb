@@ -19,6 +19,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,7 +82,7 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 			// If we don't clean it, there are some dirty data when retrying the function of Init.
 			d.Close()
 			logutil.BgLogger().Error("[ddl] init domain failed",
-				zap.Error(err1))
+				zap.String("error", fmt.Sprintf("%+v", err1)))
 		}
 		return true, err1
 	})
