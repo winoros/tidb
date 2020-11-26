@@ -599,7 +599,7 @@ func (s *testSuite1) TestExtractTopN(c *C) {
 	item := colStats.CMSketch.TopN()[0]
 	c.Assert(item.Count, Equals, uint64(11))
 	idxStats := tblStats.Indices[tblInfo.Indices[0].ID]
-	c.Assert(len(idxStats.CMSketch.TopN()), Equals, 1)
+	c.Assert(len(idxStats.CMSketch.TopN()), Equals, 10)
 	item = idxStats.CMSketch.TopN()[0]
 	c.Assert(item.Count, Equals, uint64(11))
 }

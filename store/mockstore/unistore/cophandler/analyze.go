@@ -176,6 +176,7 @@ func (p *analyzeIndexProcessor) Process(key, _ []byte) error {
 		if p.cms != nil {
 			p.cms.InsertBytes(p.rowBuf)
 		}
+		// We are iterating the index data by order. So we can directly compare with p.rowBuf to move forward.
 		if bytes.Equal(p.topNCurValuePair[i].Val, p.rowBuf) {
 			p.topNCurValuePair[i].Cnt++
 		} else {
