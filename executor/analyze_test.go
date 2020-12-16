@@ -197,14 +197,14 @@ func (s *testSuite1) TestAnalyzeParameters(c *C) {
 	c.Assert(width, Equals, int32(4))
 
 	// Test very large cmsketch
-	tk.MustExec(fmt.Sprintf("analyze table t with %d cmsketch width, %d cmsketch depth", statistics.CMSketchSizeLimit, 1))
+	tk.MustExec(fmt.Sprintf("analyze table t with %d cmsketch width, %d cmsketch depth", core.CMSketchSizeLimit, 1))
 	tbl = s.dom.StatsHandle().GetTableStats(tableInfo)
 	col = tbl.Columns[1]
 	c.Assert(col.Len(), Equals, 20)
 	c.Assert(len(col.TopN.TopN), Equals, 1)
 	width, depth = col.CMSketch.GetWidthAndDepth()
 	c.Assert(depth, Equals, int32(1))
-	c.Assert(width, Equals, int32(statistics.CMSketchSizeLimit))
+	c.Assert(width, Equals, int32(core.CMSketchSizeLimit))
 
 	// Test very large cmsketch
 	tk.MustExec("analyze table t with 20480 cmsketch width, 50 cmsketch depth")
@@ -687,7 +687,7 @@ func (s *testSuite1) TestExtractTopN(c *C) {
 	tblInfo := table.Meta()
 	tblStats := s.dom.StatsHandle().GetTableStats(tblInfo)
 	colStats := tblStats.Columns[tblInfo.Columns[1].ID]
-	c.Assert(len(colStats.TopN.TopN), Equals, 1)
+	c.Assert(len(colStats.TopN.TopN), Equals, 10)
 	item := colStats.TopN.TopN[0]
 	c.Assert(item.Count, Equals, uint64(11))
 	idxStats := tblStats.Indices[tblInfo.Indices[0].ID]
@@ -696,6 +696,15 @@ func (s *testSuite1) TestExtractTopN(c *C) {
 	c.Assert(idxItem.Count, Equals, uint64(11))
 	// The columns are: DBName, table name, column name, is index, value, count.
 	tk.MustQuery("show stats_topn").Sort().Check(testkit.Rows("test t  b 0 0 11",
+		"test t  b 0 1 1",
+		"test t  b 0 2 1",
+		"test t  b 0 3 1",
+		"test t  b 0 4 1",
+		"test t  b 0 5 1",
+		"test t  b 0 6 1",
+		"test t  b 0 7 1",
+		"test t  b 0 8 1",
+		"test t  b 0 9 1",
 		"test t  index_b 1 0 11",
 		"test t  index_b 1 1 1",
 		"test t  index_b 1 2 1",

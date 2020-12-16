@@ -131,10 +131,7 @@ func (hg *Histogram) MemoryUsage() (sum int64) {
 	if hg == nil {
 		return
 	}
-	// let the initial sum = 0
-	sum = hg.Bounds.MemoryUsage() - chunk.NewChunkWithCapacity([]*types.FieldType{hg.Tp}, 0).MemoryUsage()
-	sum = sum + int64(cap(hg.Buckets)*int(unsafe.Sizeof(Bucket{}))) + int64(cap(hg.scalars)*int(unsafe.Sizeof(scalar{})))
-
+	sum = hg.Bounds.MemoryUsage() + int64(cap(hg.Buckets)*int(unsafe.Sizeof(Bucket{}))) + int64(cap(hg.scalars)*int(unsafe.Sizeof(scalar{})))
 	return
 }
 
@@ -294,12 +291,15 @@ func HistogramEqual(a, b *Histogram, ignoreID bool) bool {
 // If the version number is 0, it means the most original statistics.
 const (
 	CurStatsVersion = Version2
-
-	// Version0 is the most early statistics only histogram.
-	Version0 = 0
-	// Version1 added CMSketch.
+	Version0        = 0
+	// In Version1
+	// Column stats: CM Sketch is built in TiKV. Histogram is built from samples. TopN is extracted from CM Sketch.
+	//   TopN + CM Sketch represent all data. Histogram also represents all data.
+	// Index stats: CM Sketch and histogram.
 	Version1 = 1
-	// Version2 added bucket NDV for index's full analyze.
+	// In Version2
+	// Column stats: CM Sketch is not used. TopN and Histogram are built from samples. TopN + Histogram represent all data.
+	// Index stats: we added bucket NDV when it's full analyze, and also extracts the topn out of histogram.
 	Version2 = 2
 )
 
@@ -487,6 +487,23 @@ func (hg *Histogram) BetweenRowCount(a, b types.Datum) float64 {
 		return math.Min(result, hg.notNullCount()/float64(hg.NDV))
 	}
 	return lessCountB - lessCountA
+}
+
+// BetweenRowCount estimates the row count for interval [l, r).
+func (c *Column) BetweenRowCount(sc *stmtctx.StatementContext, l, r types.Datum) (float64, error) {
+	histBetweenCnt := c.Histogram.BetweenRowCount(l, r)
+	if c.StatsVer <= Version1 {
+		return histBetweenCnt, nil
+	}
+	lBytes, err := codec.EncodeKey(sc, nil, l)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	rBytes, err := codec.EncodeKey(sc, nil, r)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return float64(c.TopN.BetweenCount(lBytes, rBytes)) + histBetweenCnt, nil
 }
 
 // TotalRowCount returns the total count of this histogram.
@@ -877,10 +894,29 @@ type Column struct {
 	ErrorRate
 	Flag           int64
 	LastAnalyzePos types.Datum
+	StatsVer       int64 // StatsVer is the version of the current stats, used to maintain compatibility
 }
 
 func (c *Column) String() string {
 	return c.Histogram.ToString(0)
+}
+
+// TotalRowCount returns the total count of this column.
+func (c *Column) TotalRowCount() float64 {
+	if c.StatsVer == Version2 {
+		return c.Histogram.TotalRowCount() + float64(c.TopN.TotalCount())
+	}
+	return c.Histogram.TotalRowCount()
+}
+
+// GetIncreaseFactor get the increase factor to adjust the final estimated count when the table is modified.
+func (c *Column) GetIncreaseFactor(totalCount int64) float64 {
+	columnCount := c.TotalRowCount()
+	if columnCount == 0 {
+		// avoid dividing by 0
+		return 1.0
+	}
+	return float64(totalCount) / columnCount
 }
 
 // MemoryUsage returns the total memory usage of Histogram and CMSketch in Column.
@@ -903,29 +939,69 @@ func (c *Column) IsInvalid(sc *stmtctx.StatementContext, collPseudo bool) bool {
 	if collPseudo && c.NotAccurate() {
 		return true
 	}
-	if c.NDV > 0 && c.Len() == 0 && sc != nil {
+	// If stats ver < 2, histogram represents all data in this column, so empty histogram implies unloaded stats.
+	// In stats ver 2, histogram + TopN represents all data in a column, so both of them being empty implies unloaded stats.
+	if c.NDV > 0 && sc != nil &&
+		((c.Len() == 0 && c.StatsVer < Version2) || (c.Len() == 0 && c.TopN.TotalCount() == 0 && c.StatsVer == Version2)) {
 		sc.SetHistogramsNotLoad()
 		HistogramNeededColumns.insert(tableColumnID{TableID: c.PhysicalID, ColumnID: c.Info.ID})
 	}
-	return c.TotalRowCount() == 0 || (c.NDV > 0 && c.Len() == 0)
+	return c.TotalRowCount() == 0 ||
+		(c.NDV > 0 &&
+			((c.Len() == 0 && c.StatsVer < Version2) || (c.Len() == 0 && c.TopN.TotalCount() == 0 && c.StatsVer == Version2)))
 }
 
 func (c *Column) equalRowCount(sc *stmtctx.StatementContext, val types.Datum, modifyCount int64) (float64, error) {
 	if val.IsNull() {
 		return float64(c.NullCount), nil
 	}
-	// All the values are null.
-	if c.Histogram.Bounds.NumRows() == 0 {
-		return 0.0, nil
+	if c.StatsVer < Version2 {
+		// All the values are null.
+		if c.Histogram.Bounds.NumRows() == 0 {
+			return 0.0, nil
+		}
+		if c.NDV > 0 && c.outOfRange(val) {
+			return outOfRangeEQSelectivity(c.NDV, modifyCount, int64(c.TotalRowCount())) * c.TotalRowCount(), nil
+		}
+		if c.CMSketch != nil {
+			count, err := queryValue(sc, c.CMSketch, c.TopN, val)
+			return float64(count), errors.Trace(err)
+		}
+		return c.Histogram.equalRowCount(val), nil
 	}
-	if c.NDV > 0 && c.outOfRange(val) {
-		return outOfRangeEQSelectivity(c.NDV, modifyCount, int64(c.TotalRowCount())) * c.TotalRowCount(), nil
+	// Stats version == 2
+	// 1. try to find this value in TopN
+	if c.TopN != nil {
+		valBytes, err := codec.EncodeKey(sc, nil, val)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		rowcount, ok := c.QueryTopN(valBytes)
+		if ok {
+			return float64(rowcount), nil
+		}
 	}
-	if c.CMSketch != nil {
-		count, err := queryValue(sc, c.CMSketch, c.TopN, val)
-		return float64(count), errors.Trace(err)
+	// 2. try to find this value in bucket.repeats(the last value in every bucket)
+	index, match := c.Histogram.Bounds.LowerBound(0, &val)
+	if index%2 == 1 && match {
+		return float64(c.Histogram.Buckets[index/2].Repeat), nil
 	}
-	return c.Histogram.equalRowCount(val), nil
+	if match {
+		cmp := chunk.GetCompareFunc(c.Histogram.Tp)
+		if cmp(c.Histogram.Bounds.GetRow(index), 0, c.Histogram.Bounds.GetRow(index+1), 0) == 0 {
+			return float64(c.Histogram.Buckets[index/2].Repeat), nil
+		}
+	}
+	// 3. use evenly distribution assumption for the rest
+	cnt := c.Histogram.notNullCount()
+	for _, bkt := range c.Histogram.Buckets {
+		if cnt <= float64(bkt.Repeat) {
+			return 0, nil
+		}
+		cnt -= float64(bkt.Repeat)
+	}
+	ndv := c.NDV - int64(len(c.TopN.TopN)) - int64(len(c.Histogram.Buckets))
+	return cnt / float64(ndv), nil
 }
 
 // GetColumnRowCount estimates the row count by a slice of Range.
@@ -974,7 +1050,10 @@ func (c *Column) GetColumnRowCount(sc *stmtctx.StatementContext, ranges []*range
 			continue
 		}
 		// The interval case.
-		cnt := c.BetweenRowCount(lowVal, highVal)
+		cnt, err := c.BetweenRowCount(sc, lowVal, highVal)
+		if err != nil {
+			return 0, err
+		}
 		if (c.outOfRange(lowVal) && !lowVal.IsNull()) || c.outOfRange(highVal) {
 			cnt += outOfRangeEQSelectivity(outOfRangeBetweenRate, modifyCount, int64(c.TotalRowCount())) * c.TotalRowCount()
 		}
@@ -1017,7 +1096,6 @@ type Index struct {
 	StatsVer       int64 // StatsVer is the version of the current stats, used to maintain compatibility
 	Info           *model.IndexInfo
 	Flag           int64
-	PhysicalID     int64 // PhysicalID for lazy load
 	LastAnalyzePos types.Datum
 }
 
@@ -1033,22 +1111,9 @@ func (idx *Index) TotalRowCount() float64 {
 	return idx.Histogram.TotalRowCount()
 }
 
-// HistogramNeededIndices stores the Index whose Histograms need to be loaded from physical kv layer.
-// Currently, we only load index/pk's Histogram from kv automatically. Columns' are loaded by needs.
-var HistogramNeededIndices = neededIndexMap{idxs: map[tableIndexID]struct{}{}}
-
-// IsInvalid checks if this Index is invalid.
-// If this Index has histogram but not loaded yet, then we mark it
-// as need Index.
-func (idx *Index) IsInvalid(sc *stmtctx.StatementContext, collPseudo bool) bool {
-	if collPseudo && idx.NotAccurate() {
-		return true
-	}
-	if idx.NDV > 0 && idx.Len() == 0 && sc != nil {
-		sc.SetHistogramsNotLoad()
-		HistogramNeededIndices.insert(tableIndexID{TableID: idx.PhysicalID, IndexID: idx.Info.ID})
-	}
-	return idx.TotalRowCount() == 0 || (idx.NDV > 0 && idx.Len() == 0)
+// IsInvalid checks if this index is invalid.
+func (idx *Index) IsInvalid(collPseudo bool) bool {
+	return (collPseudo && idx.NotAccurate()) || idx.TotalRowCount() == 0
 }
 
 // MemoryUsage returns the total memory usage of a Histogram and CMSketch in Index.
