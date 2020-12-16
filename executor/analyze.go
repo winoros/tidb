@@ -71,7 +71,7 @@ var (
 )
 
 const (
-	maxRegionSampleSize = 1000
+	maxRegionSampleSize = 60000
 	maxSketchSize       = 10000
 )
 
@@ -331,7 +331,7 @@ func (e *AnalyzeIndexExec) buildStatsFromResult(result distsql.SelectResult, nee
 	var topn *statistics.TopN
 	if needCMS {
 		cms = statistics.NewCMSketch(int32(e.opts[ast.AnalyzeOptCMSketchDepth]), int32(e.opts[ast.AnalyzeOptCMSketchWidth]))
-		topn = statistics.NewTopN(int(e.opts[ast.AnalyzeOptNumTopN]))
+		topn = statistics.NewTopN(1000)
 	}
 	statsVer := statistics.Version1
 	if e.analyzePB.IdxReq.Version != nil {
@@ -589,7 +589,7 @@ func (e *AnalyzeColumnsExec) buildStats(ranges []*ranger.Range, needExtStats boo
 		if e.analyzeVer < 2 {
 			hg, err = statistics.BuildColumn(e.ctx, int64(e.opts[ast.AnalyzeOptNumBuckets]), col.ID, collectors[i], &col.FieldType)
 		} else {
-			hg, topn, err = statistics.BuildColumnHistAndTopN(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]),
+			hg, topn, err = statistics.BuildColumnHistAndTopN(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), 100,
 				col.ID, collectors[i], &col.FieldType, collectors[i].Count, collectors[i].FMSketch.NDV(), collectors[i].NullCount)
 			topNs = append(topNs, topn)
 		}
