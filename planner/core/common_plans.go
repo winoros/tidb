@@ -852,6 +852,7 @@ type AnalyzeColumnsTask struct {
 	CommonHandleInfo *model.IndexInfo
 	ColsInfo         []*model.ColumnInfo
 	TblInfo          *model.TableInfo
+	Indexes          []*model.IndexInfo
 	analyzeInfo
 }
 

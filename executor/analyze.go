@@ -16,6 +16,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"runtime"
@@ -147,7 +148,12 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 					globalStatsMap[globalStatsID] = globalStatsInfo{result.IsIndex, hg.ID, result.StatsVer}
 				}
 			}
-			err1 := statsHandle.SaveStatsToStorage(statisticsID, result.Count, result.IsIndex, hg, result.Cms[i], result.TopNs[i], result.Fms[i], result.StatsVer, 1)
+			var err1 error
+			if result.StatsVer == statistics.Version2 {
+				err1 = statsHandle.SaveStatsToStorage(statisticsID, result.Count, result.IsIndex, hg, nil, result.TopNs[i], result.Fms[i], result.StatsVer, 1)
+			} else {
+				err1 = statsHandle.SaveStatsToStorage(statisticsID, result.Count, result.IsIndex, hg, result.Cms[i], result.TopNs[i], result.Fms[i], result.StatsVer, 1)
+			}
 			if err1 != nil {
 				err = err1
 				logutil.Logger(ctx).Error("save stats to storage failed", zap.Error(err))
@@ -502,6 +508,32 @@ func analyzeColumnsPushdown(colExec *AnalyzeColumnsExec) []analyzeResult {
 	} else {
 		ranges = ranger.FullIntRange(false)
 	}
+	if colExec.analyzeVer == statistics.Version2 {
+		count, hists, topns, fmSketches, err := colExec.buildSamplingStats(ranges)
+		if err != nil {
+			return []analyzeResult{{Err: err, job: colExec.job}}
+		}
+		cLen := len(colExec.analyzePB.ColReq.ColumnsInfo)
+		colResult := analyzeResult{
+			TableID:  colExec.tableID,
+			Hist:     hists[:cLen],
+			TopNs:    topns[:cLen],
+			Fms:      fmSketches[:cLen],
+			job:      colExec.job,
+			StatsVer: colExec.analyzeVer,
+			Count:    count,
+		}
+		idxResult := analyzeResult{
+			TableID:  colExec.tableID,
+			Hist:     hists[cLen:],
+			TopNs:    topns[cLen:],
+			job:      colExec.job,
+			StatsVer: colExec.analyzeVer,
+			Count:    count,
+			IsIndex:  1,
+		}
+		return []analyzeResult{colResult, idxResult}
+	}
 	collExtStats := colExec.ctx.GetSessionVars().EnableExtendedStats
 	hists, cms, topNs, fms, extStats, err := colExec.buildStats(ranges, collExtStats)
 	if err != nil {
@@ -580,6 +612,7 @@ type AnalyzeColumnsExec struct {
 	opts          map[ast.AnalyzeOptionType]uint64
 	job           *statistics.AnalyzeJob
 	analyzeVer    int
+	indexes       []*model.IndexInfo
 }
 
 func (e *AnalyzeColumnsExec) open(ranges []*ranger.Range) error {
@@ -624,6 +657,128 @@ func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectRe
 	}
 	result.Fetch(ctx)
 	return result, nil
+}
+
+func (e *AnalyzeColumnsExec) buildSamplingStats(ranges []*ranger.Range) (
+	count int64,
+	hists []*statistics.Histogram,
+	topns []*statistics.TopN,
+	fmSketches []*statistics.FMSketch,
+	err error,
+) {
+	logutil.BgLogger().Warn("????", zap.String("ranges", fmt.Sprintf("%v", ranges)))
+	if err = e.open(ranges); err != nil {
+		return 0, nil, nil, nil, err
+	}
+	defer func() {
+		if err1 := e.resultHandler.Close(); err1 != nil {
+			err = err1
+		}
+	}()
+	l := len(e.analyzePB.ColReq.ColumnsInfo) + len(e.analyzePB.ColReq.ColumnGroups)
+	rootRowCollector := &statistics.RowSampleCollector{
+		NullCount:     make([]int64, l),
+		FMSketches:    make([]*statistics.FMSketch, 0, l),
+		TotalSizes:    make([]int64, l),
+		Samples:       make(statistics.WeightedRowSampleHeap, 0, e.analyzePB.ColReq.SampleSize),
+		MaxSampleSize: int(e.analyzePB.ColReq.SampleSize),
+	}
+	for i := 0; i < l; i++ {
+		rootRowCollector.FMSketches = append(rootRowCollector.FMSketches, statistics.NewFMSketch(maxSketchSize))
+	}
+	sc := e.ctx.GetSessionVars().StmtCtx
+	for {
+		data, err1 := e.resultHandler.nextRaw(context.TODO())
+		if err1 != nil {
+			return 0, nil, nil, nil, err1
+		}
+		if data == nil {
+			break
+		}
+		colResp := &tipb.AnalyzeColumnsResp{}
+		err = colResp.Unmarshal(data)
+		if err != nil {
+			return 0, nil, nil, nil, err
+		}
+		subCollector := &statistics.RowSampleCollector{
+			MaxSampleSize: int(e.analyzePB.ColReq.SampleSize),
+		}
+		e.job.Update(subCollector.Count)
+		subCollector.FromProto(colResp.RowCollector)
+		rootRowCollector.MergeCollector(subCollector)
+	}
+	for _, sample := range rootRowCollector.Samples {
+		for i := range sample.Columns {
+			// logutil.BgLogger().Warn("new analyze", zap.String("raw col", fmt.Sprintf("%v", sample.Columns[i].GetBytes())))
+			sample.Columns[i], err = tablecodec.DecodeColumnValue(sample.Columns[i].GetBytes(), &e.colsInfo[i].FieldType, sc.TimeZone)
+			if err != nil {
+				logutil.BgLogger().Warn("wrong encoded value",
+					zap.String("bytes value", fmt.Sprintf("%v", sample.Columns[i].GetBytes())),
+					zap.Int("kind", int(e.colsInfo[i].FieldType.Tp)),
+				)
+				return 0, nil, nil, nil, err
+			}
+			if sample.Columns[i].Kind() == types.KindBytes {
+				sample.Columns[i].SetBytes(sample.Columns[i].GetBytes())
+			}
+		}
+	}
+	hists = make([]*statistics.Histogram, 0, len(e.colsInfo))
+	topns = make([]*statistics.TopN, 0, len(e.colsInfo))
+	fmSketches = make([]*statistics.FMSketch, 0, len(e.colsInfo))
+	for i, col := range e.colsInfo {
+		sampleItems := make([]*statistics.SampleItem, 0, rootRowCollector.MaxSampleSize)
+		for _, row := range rootRowCollector.Samples {
+			sampleItems = append(sampleItems, &statistics.SampleItem{
+				Value: row.Columns[i],
+			})
+		}
+		collector := &statistics.SampleCollector{
+			Samples:   sampleItems,
+			NullCount: rootRowCollector.NullCount[i],
+			Count:     rootRowCollector.Count,
+			FMSketch:  rootRowCollector.FMSketches[i],
+			TotalSize: rootRowCollector.TotalSizes[i],
+		}
+		hg, topn, err := statistics.BuildColumnHistAndTopNOnRowSample(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]), col.ID, collector, &col.FieldType)
+		if err != nil {
+			return 0, nil, nil, nil, err
+		}
+		hists = append(hists, hg)
+		topns = append(topns, topn)
+		fmSketches = append(fmSketches, rootRowCollector.FMSketches[i])
+	}
+	for i, idx := range e.indexes {
+		if len(idx.Columns) == 1 {
+			colOffset := idx.Columns[0].Offset
+			sampleItems := make([]*statistics.SampleItem, 0, rootRowCollector.MaxSampleSize)
+			for _, row := range rootRowCollector.Samples {
+				b, err := codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, nil, row.Columns[colOffset])
+				if err != nil {
+					return 0, nil, nil, nil, err
+				}
+				sampleItems = append(sampleItems, &statistics.SampleItem{
+					Value: types.NewBytesDatum(b),
+				})
+			}
+			collector := &statistics.SampleCollector{
+				Samples:   sampleItems,
+				NullCount: rootRowCollector.NullCount[colOffset],
+				Count:     rootRowCollector.Count,
+				FMSketch:  rootRowCollector.FMSketches[colOffset],
+				TotalSize: rootRowCollector.TotalSizes[colOffset],
+			}
+			hg, topn, err := statistics.BuildIdxHistAndTopNOnRowSample(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]), idx.ID, collector, types.NewFieldType(mysql.TypeBlob))
+			if err != nil {
+				return 0, nil, nil, nil, err
+			}
+			hists = append(hists, hg)
+			topns = append(topns, topn)
+			fmSketches = append(fmSketches, rootRowCollector.FMSketches[i])
+		}
+	}
+	count = rootRowCollector.Count
+	return
 }
 
 func (e *AnalyzeColumnsExec) buildStats(ranges []*ranger.Range, needExtStats bool) (hists []*statistics.Histogram, cms []*statistics.CMSketch, topNs []*statistics.TopN, fms []*statistics.FMSketch, extStats *statistics.ExtendedStatsColl, err error) {
@@ -1312,7 +1467,9 @@ func (e *AnalyzeFastExec) runTasks() ([]*statistics.Histogram, []*statistics.CMS
 		// Build collector properties.
 		collector := e.collectors[i]
 		collector.Samples = collector.Samples[:e.sampCursor]
-		sort.Slice(collector.Samples, func(i, j int) bool { return collector.Samples[i].Handle.Compare(collector.Samples[j].Handle) < 0 })
+		sort.Slice(collector.Samples, func(i, j int) bool {
+			return collector.Samples[i].Handle.Compare(collector.Samples[j].Handle) < 0
+		})
 		collector.CalcTotalSize()
 		// Adjust the row count in case the count of `tblStats` is not accurate and too small.
 		rowCount = mathutil.MaxInt64(rowCount, int64(len(collector.Samples)))

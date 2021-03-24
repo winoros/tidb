@@ -1635,7 +1635,63 @@ func GetPhysicalIDsAndPartitionNames(tblInfo *model.TableInfo, partitionNames []
 	return ids, names, nil
 }
 
+func (b *PlanBuilder) buildAnalyzeTableNew(as *ast.AnalyzeTableStmt, opts map[ast.AnalyzeOptionType]uint64, version int) (Plan, error) {
+	p := &Analyze{Opts: opts}
+	for _, tbl := range as.TableNames {
+		if tbl.TableInfo.IsView() {
+			return nil, errors.Errorf("analyze view %s is not supported now.", tbl.Name.O)
+		}
+		if tbl.TableInfo.IsSequence() {
+			return nil, errors.Errorf("analyze sequence %s is not supported now.", tbl.Name.O)
+		}
+		colsInfo := tbl.TableInfo.Columns
+		physicalIDs, names, err := GetPhysicalIDsAndPartitionNames(tbl.TableInfo, as.PartitionNames)
+		if err != nil {
+			return nil, err
+		}
+		if statistics.FeedbackProbability.Load() > 0 {
+			statsHandle := domain.GetDomain(b.ctx).StatsHandle()
+			versionIsSame := statsHandle.CheckAnalyzeVersion(tbl.TableInfo, physicalIDs, &version)
+			if !versionIsSame {
+				b.ctx.GetSessionVars().StmtCtx.AppendWarning(errors.New(fmt.Sprintf("Use analyze version 1 on table `%s` ", tbl.Name) +
+					"because this table already has version 1 statistics and query feedback is also enabled. " +
+					"If you want to switch to version 2 statistics, please first disable query feedback by setting feedback-probability to 0.0 in the config file."))
+			}
+		}
+		idxInfos := make([]*model.IndexInfo, 0, len(tbl.TableInfo.Indices))
+		for _, idx := range tbl.TableInfo.Indices {
+			if idx.State != model.StatePublic {
+				continue
+			}
+			idxInfos = append(idxInfos, idx)
+		}
+		for i, id := range physicalIDs {
+			if id == tbl.TableInfo.ID {
+				id = -1
+			}
+			info := analyzeInfo{
+				DBName:        tbl.Schema.O,
+				TableName:     tbl.Name.O,
+				PartitionName: names[i],
+				TableID:       AnalyzeTableID{TableID: tbl.TableInfo.ID, PartitionID: id},
+				Incremental:   as.Incremental,
+				StatsVersion:  version,
+			}
+			p.ColTasks = append(p.ColTasks, AnalyzeColumnsTask{
+				ColsInfo:    colsInfo,
+				analyzeInfo: info,
+				TblInfo:     tbl.TableInfo,
+				Indexes:     idxInfos,
+			})
+		}
+	}
+	return p, nil
+}
+
 func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt, opts map[ast.AnalyzeOptionType]uint64, version int) (Plan, error) {
+	if version == 2 {
+		return b.buildAnalyzeTableNew(as, opts, version)
+	}
 	p := &Analyze{Opts: opts}
 	for _, tbl := range as.TableNames {
 		if tbl.TableInfo.IsView() {
