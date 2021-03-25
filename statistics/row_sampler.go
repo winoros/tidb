@@ -224,10 +224,16 @@ func (s *RowSampleCollector) FromProto(pbCollector *tipb.RowSampleCollector) {
 	for _, pbSample := range pbCollector.Samples {
 		data := make([]types.Datum, 0, len(pbSample.Row))
 		for _, col := range pbSample.Row {
-			data = append(data, types.NewBytesDatum(col))
+			b := make([]byte, len(col))
+			copy(b, col)
+			data = append(data, types.NewBytesDatum(b))
 		}
-		s.sampleRow(data, pbSample.Weight)
+		s.Samples = append(s.Samples, &RowSampleItem{
+			Columns: data,
+			Weight:  pbSample.Weight,
+		})
 	}
+	heap.Init(&s.Samples)
 }
 
 func (s *RowSampleCollector) MergeCollector(subCollector *RowSampleCollector) {
