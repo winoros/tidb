@@ -527,6 +527,7 @@ func analyzeColumnsPushdown(colExec *AnalyzeColumnsExec) []analyzeResult {
 			TableID:  colExec.tableID,
 			Hist:     hists[cLen:],
 			TopNs:    topns[cLen:],
+			Fms:      fmSketches[cLen:],
 			job:      colExec.job,
 			StatsVer: colExec.analyzeVer,
 			Count:    count,
@@ -748,34 +749,39 @@ func (e *AnalyzeColumnsExec) buildSamplingStats(ranges []*ranger.Range) (
 		topns = append(topns, topn)
 		fmSketches = append(fmSketches, rootRowCollector.FMSketches[i])
 	}
+	colLen := len(e.colsInfo)
 	for i, idx := range e.indexes {
 		if len(idx.Columns) == 1 {
-			colOffset := idx.Columns[0].Offset
-			sampleItems := make([]*statistics.SampleItem, 0, rootRowCollector.MaxSampleSize)
-			for _, row := range rootRowCollector.Samples {
-				b, err := codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, nil, row.Columns[colOffset])
+			continue
+		}
+		sampleItems := make([]*statistics.SampleItem, 0, rootRowCollector.MaxSampleSize)
+		for _, row := range rootRowCollector.Samples {
+			b := make([]byte, 0, 8)
+			for _, col := range idx.Columns {
+				b, err = codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, b, row.Columns[col.Offset])
 				if err != nil {
 					return 0, nil, nil, nil, err
 				}
-				sampleItems = append(sampleItems, &statistics.SampleItem{
-					Value: types.NewBytesDatum(b),
-				})
 			}
-			collector := &statistics.SampleCollector{
-				Samples:   sampleItems,
-				NullCount: rootRowCollector.NullCount[colOffset],
-				Count:     rootRowCollector.Count,
-				FMSketch:  rootRowCollector.FMSketches[colOffset],
-				TotalSize: rootRowCollector.TotalSizes[colOffset],
-			}
-			hg, topn, err := statistics.BuildIdxHistAndTopNOnRowSample(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]), idx.ID, collector, types.NewFieldType(mysql.TypeBlob))
-			if err != nil {
-				return 0, nil, nil, nil, err
-			}
-			hists = append(hists, hg)
-			topns = append(topns, topn)
-			fmSketches = append(fmSketches, rootRowCollector.FMSketches[i])
+			sampleItems = append(sampleItems, &statistics.SampleItem{
+				Value: types.NewBytesDatum(b),
+			})
 		}
+		collector := &statistics.SampleCollector{
+			Samples:   sampleItems,
+			NullCount: rootRowCollector.NullCount[colLen+i],
+			Count:     rootRowCollector.Count,
+			FMSketch:  rootRowCollector.FMSketches[colLen+i],
+			TotalSize: rootRowCollector.TotalSizes[colLen+i],
+		}
+		logutil.BgLogger().Warn("?")
+		hg, topn, err := statistics.BuildIdxHistAndTopNOnRowSample(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]), idx.ID, collector, types.NewFieldType(mysql.TypeBlob))
+		if err != nil {
+			return 0, nil, nil, nil, err
+		}
+		hists = append(hists, hg)
+		topns = append(topns, topn)
+		fmSketches = append(fmSketches, rootRowCollector.FMSketches[colLen+i])
 	}
 	count = rootRowCollector.Count
 	return

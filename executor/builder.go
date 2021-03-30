@@ -2011,12 +2011,14 @@ func (b *executorBuilder) buildAnalyzeSamplingPushdown(
 	opts map[ast.AnalyzeOptionType]uint64,
 	autoAnalyze string,
 ) *analyzeTask {
+	avaliabeIdx := make([]*model.IndexInfo, 0, len(task.Indexes))
 	colGroups := make([]*tipb.AnalyzeColumnGroup, 0, len(task.Indexes))
 	if len(task.Indexes) > 0 {
 		for _, idx := range task.Indexes {
 			if len(idx.Columns) == 1 {
 				continue
 			}
+			avaliabeIdx = append(avaliabeIdx, idx)
 			colGroup := &tipb.AnalyzeColumnGroup{
 				ColumnOffsets: make([]int64, 0, len(idx.Columns)),
 			}
@@ -2042,6 +2044,7 @@ func (b *executorBuilder) buildAnalyzeSamplingPushdown(
 		},
 		opts:       opts,
 		analyzeVer: task.StatsVersion,
+		indexes:    avaliabeIdx,
 	}
 	e.analyzePB.ColReq = &tipb.AnalyzeColumnsReq{
 		BucketSize:   int64(opts[ast.AnalyzeOptNumBuckets]),

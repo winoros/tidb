@@ -233,7 +233,6 @@ func (s *RowSampleCollector) FromProto(pbCollector *tipb.RowSampleCollector) {
 			Weight:  pbSample.Weight,
 		})
 	}
-	heap.Init(&s.Samples)
 }
 
 func (s *RowSampleCollector) MergeCollector(subCollector *RowSampleCollector) {
