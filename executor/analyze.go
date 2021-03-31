@@ -109,6 +109,7 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 			result.job.Finish(true)
 			continue
 		}
+		now := time.Now()
 		for i, hg := range result.Hist {
 			err1 := statsHandle.SaveStatsToStorage(result.PhysicalTableID, result.Count, result.IsIndex, hg, result.Cms[i], 1)
 			if err1 != nil {
@@ -118,6 +119,8 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 				continue
 			}
 		}
+		dur := time.Since(now)
+		logutil.BgLogger().Warn("analyze exec", zap.Duration("one job cost", dur))
 		result.job.Finish(false)
 	}
 	for _, task := range e.tasks {
