@@ -848,6 +848,10 @@ func (s *testStatsSuite) prepareForGlobalStatsWithOpts(c *C, tk *testkit.TestKit
 		buf1.WriteString(fmt.Sprintf(", (%v)", i))
 		buf2.WriteString(fmt.Sprintf(", (%v)", 100000+i))
 	}
+	for i := 0; i < 1000; i++ {
+		buf1.WriteString(fmt.Sprintf(", (%v)", 0))
+		buf2.WriteString(fmt.Sprintf(", (%v)", 100000))
+	}
 	tk.MustExec(buf1.String())
 	tk.MustExec(buf2.String())
 	tk.MustExec("set @@tidb_analyze_version=2")
@@ -873,28 +877,31 @@ func (s *testStatsSuite) TestAnalyzeGlobalStatsWithOpts(c *C) {
 	s.prepareForGlobalStatsWithOpts(c, tk)
 
 	type opt struct {
-		topn    int
-		buckets int
-		err     bool
+		topnExpected int
+		topn         int
+		topnP1       int
+		topnP2       int
+		buckets      int
+		err          bool
 	}
 
 	cases := []opt{
-		{1, 37, false},
-		{2, 47, false},
-		{10, 77, false},
-		{77, 219, false},
-		{-31, 222, true},
-		{10, -77, true},
-		{10000, 47, true},
-		{77, 47000, true},
+		{2, 2, 2, 1, 37, false},
+		{2, 2, 1, 1, 47, false},
+		{10, 2, 1, 1, 77, false},
+		{77, 2, 1, 1, 219, false},
+		{-31, 2, 1, 1, 222, true},
+		{10, 2, 1, 1, -77, true},
+		{10000, 2, 1, 1, 47, true},
+		{77, 2, 1, 1, 47000, true},
 	}
 	for _, ca := range cases {
-		sql := fmt.Sprintf("analyze table t with %v topn, %v buckets", ca.topn, ca.buckets)
+		sql := fmt.Sprintf("analyze table t with %v topn, %v buckets", ca.topnExpected, ca.buckets)
 		if !ca.err {
 			tk.MustExec(sql)
-			s.checkForGlobalStatsWithOpts(c, tk, "global", ca.topn, ca.buckets)
-			s.checkForGlobalStatsWithOpts(c, tk, "p0", ca.topn, ca.buckets)
-			s.checkForGlobalStatsWithOpts(c, tk, "p1", ca.topn, ca.buckets)
+			s.checkForGlobalStatsWithOpts(c, tk, "global", ca.topnExpected, ca.buckets)
+			s.checkForGlobalStatsWithOpts(c, tk, "p0", ca.topnP1, ca.buckets)
+			s.checkForGlobalStatsWithOpts(c, tk, "p1", ca.topnP2, ca.buckets)
 		} else {
 			err := tk.ExecToErr(sql)
 			c.Assert(err, NotNil)
@@ -909,24 +916,24 @@ func (s *testStatsSuite) TestAnalyzeGlobalStatsWithOpts2(c *C) {
 
 	tk.MustExec("analyze table t with 20 topn, 50 buckets")
 	s.checkForGlobalStatsWithOpts(c, tk, "global", 20, 50)
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 20, 50)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 20, 50)
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 50)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 50)
 
 	// analyze a partition to let its options be different with others'
 	tk.MustExec("analyze table t partition p0 with 10 topn, 20 buckets")
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 10, 20) // use new options
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 10, 20)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 20, 50)
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 20) // use new options
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 2, 20)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 2, 50)
 
 	tk.MustExec("analyze table t partition p1 with 100 topn, 200 buckets")
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 100, 200)
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 10, 20)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 100, 200)
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 200)
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 20)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 200)
 
 	tk.MustExec("analyze table t partition p0") // default options
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 20, 256)
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 20, 256)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 100, 200)
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 256)
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 256)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 200)
 }
 
 func (s *testStatsSuite) TestGlobalStatsHealthy(c *C) {
