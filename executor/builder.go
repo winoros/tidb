@@ -2090,7 +2090,7 @@ func (b *executorBuilder) buildAnalyzeSamplingPushdown(
 }
 
 func (b *executorBuilder) buildAnalyzeColumnsPushdown(task plannercore.AnalyzeColumnsTask, opts map[ast.AnalyzeOptionType]uint64, autoAnalyze string) *analyzeTask {
-	if task.StatsVersion == statistics.Version3 {
+	if task.StatsVersion == statistics.Version2 {
 		return b.buildAnalyzeSamplingPushdown(task, opts, autoAnalyze)
 	}
 	cols := task.ColsInfo

@@ -523,7 +523,7 @@ func (s *testStatsSuite) TestInitStatsVer2(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
-	tk.MustExec("set @@session.tidb_analyze_version=3")
+	tk.MustExec("set @@session.tidb_analyze_version=2")
 	tk.MustExec("create table t(a int, b int, c int, index idx(a), index idxab(a, b))")
 	tk.MustExec("insert into t values(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (4, 4, 4), (4, 4, 4)")
 	tk.MustExec("analyze table t with 2 topn, 3 buckets")
@@ -628,7 +628,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0")
 	c.Assert(result.Rows()[1][9], Equals, "1")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -641,7 +641,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0")
 	c.Assert(result.Rows()[1][9], Equals, "0.8285714285714286")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -658,7 +658,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0")
 	c.Assert(result.Rows()[1][9], Equals, "-1")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -671,7 +671,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0")
 	c.Assert(result.Rows()[1][9], Equals, "-0.9428571428571428")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -686,7 +686,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0")
 	c.Assert(result.Rows()[1][9], Equals, "1")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -702,7 +702,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "1")
 	c.Assert(result.Rows()[1][9], Equals, "0.8285714285714286")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -717,7 +717,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	c.Assert(len(result.Rows()), Equals, 2)
 	c.Assert(result.Rows()[0][9], Equals, "0.8285714285714286")
 	c.Assert(result.Rows()[1][9], Equals, "1")
-	testKit.MustExec("set @@session.tidb_analyze_version=3")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't'").Sort()
 	c.Assert(len(result.Rows()), Equals, 2)
@@ -737,7 +737,7 @@ func (s *testStatsSuite) TestCorrelation(c *C) {
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't' and Is_index = 1").Sort()
 	c.Assert(len(result.Rows()), Equals, 1)
 	c.Assert(result.Rows()[0][9], Equals, "0")
-	testKit.MustExec("set @@tidb_analyze_version=3")
+	testKit.MustExec("set @@tidb_analyze_version=2")
 	testKit.MustExec("analyze table t")
 	result = testKit.MustQuery("show stats_histograms where Table_name = 't' and Is_index = 0").Sort()
 	c.Assert(len(result.Rows()), Equals, 3)
@@ -1899,7 +1899,7 @@ func (s *testStatsSuite) TestCorrelationStatsCompute(c *C) {
 		"2 [1,2] 1.000000 1",
 		"2 [1,3] -1.000000 1",
 	))
-	tk.MustExec("set @@session.tidb_analyze_version=3")
+	tk.MustExec("set @@session.tidb_analyze_version=2")
 	tk.MustExec("analyze table t")
 	tk.MustQuery("select type, column_ids, stats, status from mysql.stats_extended").Sort().Check(testkit.Rows(
 		"2 [1,2] 1.000000 1",
@@ -1935,7 +1935,7 @@ func (s *testStatsSuite) TestCorrelationStatsCompute(c *C) {
 		"2 [1,2] 0.000000 1",
 		"2 [1,3] 1.000000 1",
 	))
-	tk.MustExec("set @@session.tidb_analyze_version=3")
+	tk.MustExec("set @@session.tidb_analyze_version=2")
 	tk.MustExec("analyze table t")
 	tk.MustQuery("select type, column_ids, stats, status from mysql.stats_extended").Sort().Check(testkit.Rows(
 		"2 [1,2] 0.000000 1",
@@ -1948,7 +1948,7 @@ func (s *testStatsSuite) TestCorrelationStatsCompute(c *C) {
 		"2 [1,2] 1.000000 1",
 		"2 [1,3] 1.000000 1",
 	))
-	tk.MustExec("set @@session.tidb_analyze_version=3")
+	tk.MustExec("set @@session.tidb_analyze_version=2")
 	tk.MustExec("analyze table t")
 	tk.MustQuery("select type, column_ids, stats, status from mysql.stats_extended").Sort().Check(testkit.Rows(
 		"2 [1,2] 1.000000 1",
