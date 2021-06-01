@@ -1237,6 +1237,8 @@ func (e *AnalyzeColumnsExec) subBuildWorker(resultCh chan error, taskCh chan *sa
 		}
 	}()
 	colLen := len(e.colsInfo)
+	var tmpDatum types.Datum
+TaskLoop:
 	for {
 		task, ok := <-taskCh
 		if !ok {
@@ -1271,10 +1273,20 @@ func (e *AnalyzeColumnsExec) subBuildWorker(resultCh chan error, taskCh chan *sa
 				b := make([]byte, 0, 8)
 				var err error
 				for _, col := range idx.Columns {
+					if col.Length != types.UnspecifiedLength {
+						row.Columns[col.Offset].Copy(&tmpDatum)
+						ranger.CutDatumByPrefixLen(&tmpDatum, col.Length, &e.colsInfo[col.Offset].FieldType)
+						b, err = codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, b, tmpDatum)
+						if err != nil {
+							resultCh <- err
+							break TaskLoop
+						}
+						continue
+					}
 					b, err = codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, b, row.Columns[col.Offset])
 					if err != nil {
 						resultCh <- err
-						break
+						break TaskLoop
 					}
 				}
 				sampleItems = append(sampleItems, &statistics.SampleItem{
