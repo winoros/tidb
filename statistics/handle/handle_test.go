@@ -854,7 +854,7 @@ func (s *testStatsSuite) prepareForGlobalStatsWithOpts(c *C, tk *testkit.TestKit
 	}
 	tk.MustExec(buf1.String())
 	tk.MustExec(buf2.String())
-	tk.MustExec("set @@tidb_analyze_version=2")
+	tk.MustExec("set @@tidb_analyze_version=3")
 	tk.MustExec("set @@tidb_partition_prune_mode='dynamic'")
 	c.Assert(s.do.StatsHandle().DumpStatsDeltaToKV(handle.DumpAll), IsNil)
 }
@@ -914,26 +914,26 @@ func (s *testStatsSuite) TestAnalyzeGlobalStatsWithOpts2(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	s.prepareForGlobalStatsWithOpts(c, tk)
 
-	tk.MustExec("analyze table t with 20 topn, 50 buckets")
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 20, 50)
+	tk.MustExec("analyze table t with 20 topn, 50 buckets, 1000 samples")
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 50)
 	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 50)
 	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 50)
 
 	// analyze a partition to let its options be different with others'
 	tk.MustExec("analyze table t partition p0 with 10 topn, 20 buckets")
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 20) // use new options
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 2, 20)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 2, 50)
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 10, 20) // use new options
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 10, 20)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 50)
 
 	tk.MustExec("analyze table t partition p1 with 100 topn, 200 buckets")
 	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 200)
 	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 20)
 	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 200)
 
-	tk.MustExec("analyze table t partition p0") // default options
-	s.checkForGlobalStatsWithOpts(c, tk, "global", 2, 256)
-	s.checkForGlobalStatsWithOpts(c, tk, "p0", 1, 256)
-	s.checkForGlobalStatsWithOpts(c, tk, "p1", 1, 200)
+	tk.MustExec("analyze table t partition p0 with 20 topn") // change back to 20 topn
+	s.checkForGlobalStatsWithOpts(c, tk, "global", 20, 256)
+	s.checkForGlobalStatsWithOpts(c, tk, "p0", 20, 256)
+	s.checkForGlobalStatsWithOpts(c, tk, "p1", 100, 200)
 }
 
 func (s *testStatsSuite) TestGlobalStatsHealthy(c *C) {
