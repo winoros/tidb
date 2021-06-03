@@ -680,7 +680,7 @@ const (
 	DefTiDBEnableAsyncCommit           = false
 	DefTiDBEnable1PC                   = false
 	DefTiDBGuaranteeLinearizability    = true
-	DefTiDBAnalyzeVersion              = 1
+	DefTiDBAnalyzeVersion              = 2
 	DefTiDBEnableIndexMergeJoin        = false
 	DefTiDBTrackAggregateMemoryUsage   = true
 	DefTiDBEnableExchangePartition     = false

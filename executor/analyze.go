@@ -1319,6 +1319,7 @@ workLoop:
 		if task.isColumn {
 			collectors[task.slicePos] = collector
 		}
+		logutil.BgLogger().Warn("build stats", zap.Int("topn num", int(e.opts[ast.AnalyzeOptNumTopN])))
 		hist, topn, err := statistics.BuildHistAndTopN(e.ctx, int(e.opts[ast.AnalyzeOptNumBuckets]), int(e.opts[ast.AnalyzeOptNumTopN]), task.id, collector, task.tp, task.isColumn)
 		if err != nil {
 			resultCh <- err

@@ -268,41 +268,43 @@ func BuildHistAndTopN(
 			corrXYSum += float64(i) * float64(samples[i].Ordinal)
 		}
 
-		sampleBytes, err := getComparedBytes(samples[i].Value)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		// case 1, this value is equal to the last one: current count++
-		if bytes.Equal(cur, sampleBytes) {
-			curCnt += 1
-			continue
-		}
-		// case 2, meet a different value: counting for the "current" is complete
-		// case 2-1, now topn is empty: append the "current" count directly
-		if len(topNList) == 0 {
-			topNList = append(topNList, TopNMeta{Encoded: cur, Count: uint64(curCnt)})
-			cur, curCnt = sampleBytes, 1
-			continue
-		}
-		// case 2-2, now topn is full, and the "current" count is less than the least count in the topn: no need to insert the "current"
-		if len(topNList) >= numTopN && uint64(curCnt) <= topNList[len(topNList)-1].Count {
-			cur, curCnt = sampleBytes, 1
-			continue
-		}
-		// case 2-3, now topn is not full, or the "current" count is larger than the least count in the topn: need to find a slot to insert the "current"
-		j := len(topNList)
-		for ; j > 0; j-- {
-			if uint64(curCnt) < topNList[j-1].Count {
-				break
+		if numTopN > 0 {
+			sampleBytes, err := getComparedBytes(samples[i].Value)
+			if err != nil {
+				return nil, nil, errors.Trace(err)
 			}
+			// case 1, this value is equal to the last one: current count++
+			if bytes.Equal(cur, sampleBytes) {
+				curCnt += 1
+				continue
+			}
+			// case 2, meet a different value: counting for the "current" is complete
+			// case 2-1, now topn is empty: append the "current" count directly
+			if len(topNList) == 0 {
+				topNList = append(topNList, TopNMeta{Encoded: cur, Count: uint64(curCnt)})
+				cur, curCnt = sampleBytes, 1
+				continue
+			}
+			// case 2-2, now topn is full, and the "current" count is less than the least count in the topn: no need to insert the "current"
+			if len(topNList) >= numTopN && uint64(curCnt) <= topNList[len(topNList)-1].Count {
+				cur, curCnt = sampleBytes, 1
+				continue
+			}
+			// case 2-3, now topn is not full, or the "current" count is larger than the least count in the topn: need to find a slot to insert the "current"
+			j := len(topNList)
+			for ; j > 0; j-- {
+				if uint64(curCnt) < topNList[j-1].Count {
+					break
+				}
+			}
+			topNList = append(topNList, TopNMeta{})
+			copy(topNList[j+1:], topNList[j:])
+			topNList[j] = TopNMeta{Encoded: cur, Count: uint64(curCnt)}
+			if len(topNList) > numTopN {
+				topNList = topNList[:numTopN]
+			}
+			cur, curCnt = sampleBytes, 1
 		}
-		topNList = append(topNList, TopNMeta{})
-		copy(topNList[j+1:], topNList[j:])
-		topNList[j] = TopNMeta{Encoded: cur, Count: uint64(curCnt)}
-		if len(topNList) > numTopN {
-			topNList = topNList[:numTopN]
-		}
-		cur, curCnt = sampleBytes, 1
 	}
 
 	// Calc the correlation of the column between the handle column.
@@ -312,9 +314,9 @@ func BuildHistAndTopN(
 
 	// Handle the counting for the last value. Basically equal to the case 2 above.
 	// now topn is empty: append the "current" count directly
-	if len(topNList) == 0 {
+	if len(topNList) == 0 && numTopN > 0 {
 		topNList = append(topNList, TopNMeta{Encoded: cur, Count: uint64(curCnt)})
-	} else if len(topNList) < numTopN || uint64(curCnt) > topNList[len(topNList)-1].Count {
+	} else if len(topNList) < numTopN || len(topNList) > 0 && uint64(curCnt) > topNList[len(topNList)-1].Count {
 		// now topn is not full, or the "current" count is larger than the least count in the topn: need to find a slot to insert the "current"
 		j := len(topNList)
 		for ; j > 0; j-- {

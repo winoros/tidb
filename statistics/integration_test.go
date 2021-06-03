@@ -94,14 +94,16 @@ func (s *testIntegrationSuite) TestChangeVerTo2Behavior(c *C) {
 	}
 	tk.MustExec("set @@session.tidb_analyze_version = 1")
 	tk.MustExec("analyze table t index idx")
-	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 The analyze version from the session is not compatible with the existing statistics of the table. Use the existing version instead"))
+	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 The analyze version from the session is not compatible with the existing statistics of the table. Use the existing version instead",
+		"Warning 1105 The version 2 would collect all statistics not only the selected indexes"))
 	c.Assert(h.Update(is), IsNil)
 	statsTblT = h.GetTableStats(tblT.Meta())
 	for _, idx := range statsTblT.Indices {
 		c.Assert(idx.StatsVer, Equals, int64(2))
 	}
 	tk.MustExec("analyze table t index")
-	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 The analyze version from the session is not compatible with the existing statistics of the table. Use the existing version instead"))
+	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 The analyze version from the session is not compatible with the existing statistics of the table. Use the existing version instead",
+		"Warning 1105 The version 2 would collect all statistics not only the selected indexes"))
 	c.Assert(h.Update(is), IsNil)
 	statsTblT = h.GetTableStats(tblT.Meta())
 	for _, idx := range statsTblT.Indices {
@@ -188,8 +190,8 @@ func (s *testIntegrationSuite) TestIncAnalyzeOnVer2(c *C) {
 	tk.MustExec("analyze incremental table t index idx with 2 topn")
 	// After analyze, there's two val in hist.
 	tk.MustQuery("show stats_buckets where table_name = 't' and column_name = 'idx'").Check(testkit.Rows(
-		"test t  idx 1 0 2 2 1 1 1",
-		"test t  idx 1 1 3 0 2 4 1",
+		"test t  idx 1 0 2 2 1 1 0",
+		"test t  idx 1 1 3 1 3 3 0",
 	))
 	// Two val in topn.
 	tk.MustQuery("show stats_topn where table_name = 't' and column_name = 'idx'").Check(testkit.Rows(

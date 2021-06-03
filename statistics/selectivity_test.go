@@ -406,6 +406,7 @@ func (s *testStatsSuite) TestEstimationForUnknownValues(c *C) {
 	testKit.MustExec("use test")
 	testKit.MustExec("drop table if exists t")
 	testKit.MustExec("create table t(a int, b int, key idx(a, b))")
+	testKit.MustExec("set @@tidb_analyze_version=1")
 	testKit.MustExec("analyze table t")
 	for i := 0; i < 10; i++ {
 		testKit.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))

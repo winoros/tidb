@@ -574,10 +574,7 @@
   {
     "Name": "TestCollationColumnEstimate",
     "Cases": [
-      [
-        "test t  a 0 0 2 2 \u0000A\u0000A\u0000A \u0000A\u0000A\u0000A 0",
-        "test t  a 0 1 4 2 \u0000B\u0000B\u0000B \u0000B\u0000B\u0000B 0"
-      ],
+      null,
       [
         "TableReader_7 2.00 root  data:Selection_6",
         "└─Selection_6 2.00 cop[tikv]  eq(test.t.a, \"aÄa\")",
@@ -607,7 +604,7 @@
       },
       {
         "SQL": "select * from t where a < 8 and (b > 10 or c < 3 or b > 4) and a > 2",
-        "Selectivity": 0.3125
+        "Selectivity": 0
       }
     ]
   }
