@@ -584,24 +584,27 @@ func analyzeColumnsPushdown(colExec *AnalyzeColumnsExec) []analyzeResult {
 	}
 	collExtStats := colExec.ctx.GetSessionVars().EnableExtendedStats
 	if colExec.StatsVersion == statistics.Version2 {
-		indexesWithVirtualCol := make([]*model.IndexInfo, 0, len(colExec.indexes))
-		indexesWithVirtualColOffsets := make([]int, 0, len(colExec.indexes))
+		specialIndexes := make([]*model.IndexInfo, 0, len(colExec.indexes))
+		specialIndexesOffsets := make([]int, 0, len(colExec.indexes))
 		for i, idx := range colExec.indexes {
-			containVirtual := false
+			isSpecial := false
 			for _, col := range idx.Columns {
-				if colExec.colsInfo[col.Offset].IsGenerated() && !colExec.colsInfo[col.Offset].GeneratedStored {
-					containVirtual = true
+				colInfo := colExec.colsInfo[col.Offset]
+				isVirtualCol := colInfo.IsGenerated() && !colInfo.GeneratedStored
+				isPrefixCol := col.Length != types.UnspecifiedLength
+				if isVirtualCol || isPrefixCol {
+					isSpecial = true
 					break
 				}
 			}
-			if containVirtual {
-				indexesWithVirtualColOffsets = append(indexesWithVirtualColOffsets, i)
-				indexesWithVirtualCol = append(indexesWithVirtualCol, idx)
+			if isSpecial {
+				specialIndexesOffsets = append(specialIndexesOffsets, i)
+				specialIndexes = append(specialIndexes, idx)
 			}
 		}
 		idxNDVPushDownCh := make(chan analyzeIndexNDVTotalResult, 1)
-		go colExec.handleNDVForIndexWithVirtualCol(indexesWithVirtualCol, idxNDVPushDownCh)
-		count, hists, topns, fmSketches, extStats, err := colExec.buildSamplingStats(ranges, collExtStats, indexesWithVirtualColOffsets, idxNDVPushDownCh)
+		go colExec.handleNDVForSpecialIndexes(specialIndexes, idxNDVPushDownCh)
+		count, hists, topns, fmSketches, extStats, err := colExec.buildSamplingStats(ranges, collExtStats, specialIndexesOffsets, idxNDVPushDownCh)
 		if err != nil {
 			return []analyzeResult{{Err: err, job: colExec.job}}
 		}
@@ -1012,8 +1015,8 @@ type analyzeIndexNDVTotalResult struct {
 	err     error
 }
 
-// handleNDVForIndexWithVirtualCol deals with the logic to analyze the index containing the virtual column when the mode is full sampling.
-func (e *AnalyzeColumnsExec) handleNDVForIndexWithVirtualCol(indexInfos []*model.IndexInfo, totalResultCh chan analyzeIndexNDVTotalResult) {
+// handleNDVForSpecialIndexes deals with the logic to analyze the index containing the virtual column when the mode is full sampling.
+func (e *AnalyzeColumnsExec) handleNDVForSpecialIndexes(indexInfos []*model.IndexInfo, totalResultCh chan analyzeIndexNDVTotalResult) {
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
