@@ -75,6 +75,8 @@ func (s *testShowStatsSuite) TestShowStatsBuckets(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
+	// Simple behavior testing. Version=1 is enough.
+	tk.MustExec("set @@tidb_analyze_version=1")
 	tk.MustExec("create table t (a int, b int)")
 	tk.MustExec("create index idx on t(a,b)")
 	tk.MustExec("insert into t values (1,1)")
