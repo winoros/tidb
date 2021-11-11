@@ -649,6 +649,11 @@ func (p *PhysicalHashJoin) explainInfo(normalized bool) string {
 
 	buffer.WriteString(p.JoinType.String())
 
+	if p.JoinType == LeftOuterJoin || p.JoinType == RightOuterJoin || p.JoinType == LeftOuterSemiJoin || p.JoinType == AntiLeftOuterSemiJoin {
+		buffer.WriteString(", build side is outer:")
+		fmt.Fprintf(buffer, " %v", p.UseOuterToBuild)
+	}
+
 	if len(p.EqualConditions) > 0 {
 		if normalized {
 			buffer.WriteString(", equal:")
