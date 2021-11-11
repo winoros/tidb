@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -19,13 +20,13 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/testkit"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 type testDDLTableSplitSuite struct{}
@@ -35,7 +36,10 @@ var _ = Suite(&testDDLTableSplitSuite{})
 func (s *testDDLTableSplitSuite) TestTableSplit(c *C) {
 	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
-	defer store.Close()
+	defer func() {
+		err := store.Close()
+		c.Assert(err, IsNil)
+	}()
 	session.SetSchemaLease(100 * time.Millisecond)
 	session.DisableStats4Test()
 	atomic.StoreUint32(&ddl.EnableSplitTableRegion, 1)
@@ -75,9 +79,9 @@ func checkRegionStartWithTableID(c *C, id int64, store kvStore) {
 	var loc *tikv.KeyLocation
 	var err error
 	cache := store.GetRegionCache()
-	loc, err = cache.LocateKey(tikv.NewBackofferWithVars(context.Background(), 5000, nil), regionStartKey)
+	loc, err = cache.LocateKey(tikv.NewBackoffer(context.Background(), 5000), regionStartKey)
 	c.Assert(err, IsNil)
 	// Region cache may be out of date, so we need to drop this expired region and load it again.
 	cache.InvalidateCachedRegion(loc.Region)
-	c.Assert([]byte(loc.StartKey), BytesEquals, []byte(regionStartKey))
+	c.Assert(loc.StartKey, BytesEquals, []byte(regionStartKey))
 }

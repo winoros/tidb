@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,6 +17,7 @@ package codec
 import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -23,6 +25,9 @@ import (
 func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) ([]byte, error) {
 	if precision == 0 {
 		precision, frac = dec.PrecisionAndFrac()
+	}
+	if frac > mysql.MaxDecimalScale {
+		frac = mysql.MaxDecimalScale
 	}
 	b = append(b, byte(precision), byte(frac))
 	b, err := dec.WriteBin(precision, frac, b)

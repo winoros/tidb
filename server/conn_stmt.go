@@ -1,3 +1,17 @@
+// Copyright 2015 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Copyright 2013 The Go-MySQL-Driver Authors. All rights reserved.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -19,19 +33,6 @@
 // The above copyright notice and this permission notice shall be included in all
 // copies or substantial portions of the Software.
 
-// Copyright 2015 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package server
 
 import (
@@ -44,13 +45,18 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	storeerr "github.com/pingcap/tidb/store/driver/error"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/topsql"
+	"github.com/tikv/client-go/v2/util"
 )
 
 func (cc *clientConn) handleStmtPrepare(ctx context.Context, sql string) error {
@@ -60,27 +66,29 @@ func (cc *clientConn) handleStmtPrepare(ctx context.Context, sql string) error {
 	}
 	data := make([]byte, 4, 128)
 
-	//status ok
+	// status ok
 	data = append(data, 0)
-	//stmt id
+	// stmt id
 	data = dumpUint32(data, uint32(stmt.ID()))
-	//number columns
+	// number columns
 	data = dumpUint16(data, uint16(len(columns)))
-	//number params
+	// number params
 	data = dumpUint16(data, uint16(len(params)))
-	//filter [00]
+	// filter [00]
 	data = append(data, 0)
-	//warning count
-	data = append(data, 0, 0) //TODO support warning count
+	// warning count
+	data = append(data, 0, 0) // TODO support warning count
 
 	if err := cc.writePacket(data); err != nil {
 		return err
 	}
 
+	cc.initResultEncoder(ctx)
+	defer cc.rsEncoder.clean()
 	if len(params) > 0 {
 		for i := 0; i < len(params); i++ {
 			data = data[0:4]
-			data = params[i].Dump(data)
+			data = params[i].Dump(data, cc.rsEncoder)
 
 			if err := cc.writePacket(data); err != nil {
 				return err
@@ -95,7 +103,7 @@ func (cc *clientConn) handleStmtPrepare(ctx context.Context, sql string) error {
 	if len(columns) > 0 {
 		for i := 0; i < len(columns); i++ {
 			data = data[0:4]
-			data = columns[i].Dump(data)
+			data = columns[i].Dump(data, cc.rsEncoder)
 
 			if err := cc.writePacket(data); err != nil {
 				return err
@@ -119,6 +127,13 @@ func (cc *clientConn) handleStmtExecute(ctx context.Context, data []byte) (err e
 	stmtID := binary.LittleEndian.Uint32(data[0:4])
 	pos += 4
 
+	if variable.TopSQLEnabled() {
+		preparedStmt, _ := cc.preparedStmtID2CachePreparedStmt(stmtID)
+		if preparedStmt != nil && preparedStmt.SQLDigest != nil {
+			ctx = topsql.AttachSQLInfo(ctx, preparedStmt.NormalizedSQL, preparedStmt.SQLDigest, "", nil, false)
+		}
+	}
+
 	stmt := cc.ctx.GetStatement(int(stmtID))
 	if stmt == nil {
 		return mysql.NewErr(mysql.ErrUnknownStmtHandler,
@@ -141,7 +156,7 @@ func (cc *clientConn) handleStmtExecute(ctx context.Context, data []byte) (err e
 	case 1:
 		useCursor = true
 	default:
-		return mysql.NewErrf(mysql.ErrUnknown, "unsupported flag %d", flag)
+		return mysql.NewErrf(mysql.ErrUnknown, "unsupported flag %d", nil, flag)
 	}
 
 	// skip iteration-count, always 1
@@ -186,35 +201,58 @@ func (cc *clientConn) handleStmtExecute(ctx context.Context, data []byte) (err e
 		}
 	}
 	ctx = context.WithValue(ctx, execdetails.StmtExecDetailKey, &execdetails.StmtExecDetails{})
+	ctx = context.WithValue(ctx, util.ExecDetailsKey, &util.ExecDetails{})
+	retryable, err := cc.executePreparedStmtAndWriteResult(ctx, stmt, args, useCursor)
+	_, allowTiFlashFallback := cc.ctx.GetSessionVars().AllowFallbackToTiKV[kv.TiFlash]
+	if allowTiFlashFallback && err != nil && errors.ErrorEqual(err, storeerr.ErrTiFlashServerTimeout) && retryable {
+		// When the TiFlash server seems down, we append a warning to remind the user to check the status of the TiFlash
+		// server and fallback to TiKV.
+		prevErr := err
+		delete(cc.ctx.GetSessionVars().IsolationReadEngines, kv.TiFlash)
+		defer func() {
+			cc.ctx.GetSessionVars().IsolationReadEngines[kv.TiFlash] = struct{}{}
+		}()
+		_, err = cc.executePreparedStmtAndWriteResult(ctx, stmt, args, useCursor)
+		// We append warning after the retry because `ResetContextOfStmt` may be called during the retry, which clears warnings.
+		cc.ctx.GetSessionVars().StmtCtx.AppendError(prevErr)
+	}
+	return err
+}
+
+// The first return value indicates whether the call of executePreparedStmtAndWriteResult has no side effect and can be retried.
+// Currently the first return value is used to fallback to TiKV when TiFlash is down.
+func (cc *clientConn) executePreparedStmtAndWriteResult(ctx context.Context, stmt PreparedStatement, args []types.Datum, useCursor bool) (bool, error) {
 	rs, err := stmt.Execute(ctx, args)
 	if err != nil {
-		return errors.Annotate(err, cc.preparedStmt2String(stmtID))
+		return true, errors.Annotate(err, cc.preparedStmt2String(uint32(stmt.ID())))
 	}
 	if rs == nil {
-		return cc.writeOK(ctx)
+		return false, cc.writeOK(ctx)
 	}
 
 	// if the client wants to use cursor
 	// we should hold the ResultSet in PreparedStatement for next stmt_fetch, and only send back ColumnInfo.
 	// Tell the client cursor exists in server by setting proper serverStatus.
 	if useCursor {
+		cc.initResultEncoder(ctx)
+		defer cc.rsEncoder.clean()
 		stmt.StoreResultSet(rs)
 		err = cc.writeColumnInfo(rs.Columns(), mysql.ServerStatusCursorExists)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if cl, ok := rs.(fetchNotifier); ok {
 			cl.OnFetchReturned()
 		}
 		// explicitly flush columnInfo to client.
-		return cc.flush(ctx)
+		return false, cc.flush(ctx)
 	}
 	defer terror.Call(rs.Close)
-	err = cc.writeResultset(ctx, rs, true, 0, 0)
+	retryable, err := cc.writeResultset(ctx, rs, true, 0, 0)
 	if err != nil {
-		return errors.Annotate(err, cc.preparedStmt2String(stmtID))
+		return retryable, errors.Annotate(err, cc.preparedStmt2String(uint32(stmt.ID())))
 	}
-	return nil
+	return false, nil
 }
 
 // maxFetchSize constants
@@ -235,6 +273,12 @@ func (cc *clientConn) handleStmtFetch(ctx context.Context, data []byte) (err err
 		return errors.Annotate(mysql.NewErr(mysql.ErrUnknownStmtHandler,
 			strconv.FormatUint(uint64(stmtID), 10), "stmt_fetch"), cc.preparedStmt2String(stmtID))
 	}
+	if variable.TopSQLEnabled() {
+		prepareObj, _ := cc.preparedStmtID2CachePreparedStmt(stmtID)
+		if prepareObj != nil && prepareObj.SQLDigest != nil {
+			ctx = topsql.AttachSQLInfo(ctx, prepareObj.NormalizedSQL, prepareObj.SQLDigest, "", nil, false)
+		}
+	}
 	sql := ""
 	if prepared, ok := cc.ctx.GetStatement(int(stmtID)).(*TiDBStatement); ok {
 		sql = prepared.sql
@@ -246,7 +290,7 @@ func (cc *clientConn) handleStmtFetch(ctx context.Context, data []byte) (err err
 			strconv.FormatUint(uint64(stmtID), 10), "stmt_fetch_rs"), cc.preparedStmt2String(stmtID))
 	}
 
-	err = cc.writeResultset(ctx, rs, true, mysql.ServerStatusCursorExists, int(fetchSize))
+	_, err = cc.writeResultset(ctx, rs, true, mysql.ServerStatusCursorExists, int(fetchSize))
 	if err != nil {
 		return errors.Annotate(err, cc.preparedStmt2String(stmtID))
 	}
@@ -639,7 +683,7 @@ func (cc *clientConn) preparedStmt2String(stmtID uint32) string {
 	if sv == nil {
 		return ""
 	}
-	if sv.EnableLogDesensitization {
+	if sv.EnableRedactLog {
 		return cc.preparedStmt2StringNoArgs(stmtID)
 	}
 	return cc.preparedStmt2StringNoArgs(stmtID) + sv.PreparedParams.String()
@@ -650,14 +694,30 @@ func (cc *clientConn) preparedStmt2StringNoArgs(stmtID uint32) string {
 	if sv == nil {
 		return ""
 	}
+	preparedObj, invalid := cc.preparedStmtID2CachePreparedStmt(stmtID)
+	if invalid {
+		return "invalidate CachedPrepareStmt type, ID: " + strconv.FormatUint(uint64(stmtID), 10)
+	}
+	if preparedObj == nil {
+		return "prepared statement not found, ID: " + strconv.FormatUint(uint64(stmtID), 10)
+	}
+	return preparedObj.PreparedAst.Stmt.Text()
+}
+
+func (cc *clientConn) preparedStmtID2CachePreparedStmt(stmtID uint32) (_ *plannercore.CachedPrepareStmt, invalid bool) {
+	sv := cc.ctx.GetSessionVars()
+	if sv == nil {
+		return nil, false
+	}
 	preparedPointer, ok := sv.PreparedStmts[stmtID]
 	if !ok {
-		return "prepared statement not found, ID: " + strconv.FormatUint(uint64(stmtID), 10)
+		// not found
+		return nil, false
 	}
 	preparedObj, ok := preparedPointer.(*plannercore.CachedPrepareStmt)
 	if !ok {
-		return "invalidate CachedPrepareStmt type, ID: " + strconv.FormatUint(uint64(stmtID), 10)
+		// invalid cache. should never happen.
+		return nil, true
 	}
-	preparedAst := preparedObj.PreparedAst
-	return preparedAst.Stmt.Text()
+	return preparedObj, false
 }

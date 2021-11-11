@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,7 +19,8 @@ import (
 	"strings"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/printer"
@@ -122,7 +124,7 @@ func (b *builtinCurrentRoleSig) vectorized() bool {
 }
 
 // evalString evals a builtinCurrentUserSig.
-// See https://dev.mysql.com/doc/refman/5.7/en/information-functions.html#function_current-user
+// See https://dev.mysql.com/doc/refman/8.0/en/information-functions.html#function_current-role
 func (b *builtinCurrentRoleSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
 	n := input.NumRows()
 
@@ -134,7 +136,7 @@ func (b *builtinCurrentRoleSig) vecEvalString(input *chunk.Chunk, result *chunk.
 	result.ReserveString(n)
 	if len(data.ActiveRoles) == 0 {
 		for i := 0; i < n; i++ {
-			result.AppendString("")
+			result.AppendString("NONE")
 		}
 		return nil
 	}
@@ -218,7 +220,7 @@ func (b *builtinBenchmarkSig) vecEvalInt(input *chunk.Chunk, result *chunk.Colum
 	loopCount := b.constLoopCount
 	arg, ctx := b.args[1], b.ctx
 	evalType := arg.GetType().EvalType()
-	buf, err := b.bufAllocator.get(evalType, n)
+	buf, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -331,7 +333,7 @@ func (b *builtinTiDBDecodeKeySig) vectorized() bool {
 
 func (b *builtinTiDBDecodeKeySig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
 	n := input.NumRows()
-	buf, err := b.bufAllocator.get(types.ETString, n)
+	buf, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -340,12 +342,16 @@ func (b *builtinTiDBDecodeKeySig) vecEvalString(input *chunk.Chunk, result *chun
 		return err
 	}
 	result.ReserveString(n)
+	decode := func(ctx sessionctx.Context, s string) string { return s }
+	if fn := b.ctx.Value(TiDBDecodeKeyFunctionKey); fn != nil {
+		decode = fn.(func(ctx sessionctx.Context, s string) string)
+	}
 	for i := 0; i < n; i++ {
 		if buf.IsNull(i) {
 			result.AppendNull()
 			continue
 		}
-		result.AppendString(decodeKey(b.ctx, buf.GetString(i)))
+		result.AppendString(decode(b.ctx, buf.GetString(i)))
 	}
 	return nil
 }

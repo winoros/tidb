@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,6 +17,8 @@ package kv
 import (
 	"context"
 	"sync"
+
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 // InjectionConfig is used for fault injections for KV components.
@@ -63,9 +66,9 @@ func (s *InjectedStore) Begin() (Transaction, error) {
 	}, err
 }
 
-// BeginWithStartTS creates an injected Transaction with startTS.
-func (s *InjectedStore) BeginWithStartTS(startTS uint64) (Transaction, error) {
-	txn, err := s.Storage.BeginWithStartTS(startTS)
+// BeginWithOption creates an injected Transaction with given option.
+func (s *InjectedStore) BeginWithOption(option tikv.StartTSOption) (Transaction, error) {
+	txn, err := s.Storage.BeginWithOption(option)
 	return &InjectedTransaction{
 		Transaction: txn,
 		cfg:         s.cfg,
@@ -73,12 +76,12 @@ func (s *InjectedStore) BeginWithStartTS(startTS uint64) (Transaction, error) {
 }
 
 // GetSnapshot creates an injected Snapshot.
-func (s *InjectedStore) GetSnapshot(ver Version) (Snapshot, error) {
-	snapshot, err := s.Storage.GetSnapshot(ver)
+func (s *InjectedStore) GetSnapshot(ver Version) Snapshot {
+	snapshot := s.Storage.GetSnapshot(ver)
 	return &InjectedSnapshot{
 		Snapshot: snapshot,
 		cfg:      s.cfg,
-	}, err
+	}
 }
 
 // InjectedTransaction wraps a Transaction with injections.

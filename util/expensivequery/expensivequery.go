@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
@@ -54,6 +56,7 @@ func (eqh *Handle) Run() {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	sm := eqh.sm.Load().(util.SessionManager)
+	record := &memoryUsageAlarm{}
 	for {
 		select {
 		case <-ticker.C:
@@ -73,6 +76,11 @@ func (eqh *Handle) Run() {
 				}
 			}
 			threshold = atomic.LoadUint64(&variable.ExpensiveQueryTimeThreshold)
+
+			record.memoryUsageAlarmRatio = variable.MemoryUsageAlarmRatio.Load()
+			if record.err == nil {
+				record.alarm4ExcessiveMemUsage(sm)
+			}
 		case <-eqh.exitCh:
 			return
 		}
@@ -148,13 +156,16 @@ func genLogFields(costTime time.Duration, info *util.ProcessInfo) []zap.Field {
 	}
 	logFields = append(logFields, zap.Uint64("txn_start_ts", info.CurTxnStartTS))
 	if memTracker := info.StmtCtx.MemTracker; memTracker != nil {
-		logFields = append(logFields, zap.String("mem_max", fmt.Sprintf("%d Bytes (%v)", memTracker.MaxConsumed(), memTracker.BytesToString(memTracker.MaxConsumed()))))
+		logFields = append(logFields, zap.String("mem_max", fmt.Sprintf("%d Bytes (%v)", memTracker.MaxConsumed(), memTracker.FormatBytes(memTracker.MaxConsumed()))))
 	}
 
 	const logSQLLen = 1024 * 8
 	var sql string
 	if len(info.Info) > 0 {
 		sql = info.Info
+		if info.RedactSQL {
+			sql = parser.Normalize(sql)
+		}
 	}
 	if len(sql) > logSQLLen {
 		sql = fmt.Sprintf("%s len(%d)", sql[:logSQLLen], len(sql))

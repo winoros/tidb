@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,8 +18,8 @@ import (
 	"encoding/binary"
 	"unicode/utf8"
 
-	"github.com/pingcap/parser/terror"
 	mysql "github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbterror"
 )
 
 // TypeCode indicates JSON type.
@@ -206,21 +207,23 @@ const (
 
 var (
 	// ErrInvalidJSONText means invalid JSON text.
-	ErrInvalidJSONText = terror.ClassJSON.New(mysql.ErrInvalidJSONText, mysql.MySQLErrName[mysql.ErrInvalidJSONText])
+	ErrInvalidJSONText = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONText)
 	// ErrInvalidJSONPath means invalid JSON path.
-	ErrInvalidJSONPath = terror.ClassJSON.New(mysql.ErrInvalidJSONPath, mysql.MySQLErrName[mysql.ErrInvalidJSONPath])
+	ErrInvalidJSONPath = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONPath)
 	// ErrInvalidJSONData means invalid JSON data.
-	ErrInvalidJSONData = terror.ClassJSON.New(mysql.ErrInvalidJSONData, mysql.MySQLErrName[mysql.ErrInvalidJSONData])
+	ErrInvalidJSONData = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONData)
 	// ErrInvalidJSONPathWildcard means invalid JSON path that contain wildcard characters.
-	ErrInvalidJSONPathWildcard = terror.ClassJSON.New(mysql.ErrInvalidJSONPathWildcard, mysql.MySQLErrName[mysql.ErrInvalidJSONPathWildcard])
+	ErrInvalidJSONPathWildcard = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONPathWildcard)
 	// ErrInvalidJSONContainsPathType means invalid JSON contains path type.
-	ErrInvalidJSONContainsPathType = terror.ClassJSON.New(mysql.ErrInvalidJSONContainsPathType, mysql.MySQLErrName[mysql.ErrInvalidJSONContainsPathType])
+	ErrInvalidJSONContainsPathType = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONContainsPathType)
 	// ErrJSONDocumentNULLKey means that json's key is null
-	ErrJSONDocumentNULLKey = terror.ClassJSON.New(mysql.ErrJSONDocumentNULLKey, mysql.MySQLErrName[mysql.ErrJSONDocumentNULLKey])
+	ErrJSONDocumentNULLKey = dbterror.ClassJSON.NewStd(mysql.ErrJSONDocumentNULLKey)
+	// ErrJSONObjectKeyTooLong means JSON object with key length >= 65536 which is not yet supported.
+	ErrJSONObjectKeyTooLong = dbterror.ClassTypes.NewStdErr(mysql.ErrJSONObjectKeyTooLong, mysql.MySQLErrName[mysql.ErrJSONObjectKeyTooLong])
 	// ErrInvalidJSONPathArrayCell means invalid JSON path for an array cell.
-	ErrInvalidJSONPathArrayCell = terror.ClassJSON.New(mysql.ErrInvalidJSONPathArrayCell, mysql.MySQLErrName[mysql.ErrInvalidJSONPathArrayCell])
+	ErrInvalidJSONPathArrayCell = dbterror.ClassJSON.NewStd(mysql.ErrInvalidJSONPathArrayCell)
 	// ErrUnsupportedSecondArgumentType means unsupported second argument type in json_objectagg
-	ErrUnsupportedSecondArgumentType = terror.ClassJSON.New(mysql.ErrUnsupportedSecondArgumentType, mysql.MySQLErrName[mysql.ErrUnsupportedSecondArgumentType])
+	ErrUnsupportedSecondArgumentType = dbterror.ClassJSON.NewStd(mysql.ErrUnsupportedSecondArgumentType)
 )
 
 // json_contains_path function type choices

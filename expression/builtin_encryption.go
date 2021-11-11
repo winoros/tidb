@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,9 +18,9 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/aes"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
@@ -29,8 +30,9 @@ import (
 	"strings"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/auth"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/auth"
+	"github.com/pingcap/tidb/parser/charset"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
@@ -77,6 +79,7 @@ var (
 // aesModeAttr indicates that the key length and iv attribute for specific block_encryption_mode.
 // keySize is the key length in bits and mode is the encryption mode.
 // ivRequired indicates that initialization vector is required or not.
+// nolint:structcheck
 type aesModeAttr struct {
 	modeName   string
 	keySize    int
@@ -84,7 +87,7 @@ type aesModeAttr struct {
 }
 
 var aesModes = map[string]*aesModeAttr{
-	//TODO support more modes, permitted mode values are: ECB, CBC, CFB1, CFB8, CFB128, OFB
+	// TODO support more modes, permitted mode values are: ECB, CBC, CFB1, CFB8, CFB128, OFB
 	"aes-128-ecb": {"ecb", 16, false},
 	"aes-192-ecb": {"ecb", 24, false},
 	"aes-256-ecb": {"ecb", 32, false},
@@ -404,10 +407,20 @@ func (b *builtinDecodeSig) evalString(row chunk.Row) (string, bool, error) {
 	if isNull || err != nil {
 		return "", true, err
 	}
+	dataTp := b.args[0].GetType()
+	dataStr, err = charset.NewEncoding(dataTp.Charset).EncodeString(dataStr)
+	if err != nil {
+		return "", false, err
+	}
 
 	passwordStr, isNull, err := b.args[1].EvalString(b.ctx, row)
 	if isNull || err != nil {
 		return "", true, err
+	}
+	passwordTp := b.args[1].GetType()
+	passwordStr, err = charset.NewEncoding(passwordTp.Charset).EncodeString(passwordStr)
+	if err != nil {
+		return "", false, err
 	}
 
 	decodeStr, err := encrypt.SQLDecode(dataStr, passwordStr)
@@ -467,10 +480,20 @@ func (b *builtinEncodeSig) evalString(row chunk.Row) (string, bool, error) {
 	if isNull || err != nil {
 		return "", true, err
 	}
+	decodeTp := b.args[0].GetType()
+	decodeStr, err = charset.NewEncoding(decodeTp.Charset).EncodeString(decodeStr)
+	if err != nil {
+		return "", false, err
+	}
 
 	passwordStr, isNull, err := b.args[1].EvalString(b.ctx, row)
 	if isNull || err != nil {
 		return "", true, err
+	}
+	passwordTp := b.args[1].GetType()
+	passwordStr, err = charset.NewEncoding(passwordTp.Charset).EncodeString(passwordStr)
+	if err != nil {
+		return "", false, err
 	}
 
 	dataStr, err := encrypt.SQLEncode(decodeStr, passwordStr)
@@ -526,18 +549,23 @@ func (b *builtinPasswordSig) Clone() builtinFunc {
 func (b *builtinPasswordSig) evalString(row chunk.Row) (d string, isNull bool, err error) {
 	pass, isNull, err := b.args[0].EvalString(b.ctx, row)
 	if isNull || err != nil {
-		return "", err != nil, err
+		return "", isNull, err
 	}
 
 	if len(pass) == 0 {
 		return "", false, nil
 	}
 
+	dStr, err := charset.NewEncoding(b.args[0].GetType().Charset).EncodeString(pass)
+	if err != nil {
+		return "", false, err
+	}
+
 	// We should append a warning here because function "PASSWORD" is deprecated since MySQL 5.7.6.
 	// See https://dev.mysql.com/doc/refman/5.7/en/encryption-functions.html#function_password
 	b.ctx.GetSessionVars().StmtCtx.AppendWarning(errDeprecatedSyntaxNoReplacement.GenWithStackByArgs("PASSWORD"))
 
-	return auth.EncodePassword(pass), false, nil
+	return auth.EncodePassword(dStr), false, nil
 }
 
 type randomBytesFunctionClass struct {
@@ -623,7 +651,12 @@ func (b *builtinMD5Sig) evalString(row chunk.Row) (string, bool, error) {
 	if isNull || err != nil {
 		return "", isNull, err
 	}
-	sum := md5.Sum([]byte(arg))
+	var sum [16]byte
+	dBytes, err := charset.NewEncoding(b.args[0].GetType().Charset).Encode(nil, []byte(arg))
+	if err != nil {
+		return "", false, err
+	}
+	sum = md5.Sum(dBytes) // #nosec G401
 	hexStr := fmt.Sprintf("%x", sum)
 	return hexStr, false, nil
 }
@@ -665,8 +698,12 @@ func (b *builtinSHA1Sig) evalString(row chunk.Row) (string, bool, error) {
 	if isNull || err != nil {
 		return "", isNull, err
 	}
-	hasher := sha1.New()
-	_, err = hasher.Write([]byte(str))
+	bytes, err := charset.NewEncoding(b.args[0].GetType().Charset).Encode(nil, []byte(str))
+	if err != nil {
+		return "", false, err
+	}
+	hasher := sha1.New() // #nosec G401
+	_, err = hasher.Write(bytes)
 	if err != nil {
 		return "", true, err
 	}
@@ -718,10 +755,15 @@ func (b *builtinSHA2Sig) evalString(row chunk.Row) (string, bool, error) {
 	if isNull || err != nil {
 		return "", isNull, err
 	}
+	bytes, err := charset.NewEncoding(b.args[0].GetType().Charset).Encode(nil, []byte(str))
+	if err != nil {
+		return "", false, err
+	}
 	hashLength, isNull, err := b.args[1].EvalInt(b.ctx, row)
 	if isNull || err != nil {
 		return "", isNull, err
 	}
+
 	var hasher hash.Hash
 	switch int(hashLength) {
 	case SHA0, SHA256:
@@ -737,7 +779,7 @@ func (b *builtinSHA2Sig) evalString(row chunk.Row) (string, bool, error) {
 		return "", true, nil
 	}
 
-	_, err = hasher.Write([]byte(str))
+	_, err = hasher.Write(bytes)
 	if err != nil {
 		return "", true, err
 	}
@@ -765,6 +807,7 @@ func inflate(compressStr []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	/* #nosec G110 */
 	if _, err = io.Copy(&out, r); err != nil {
 		return nil, err
 	}

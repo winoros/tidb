@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -48,6 +49,19 @@ func (e Set) Copy() Set {
 	}
 }
 
+// ParseSet creates a Set with name or value.
+func ParseSet(elems []string, name string, collation string) (Set, error) {
+	if setName, err := ParseSetName(elems, name, collation); err == nil {
+		return setName, nil
+	}
+	// name doesn't exist, maybe an integer?
+	if num, err := strconv.ParseUint(name, 0, 64); err == nil {
+		return ParseSetValue(elems, num)
+	}
+
+	return Set{}, errors.Errorf("item %s is not in Set %v", name, elems)
+}
+
 // ParseSetName creates a Set with name.
 func ParseSetName(elems []string, name string, collation string) (Set, error) {
 	if len(name) == 0 {
@@ -75,11 +89,6 @@ func ParseSetName(elems []string, name string, collation string) (Set, error) {
 
 	if len(marked) == 0 {
 		return Set{Name: strings.Join(items, ","), Value: value}, nil
-	}
-
-	// name doesn't exist, maybe an integer?
-	if num, err := strconv.ParseUint(name, 0, 64); err == nil {
-		return ParseSetValue(elems, num)
 	}
 
 	return Set{}, errors.Errorf("item %s is not in Set %v", name, elems)

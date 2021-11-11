@@ -12,9 +12,15 @@ explain_test
 cmd/explaintest/explain-test.out
 cmd/explaintest/explaintest_tidb-server
 cmd/explaintest/portgenerator
+cmd/explaintest/s/
 *.fail.go
 tools/bin/
 vendor
 /_tools/
 .DS_Store
 .vscode
+bench_daily.json
+coverage.txt
+var
+fix.sql
+export-20*/

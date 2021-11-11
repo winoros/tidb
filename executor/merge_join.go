@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,7 +16,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/config"
@@ -24,7 +24,6 @@ import (
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/memory"
-	"github.com/pingcap/tidb/util/stringutil"
 )
 
 // MergeJoinExec implements the merge join algorithm.
@@ -52,11 +51,6 @@ type MergeJoinExec struct {
 	memTracker  *memory.Tracker
 	diskTracker *disk.Tracker
 }
-
-var (
-	innerTableLabel fmt.Stringer = stringutil.StringerStr("innerTable")
-	outerTableLabel fmt.Stringer = stringutil.StringerStr("outerTable")
-)
 
 type mergeJoinTable struct {
 	isInner    bool

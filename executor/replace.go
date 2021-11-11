@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,10 +18,14 @@ import (
 	"context"
 	"fmt"
 	"runtime/trace"
+	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser/charset"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -71,7 +76,7 @@ func (e *ReplaceExec) removeRow(ctx context.Context, txn kv.Transaction, handle 
 		return false, err
 	}
 
-	rowUnchanged, err := types.EqualDatums(e.ctx.GetSessionVars().StmtCtx, oldRow, newRow)
+	rowUnchanged, err := e.EqualDatumsAsBinary(e.ctx.GetSessionVars().StmtCtx, oldRow, newRow)
 	if err != nil {
 		return false, err
 	}
@@ -86,6 +91,27 @@ func (e *ReplaceExec) removeRow(ctx context.Context, txn kv.Transaction, handle 
 	}
 	e.ctx.GetSessionVars().StmtCtx.AddAffectedRows(1)
 	return false, nil
+}
+
+// EqualDatumsAsBinary compare if a and b contains the same datum values in binary collation.
+func (e *ReplaceExec) EqualDatumsAsBinary(sc *stmtctx.StatementContext, a []types.Datum, b []types.Datum) (bool, error) {
+	if len(a) != len(b) {
+		return false, nil
+	}
+	for i, ai := range a {
+		collation := ai.Collation()
+		// We should use binary collation to compare datum, otherwise the result will be incorrect
+		ai.SetCollation(charset.CollationBin)
+		v, err := ai.CompareDatum(sc, &b[i])
+		ai.SetCollation(collation)
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+		if v != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // replaceRow removes all duplicate rows for one row, then inserts it.
@@ -197,16 +223,20 @@ func (e *ReplaceExec) exec(ctx context.Context, newRows [][]types.Datum) error {
 	if e.collectRuntimeStatsEnabled() {
 		if snapshot := txn.GetSnapshot(); snapshot != nil {
 			snapshot.SetOption(kv.CollectRuntimeStats, e.stats.SnapshotRuntimeStats)
-			defer snapshot.DelOption(kv.CollectRuntimeStats)
+			defer snapshot.SetOption(kv.CollectRuntimeStats, nil)
 		}
 	}
-
+	setResourceGroupTagForTxn(e.ctx.GetSessionVars().StmtCtx, txn)
+	prefetchStart := time.Now()
 	// Use BatchGet to fill cache.
 	// It's an optimization and could be removed without affecting correctness.
-	if err = prefetchDataCache(ctx, txn, toBeCheckedRows); err != nil {
+	if err = e.prefetchDataCache(ctx, txn, toBeCheckedRows); err != nil {
 		return err
 	}
 
+	if e.stats != nil {
+		e.stats.Prefetch = time.Since(prefetchStart)
+	}
 	e.ctx.GetSessionVars().StmtCtx.AddRecordRows(uint64(len(newRows)))
 	for _, r := range toBeCheckedRows {
 		err = e.replaceRow(ctx, r)
@@ -221,6 +251,10 @@ func (e *ReplaceExec) exec(ctx context.Context, newRows [][]types.Datum) error {
 // Next implements the Executor Next interface.
 func (e *ReplaceExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
+	if e.collectRuntimeStatsEnabled() {
+		ctx = context.WithValue(ctx, autoid.AllocatorRuntimeStatsCtxKey, e.stats.AllocatorRuntimeStats)
+	}
+
 	if len(e.children) > 0 && e.children[0] != nil {
 		return insertRowsFromSelect(ctx, e)
 	}
@@ -234,7 +268,7 @@ func (e *ReplaceExec) setMessage() {
 	if e.SelectExec != nil || numRecords > 1 {
 		numWarnings := stmtCtx.WarningCount()
 		numDuplicates := stmtCtx.AffectedRows() - numRecords
-		msg := fmt.Sprintf(mysql.MySQLErrName[mysql.ErrInsertInfo], numRecords, numDuplicates, numWarnings)
+		msg := fmt.Sprintf(mysql.MySQLErrName[mysql.ErrInsertInfo].Raw, numRecords, numDuplicates, numWarnings)
 		stmtCtx.SetMessage(msg)
 	}
 }

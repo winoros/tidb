@@ -8,19 +8,19 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package expression
 
 import (
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
-	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/disjointset"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
@@ -29,6 +29,7 @@ import (
 // MaxPropagateColsCnt means the max number of columns that can participate propagation.
 var MaxPropagateColsCnt = 100
 
+// nolint:structcheck
 type basePropConstSolver struct {
 	colMapper map[int64]int       // colMapper maps column to its index
 	eqList    []*Constant         // if eqList[i] != nil, it means col_i = eqList[i]
@@ -85,10 +86,10 @@ func validEqualCondHelper(ctx sessionctx.Context, eq *ScalarFunction, colIsLeft 
 	if !conOk {
 		return nil, nil
 	}
-	if ContainMutableConst(ctx, []Expression{con}) {
+	if MaybeOverOptimized4PlanCache(ctx, []Expression{con}) {
 		return nil, nil
 	}
-	if !collate.CompatibleCollate(col.GetType().Collate, con.GetType().Collate) {
+	if col.GetType().Collate != con.GetType().Collate {
 		return nil, nil
 	}
 	return col, con
@@ -119,7 +120,10 @@ func validEqualCond(ctx sessionctx.Context, cond Expression) (*Column, *Constant
 //  for 'a, b, a < 3', it returns 'true, false, b < 3'
 //  for 'a, b, sin(a) + cos(a) = 5', it returns 'true, false, returns sin(b) + cos(b) = 5'
 //  for 'a, b, cast(a) < rand()', it returns 'false, true, cast(a) < rand()'
-func tryToReplaceCond(ctx sessionctx.Context, src *Column, tgt *Column, cond Expression, rejectControl bool) (bool, bool, Expression) {
+func tryToReplaceCond(ctx sessionctx.Context, src *Column, tgt *Column, cond Expression, nullAware bool) (bool, bool, Expression) {
+	if src.RetType.Tp != tgt.RetType.Tp {
+		return false, false, cond
+	}
 	sf, ok := cond.(*ScalarFunction)
 	if !ok {
 		return false, false, cond
@@ -132,12 +136,19 @@ func tryToReplaceCond(ctx sessionctx.Context, src *Column, tgt *Column, cond Exp
 	if _, ok := inequalFunctions[sf.FuncName.L]; ok {
 		return false, true, cond
 	}
-	// See https://github.com/pingcap/tidb/issues/15782. The control function's result may rely on the original nullable
-	// information of the outer side column. Its args cannot be replaced easily.
+	// See
+	//	https://github.com/pingcap/tidb/issues/15782
+	//  https://github.com/pingcap/tidb/issues/17817
+	// The null sensitive function's result may rely on the original nullable information of the outer side column.
+	// Its args cannot be replaced easily.
 	// A more strict check is that after we replace the arg. We check the nullability of the new expression.
 	// But we haven't maintained it yet, so don't replace the arg of the control function currently.
-	if rejectControl && (sf.FuncName.L == ast.Ifnull || sf.FuncName.L == ast.If || sf.FuncName.L == ast.Case) {
-		return false, false, cond
+	if nullAware &&
+		(sf.FuncName.L == ast.Ifnull ||
+			sf.FuncName.L == ast.If ||
+			sf.FuncName.L == ast.Case ||
+			sf.FuncName.L == ast.NullEQ) {
+		return false, true, cond
 	}
 	for idx, expr := range sf.GetArgs() {
 		if src.Equal(nil, expr) {
@@ -152,7 +163,7 @@ func tryToReplaceCond(ctx sessionctx.Context, src *Column, tgt *Column, cond Exp
 			}
 			args[idx] = tgt
 		} else {
-			subReplaced, isNonDeterministic, subExpr := tryToReplaceCond(ctx, src, tgt, expr, rejectControl)
+			subReplaced, isNonDeterministic, subExpr := tryToReplaceCond(ctx, src, tgt, expr, nullAware)
 			if isNonDeterministic {
 				return false, true, cond
 			} else if subReplaced {
@@ -228,7 +239,8 @@ func (s *propConstSolver) propagateColumnEQ() {
 		if fun, ok := s.conditions[i].(*ScalarFunction); ok && fun.FuncName.L == ast.EQ {
 			lCol, lOk := fun.GetArgs()[0].(*Column)
 			rCol, rOk := fun.GetArgs()[1].(*Column)
-			if lOk && rOk && lCol.GetType().Collate == rCol.GetType().Collate {
+			// TODO: Enable hybrid types in ConstantPropagate.
+			if lOk && rOk && lCol.GetType().Collate == rCol.GetType().Collate && !lCol.GetType().Hybrid() && !rCol.GetType().Hybrid() {
 				lID := s.getColID(lCol)
 				rID := s.getColID(rCol)
 				s.unionSet.Union(lID, rID)
@@ -287,7 +299,7 @@ func (s *propConstSolver) pickNewEQConds(visited []bool) (retMapper map[int]*Con
 				continue
 			}
 			visited[i] = true
-			if ContainMutableConst(s.ctx, []Expression{con}) {
+			if MaybeOverOptimized4PlanCache(s.ctx, []Expression{con}) {
 				continue
 			}
 			value, _, err := EvalBool(s.ctx, []Expression{con}, chunk.Row{})
@@ -299,6 +311,10 @@ func (s *propConstSolver) pickNewEQConds(visited []bool) (retMapper map[int]*Con
 				s.setConds2ConstFalse()
 				return nil
 			}
+			continue
+		}
+		// TODO: Enable hybrid types in ConstantPropagate.
+		if col.GetType().Hybrid() {
 			continue
 		}
 		visited[i] = true
@@ -333,6 +349,7 @@ func (s *propConstSolver) solve(conditions []Expression) []Expression {
 	s.propagateConstantEQ()
 	s.propagateColumnEQ()
 	s.conditions = propagateConstantDNF(s.ctx, s.conditions)
+	s.conditions = RemoveDupExprs(s.ctx, s.conditions)
 	return s.conditions
 }
 
@@ -389,7 +406,7 @@ func (s *propOuterJoinConstSolver) pickEQCondsOnOuterCol(retMapper map[int]*Cons
 				continue
 			}
 			visited[i+condsOffset] = true
-			if ContainMutableConst(s.ctx, []Expression{con}) {
+			if MaybeOverOptimized4PlanCache(s.ctx, []Expression{con}) {
 				continue
 			}
 			value, _, err := EvalBool(s.ctx, []Expression{con}, chunk.Row{})
@@ -518,6 +535,9 @@ func (s *propOuterJoinConstSolver) deriveConds(outerCol, innerCol *Column, schem
 // 'expression(..., outerCol, ...)' does not reference columns outside children schemas of join node.
 // Derived new expressions must be appended into join condition, not filter condition.
 func (s *propOuterJoinConstSolver) propagateColumnEQ() {
+	if s.nullSensitive {
+		return
+	}
 	visited := make([]bool, 2*len(s.joinConds)+len(s.filterConds))
 	s.unionSet = disjointset.NewIntSet(len(s.columns))
 	var outerCol, innerCol *Column
@@ -538,9 +558,6 @@ func (s *propOuterJoinConstSolver) propagateColumnEQ() {
 			// `select *, t1.a in (select t2.b from t t2) from t t1`
 			// rows with t2.b is null would impact whether LeftOuterSemiJoin should output 0 or null if there
 			// is no row satisfying t2.b = t1.a
-			if s.nullSensitive {
-				continue
-			}
 			childCol := s.innerSchema.RetrieveColumn(innerCol)
 			if !mysql.HasNotNullFlag(childCol.RetType.Flag) {
 				notNullExpr := BuildNotNullExpr(s.ctx, childCol)

@@ -8,9 +8,11 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !codes
 // +build !codes
 
 package testkit
@@ -22,14 +24,17 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tidb/util/testutil"
@@ -119,12 +124,46 @@ func NewTestKit(c *check.C, store kv.Storage) *TestKit {
 	}
 }
 
+// NewTestKitWithSession returns a new *TestKit with a session.
+func NewTestKitWithSession(c *check.C, store kv.Storage, se session.Session) *TestKit {
+	return &TestKit{
+		c:     c,
+		store: store,
+		Se:    se,
+	}
+}
+
 // NewTestKitWithInit returns a new *TestKit and creates a session.
 func NewTestKitWithInit(c *check.C, store kv.Storage) *TestKit {
 	tk := NewTestKit(c, store)
 	// Use test and prepare a session.
 	tk.MustExec("use test")
 	return tk
+}
+
+// MockGC is used to make GC work in the test environment.
+func MockGC(tk *TestKit) (string, string, string, func()) {
+	originGC := ddl.IsEmulatorGCEnable()
+	resetGC := func() {
+		if originGC {
+			ddl.EmulatorGCEnable()
+		} else {
+			ddl.EmulatorGCDisable()
+		}
+	}
+
+	// disable emulator GC.
+	// Otherwise emulator GC will delete table record as soon as possible after execute drop table ddl.
+	ddl.EmulatorGCDisable()
+	gcTimeFormat := "20060102-15:04:05 -0700 MST"
+	timeBeforeDrop := time.Now().Add(0 - 48*60*60*time.Second).Format(gcTimeFormat)
+	timeAfterDrop := time.Now().Add(48 * 60 * 60 * time.Second).Format(gcTimeFormat)
+	safePointSQL := `INSERT HIGH_PRIORITY INTO mysql.tidb VALUES ('tikv_gc_safe_point', '%[1]s', '')
+			       ON DUPLICATE KEY
+			       UPDATE variable_value = '%[1]s'`
+	// clear GC variables first.
+	tk.MustExec("delete from mysql.tidb where variable_name in ( 'tikv_gc_safe_point','tikv_gc_enable' )")
+	return timeBeforeDrop, timeAfterDrop, safePointSQL, resetGC
 }
 
 var connectionID uint64
@@ -137,7 +176,7 @@ func (tk *TestKit) GetConnectionID() {
 	}
 }
 
-// Exec executes a sql statement.
+// Exec executes a sql statement using the prepared stmt API
 func (tk *TestKit) Exec(sql string, args ...interface{}) (sqlexec.RecordSet, error) {
 	var err error
 	if tk.Se == nil {
@@ -221,6 +260,61 @@ func (tk *TestKit) HasPlan(sql string, plan string, args ...interface{}) bool {
 	return false
 }
 
+func containGloabl(rs *Result) bool {
+	partitionNameCol := 2
+	for i := range rs.rows {
+		if strings.Contains(rs.rows[i][partitionNameCol], "global") {
+			return true
+		}
+	}
+	return false
+}
+
+// MustNoGlobalStats checks if there is no global stats.
+func (tk *TestKit) MustNoGlobalStats(table string) bool {
+	if containGloabl(tk.MustQuery("show stats_meta where table_name like '" + table + "'")) {
+		return false
+	}
+	if containGloabl(tk.MustQuery("show stats_buckets where table_name like '" + table + "'")) {
+		return false
+	}
+	if containGloabl(tk.MustQuery("show stats_histograms where table_name like '" + table + "'")) {
+		return false
+	}
+	return true
+}
+
+// MustPartition checks if the result execution plan must read specific partitions.
+func (tk *TestKit) MustPartition(sql string, partitions string, args ...interface{}) *Result {
+	rs := tk.MustQuery("explain "+sql, args...)
+	ok := len(partitions) == 0
+	for i := range rs.rows {
+		if len(partitions) == 0 && strings.Contains(rs.rows[i][3], "partition:") {
+			ok = false
+		}
+		if len(partitions) != 0 && strings.Compare(rs.rows[i][3], "partition:"+partitions) == 0 {
+			ok = true
+		}
+	}
+	tk.c.Assert(ok, check.IsTrue)
+	return tk.MustQuery(sql, args...)
+}
+
+// UsedPartitions returns the partition names that will be used or all/dual.
+func (tk *TestKit) UsedPartitions(sql string, args ...interface{}) *Result {
+	rs := tk.MustQuery("explain "+sql, args...)
+	var usedPartitions [][]string
+	for i := range rs.rows {
+		index := strings.Index(rs.rows[i][3], "partition:")
+		if index != -1 {
+			p := rs.rows[i][3][index+len("partition:"):]
+			partitions := strings.Split(strings.SplitN(p, " ", 2)[0], ",")
+			usedPartitions = append(usedPartitions, partitions)
+		}
+	}
+	return &Result{rows: usedPartitions, c: tk.c, comment: check.Commentf("sql:%s, args:%v", sql, args)}
+}
+
 // MustUseIndex checks if the result execution plan contains specific index(es).
 func (tk *TestKit) MustUseIndex(sql string, index string, args ...interface{}) bool {
 	rs := tk.MustQuery("explain "+sql, args...)
@@ -257,8 +351,21 @@ func (tk *TestKit) MustPointGet(sql string, args ...interface{}) *Result {
 func (tk *TestKit) MustQuery(sql string, args ...interface{}) *Result {
 	comment := check.Commentf("sql:%s, args:%v", sql, args)
 	rs, err := tk.Exec(sql, args...)
-	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
+	tk.c.Assert(err, check.IsNil, comment)
 	tk.c.Assert(rs, check.NotNil, comment)
+	return tk.ResultSetToResult(rs, comment)
+}
+
+// MayQuery query the statements and returns result rows if result set is returned.
+// If expected result is set it asserts the query result equals expected result.
+func (tk *TestKit) MayQuery(sql string, args ...interface{}) *Result {
+	comment := check.Commentf("sql:%s, args:%v", sql, args)
+	rs, err := tk.Exec(sql, args...)
+	tk.c.Assert(err, check.IsNil, comment)
+	if rs == nil {
+		var emptyStringAoA [][]string
+		return &Result{rows: emptyStringAoA, c: tk.c, comment: comment}
+	}
 	return tk.ResultSetToResult(rs, comment)
 }
 
@@ -266,7 +373,7 @@ func (tk *TestKit) MustQuery(sql string, args ...interface{}) *Result {
 func (tk *TestKit) QueryToErr(sql string, args ...interface{}) error {
 	comment := check.Commentf("sql:%s, args:%v", sql, args)
 	res, err := tk.Exec(sql, args...)
-	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
+	tk.c.Assert(err, check.IsNil, comment)
 	tk.c.Assert(res, check.NotNil, comment)
 	_, resErr := session.GetRows4Test(context.Background(), tk.Se, res)
 	tk.c.Assert(res.Close(), check.IsNil)
@@ -295,8 +402,8 @@ func (tk *TestKit) MustGetErrCode(sql string, errCode int) {
 	tk.c.Assert(err, check.NotNil)
 	originErr := errors.Cause(err)
 	tErr, ok := originErr.(*terror.Error)
-	tk.c.Assert(ok, check.IsTrue, check.Commentf("expect type 'terror.Error', but obtain '%T'", originErr))
-	sqlErr := tErr.ToSQLError()
+	tk.c.Assert(ok, check.IsTrue, check.Commentf("expect type 'terror.Error', but obtain '%T': %v", originErr, originErr))
+	sqlErr := terror.ToSQLError(tErr)
 	tk.c.Assert(int(sqlErr.Code), check.Equals, errCode, check.Commentf("Assertion failed, origin err:\n  %v", sqlErr))
 }
 
@@ -325,4 +432,11 @@ func (tk *TestKit) GetTableID(tableName string) int64 {
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr(tableName))
 	tk.c.Assert(err, check.IsNil)
 	return tbl.Meta().ID
+}
+
+// WithPruneMode run test case under prune mode.
+func WithPruneMode(tk *TestKit, mode variable.PartitionPruneMode, f func()) {
+	tk.MustExec("set @@tidb_partition_prune_mode=`" + string(mode) + "`")
+	tk.MustExec("set global tidb_partition_prune_mode=`" + string(mode) + "`")
+	f()
 }

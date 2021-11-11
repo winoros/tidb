@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,22 +19,24 @@ import (
 	"fmt"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/hack"
 )
 
 // error definitions.
 var (
-	ErrNoDB = terror.ClassOptimizer.New(mysql.ErrNoDB, mysql.MySQLErrName[mysql.ErrNoDB])
+	ErrNoDB = dbterror.ClassOptimizer.NewStd(mysql.ErrNoDB)
 )
 
 // ScalarFunction is the function that returns a value.
@@ -136,7 +139,7 @@ func (sf *ScalarFunction) String() string {
 
 // MarshalJSON implements json.Marshaler interface.
 func (sf *ScalarFunction) MarshalJSON() ([]byte, error) {
-	return []byte(fmt.Sprintf("\"%s\"", sf)), nil
+	return []byte(fmt.Sprintf("%q", sf)), nil
 }
 
 // typeInferForNull infers the NULL constants field type and set the field type
@@ -152,10 +155,10 @@ func typeInferForNull(args []Expression) {
 	// Infer the actual field type of the NULL constant.
 	var retFieldTp *types.FieldType
 	var hasNullArg bool
-	for _, arg := range args {
-		isNullArg := isNull(arg)
+	for i := len(args) - 1; i >= 0; i-- {
+		isNullArg := isNull(args[i])
 		if !isNullArg && retFieldTp == nil {
-			retFieldTp = arg.GetType()
+			retFieldTp = args[i].GetType()
 		}
 		hasNullArg = hasNullArg || isNullArg
 		// Break if there are both NULL and non-NULL expression
@@ -169,17 +172,23 @@ func typeInferForNull(args []Expression) {
 	for _, arg := range args {
 		if isNull(arg) {
 			*arg.GetType() = *retFieldTp
+			arg.GetType().Flag &= ^mysql.NotNullFlag // Remove NotNullFlag of NullConst
 		}
 	}
 }
 
 // newFunctionImpl creates a new scalar function or constant.
-func newFunctionImpl(ctx sessionctx.Context, fold bool, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
+// fold: 1 means folding constants, while 0 means not,
+// -1 means try to fold constants if without errors/warnings, otherwise not.
+func newFunctionImpl(ctx sessionctx.Context, fold int, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
 	if retType == nil {
 		return nil, errors.Errorf("RetType cannot be nil for ScalarFunction.")
 	}
-	if funcName == ast.Cast {
+	switch funcName {
+	case ast.Cast:
 		return BuildCastFunction(ctx, args[0], retType), nil
+	case ast.GetVar:
+		return BuildGetVarFunction(ctx, args[0], retType)
 	}
 	fc, ok := funcs[funcName]
 	if !ok {
@@ -187,17 +196,28 @@ func newFunctionImpl(ctx sessionctx.Context, fold bool, funcName string, retType
 		if db == "" {
 			return nil, errors.Trace(ErrNoDB)
 		}
-
 		return nil, errFunctionNotExists.GenWithStackByArgs("FUNCTION", db+"."+funcName)
 	}
-	if !ctx.GetSessionVars().EnableNoopFuncs {
+	noopFuncsMode := ctx.GetSessionVars().NoopFuncsMode
+	if noopFuncsMode != variable.OnInt {
 		if _, ok := noopFuncs[funcName]; ok {
-			return nil, ErrFunctionsNoopImpl.GenWithStackByArgs(funcName)
+			err := ErrFunctionsNoopImpl.GenWithStackByArgs(funcName)
+			if noopFuncsMode == variable.OffInt {
+				return nil, err
+			}
+			// NoopFuncsMode is Warn, append an error
+			ctx.GetSessionVars().StmtCtx.AppendWarning(err)
 		}
 	}
 	funcArgs := make([]Expression, len(args))
 	copy(funcArgs, args)
-	typeInferForNull(funcArgs)
+	switch funcName {
+	case ast.If, ast.Ifnull, ast.Nullif:
+		// Do nothing. Because it will call InferType4ControlFuncs.
+	default:
+		typeInferForNull(funcArgs)
+	}
+
 	f, err := fc.getFunction(ctx, funcArgs)
 	if err != nil {
 		return nil, err
@@ -210,20 +230,36 @@ func newFunctionImpl(ctx sessionctx.Context, fold bool, funcName string, retType
 		RetType:  retType,
 		Function: f,
 	}
-	if fold {
+	if fold == 1 {
 		return FoldConstant(sf), nil
+	} else if fold == -1 {
+		// try to fold constants, and return the original function if errors/warnings occur
+		sc := ctx.GetSessionVars().StmtCtx
+		beforeWarns := sc.WarningCount()
+		newSf := FoldConstant(sf)
+		afterWarns := sc.WarningCount()
+		if afterWarns > beforeWarns {
+			sc.TruncateWarnings(int(beforeWarns))
+			return sf, nil
+		}
+		return newSf, nil
 	}
 	return sf, nil
 }
 
 // NewFunction creates a new scalar function or constant via a constant folding.
 func NewFunction(ctx sessionctx.Context, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
-	return newFunctionImpl(ctx, true, funcName, retType, args...)
+	return newFunctionImpl(ctx, 1, funcName, retType, args...)
 }
 
 // NewFunctionBase creates a new scalar function with no constant folding.
 func NewFunctionBase(ctx sessionctx.Context, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
-	return newFunctionImpl(ctx, false, funcName, retType, args...)
+	return newFunctionImpl(ctx, 0, funcName, retType, args...)
+}
+
+// NewFunctionTryFold creates a new scalar function with trying constant folding.
+func NewFunctionTryFold(ctx sessionctx.Context, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
+	return newFunctionImpl(ctx, -1, funcName, retType, args...)
 }
 
 // NewFunctionInternal is similar to NewFunction, but do not returns error, should only be used internally.
@@ -330,7 +366,13 @@ func (sf *ScalarFunction) Eval(row chunk.Row) (d types.Datum, err error) {
 	case types.ETJson:
 		res, isNull, err = sf.EvalJSON(sf.GetCtx(), row)
 	case types.ETString:
-		res, isNull, err = sf.EvalString(sf.GetCtx(), row)
+		var str string
+		str, isNull, err = sf.EvalString(sf.GetCtx(), row)
+		if !isNull && err == nil && tp.Tp == mysql.TypeEnum {
+			res, err = types.ParseEnum(tp.Elems, str, tp.Collate)
+		} else {
+			res = str
+		}
 	}
 
 	if isNull || err != nil {
@@ -384,12 +426,18 @@ func (sf *ScalarFunction) HashCode(sc *stmtctx.StatementContext) []byte {
 	if len(sf.hashcode) > 0 {
 		return sf.hashcode
 	}
+	ReHashCode(sf, sc)
+	return sf.hashcode
+}
+
+// ReHashCode is used after we change the argument in place.
+func ReHashCode(sf *ScalarFunction, sc *stmtctx.StatementContext) {
+	sf.hashcode = sf.hashcode[:0]
 	sf.hashcode = append(sf.hashcode, scalarFunctionFlag)
 	sf.hashcode = codec.EncodeCompactBytes(sf.hashcode, hack.Slice(sf.FuncName.L))
 	for _, arg := range sf.GetArgs() {
 		sf.hashcode = append(sf.hashcode, arg.HashCode(sc)...)
 	}
-	return sf.hashcode
 }
 
 // ResolveIndices implements Expression interface.
@@ -400,29 +448,6 @@ func (sf *ScalarFunction) ResolveIndices(schema *Schema) (Expression, error) {
 }
 
 func (sf *ScalarFunction) resolveIndices(schema *Schema) error {
-	if sf.FuncName.L == ast.In {
-		args := []Expression{}
-		switch inFunc := sf.Function.(type) {
-		case *builtinInIntSig:
-			args = inFunc.nonConstArgs
-		case *builtinInStringSig:
-			args = inFunc.nonConstArgs
-		case *builtinInTimeSig:
-			args = inFunc.nonConstArgs
-		case *builtinInDurationSig:
-			args = inFunc.nonConstArgs
-		case *builtinInRealSig:
-			args = inFunc.nonConstArgs
-		case *builtinInDecimalSig:
-			args = inFunc.nonConstArgs
-		}
-		for _, arg := range args {
-			err := arg.resolveIndices(schema)
-			if err != nil {
-				return err
-			}
-		}
-	}
 	for _, arg := range sf.GetArgs() {
 		err := arg.resolveIndices(schema)
 		if err != nil {
@@ -430,6 +455,23 @@ func (sf *ScalarFunction) resolveIndices(schema *Schema) error {
 		}
 	}
 	return nil
+}
+
+// ResolveIndicesByVirtualExpr implements Expression interface.
+func (sf *ScalarFunction) ResolveIndicesByVirtualExpr(schema *Schema) (Expression, bool) {
+	newSf := sf.Clone()
+	isOK := newSf.resolveIndicesByVirtualExpr(schema)
+	return newSf, isOK
+}
+
+func (sf *ScalarFunction) resolveIndicesByVirtualExpr(schema *Schema) bool {
+	for _, arg := range sf.GetArgs() {
+		isOk := arg.resolveIndicesByVirtualExpr(schema)
+		if !isOk {
+			return false
+		}
+	}
+	return true
 }
 
 // GetSingleColumn returns (Col, Desc) when the ScalarFunction is equivalent to (Col, Desc)
@@ -524,4 +566,14 @@ func (sf *ScalarFunction) CharsetAndCollation(ctx sessionctx.Context) (string, s
 // SetCharsetAndCollation ...
 func (sf *ScalarFunction) SetCharsetAndCollation(chs, coll string) {
 	sf.Function.SetCharsetAndCollation(chs, coll)
+}
+
+// Repertoire returns the repertoire value which is used to check collations.
+func (sf *ScalarFunction) Repertoire() Repertoire {
+	return sf.Function.Repertoire()
+}
+
+// SetRepertoire sets a specified repertoire for this expression.
+func (sf *ScalarFunction) SetRepertoire(r Repertoire) {
+	sf.Function.SetRepertoire(r)
 }

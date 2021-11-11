@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -35,8 +36,12 @@ func (e *ReloadOptRuleBlacklistExec) Next(ctx context.Context, _ *chunk.Chunk) e
 
 // LoadOptRuleBlacklist loads the latest data from table mysql.opt_rule_blacklist.
 func LoadOptRuleBlacklist(ctx sessionctx.Context) (err error) {
-	sql := "select HIGH_PRIORITY name from mysql.opt_rule_blacklist"
-	rows, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(sql)
+	exec := ctx.(sqlexec.RestrictedSQLExecutor)
+	stmt, err := exec.ParseWithParams(context.TODO(), "select HIGH_PRIORITY name from mysql.opt_rule_blacklist")
+	if err != nil {
+		return err
+	}
+	rows, _, err := exec.ExecRestrictedStmt(context.TODO(), stmt)
 	if err != nil {
 		return err
 	}

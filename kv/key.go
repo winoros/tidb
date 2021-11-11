@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -20,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 )
@@ -125,6 +125,12 @@ func (r *KeyRange) IsPoint() bool {
 	diffOneIdx := i
 	return r.StartKey[diffOneIdx]+1 == r.EndKey[diffOneIdx] &&
 		bytes.Equal(r.StartKey[:diffOneIdx], r.EndKey[:diffOneIdx])
+}
+
+// Entry is the entry for key and value
+type Entry struct {
+	Key   Key
+	Value []byte
 }
 
 // Handle is the ID of a row.
@@ -413,19 +419,40 @@ func (m *HandleMap) Range(fn func(h Handle, val interface{}) bool) {
 	}
 }
 
-// BuildHandleFromDatumRow builds kv.Handle from cols in row.
-func BuildHandleFromDatumRow(sctx *stmtctx.StatementContext, row []types.Datum, handleOrdinals []int) (Handle, error) {
-	pkDts := make([]types.Datum, 0, len(handleOrdinals))
-	for _, ordinal := range handleOrdinals {
-		pkDts = append(pkDts, row[ordinal])
+// PartitionHandle combines a handle and a PartitionID, used to location a row in partitioned table.
+// Now only used in global index.
+// TODO: support PartitionHandle in HandleMap.
+type PartitionHandle struct {
+	Handle
+	PartitionID int64
+}
+
+// NewPartitionHandle creates a PartitionHandle from a normal handle and a pid.
+func NewPartitionHandle(pid int64, h Handle) PartitionHandle {
+	return PartitionHandle{
+		Handle:      h,
+		PartitionID: pid,
 	}
-	handleBytes, err := codec.EncodeKey(sctx, nil, pkDts...)
-	if err != nil {
-		return nil, err
+}
+
+// Equal implements the Handle interface.
+func (ph PartitionHandle) Equal(h Handle) bool {
+	if ph2, ok := h.(PartitionHandle); ok {
+		return ph.PartitionID == ph2.PartitionID && ph.Handle.Equal(ph2.Handle)
 	}
-	handle, err := NewCommonHandle(handleBytes)
-	if err != nil {
-		return nil, err
+	return false
+}
+
+// Compare implements the Handle interface.
+func (ph PartitionHandle) Compare(h Handle) int {
+	if ph2, ok := h.(PartitionHandle); ok {
+		if ph.PartitionID < ph2.PartitionID {
+			return -1
+		}
+		if ph.PartitionID > ph2.PartitionID {
+			return 1
+		}
+		return ph.Handle.Compare(ph2.Handle)
 	}
-	return handle, nil
+	panic("PartitonHandle compares to non-parition Handle")
 }

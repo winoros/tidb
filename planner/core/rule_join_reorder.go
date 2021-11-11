@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -110,6 +111,7 @@ func (s *joinReOrderSolver) optimizeRecursive(ctx sessionctx.Context, p LogicalP
 			ctx:        ctx,
 			otherConds: otherConds,
 		}
+		originalSchema := p.Schema()
 		if len(curJoinGroup) > ctx.GetSessionVars().TiDBOptJoinReorderThreshold {
 			groupSolver := &joinReorderGreedySolver{
 				baseSingleGroupJoinOrderSolver: baseGroupSolver,
@@ -149,6 +151,25 @@ func (s *joinReOrderSolver) optimizeRecursive(ctx sessionctx.Context, p LogicalP
 		for _, joinTab := range leftJoinTabs {
 			p = s.newLeftJoin(ctx, p, joinTab.p, joinTab.eqCond, joinTab.leftCond, joinTab.otherCond)
 		}
+		schemaChanged := false
+		if len(p.Schema().Columns) != len(originalSchema.Columns) {
+			schemaChanged = true
+		} else {
+			for i, col := range p.Schema().Columns {
+				if !col.Equal(nil, originalSchema.Columns[i]) {
+					schemaChanged = true
+					break
+				}
+			}
+		}
+		if schemaChanged {
+			proj := LogicalProjection{
+				Exprs: expression.Column2Exprs(originalSchema.Columns),
+			}.Init(p.SCtx(), p.SelectBlockOffset())
+			proj.SetSchema(originalSchema)
+			proj.SetChildren(p)
+			p = proj
+		}
 		return p, nil
 	}
 	newChildren := make([]LogicalPlan, 0, len(p.Children()))
@@ -186,6 +207,7 @@ func (s *joinReOrderSolver) newLeftJoin(
 	return join
 }
 
+// nolint:structcheck
 type baseSingleGroupJoinOrderSolver struct {
 	ctx          sessionctx.Context
 	curJoinGroup []*jrNode

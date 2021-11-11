@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -27,29 +28,13 @@ import (
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/disk"
+	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/memory"
-)
-
-const (
-	// estCountMaxFactor defines the factor of estCountMax with maxChunkSize.
-	// estCountMax is maxChunkSize * estCountMaxFactor, the maximum threshold of estCount.
-	// if estCount is larger than estCountMax, set estCount to estCountMax.
-	// Set this threshold to prevent buildSideEstCount being too large and causing a performance and memory regression.
-	estCountMaxFactor = 10 * 1024
-
-	// estCountMinFactor defines the factor of estCountMin with maxChunkSize.
-	// estCountMin is maxChunkSize * estCountMinFactor, the minimum threshold of estCount.
-	// If estCount is smaller than estCountMin, set estCount to 0.
-	// Set this threshold to prevent buildSideEstCount being too small and causing a performance regression.
-	estCountMinFactor = 8
-
-	// estCountDivisor defines the divisor of buildSideEstCount.
-	// Set this divisor to prevent buildSideEstCount being too large and causing a performance regression.
-	estCountDivisor = 8
 )
 
 // hashContext keeps the needed hash context of a db table in hash join.
 type hashContext struct {
+	// allTypes one-to-one correspondence with keyColIdx
 	allTypes  []*types.FieldType
 	keyColIdx []int
 	buf       []byte
@@ -77,19 +62,22 @@ func (hc *hashContext) initHash(rows int) {
 }
 
 type hashStatistic struct {
-	probeCollision   int
+	// NOTE: probeCollision may be accessed from multiple goroutines concurrently.
+	probeCollision   int64
 	buildTableElapse time.Duration
 }
 
 func (s *hashStatistic) String() string {
-	return fmt.Sprintf("probe collision:%v, build:%v", s.probeCollision, s.buildTableElapse)
+	return fmt.Sprintf("probe_collision:%v, build:%v", s.probeCollision, execdetails.FormatDuration(s.buildTableElapse))
 }
 
 // hashRowContainer handles the rows and the hash map of a table.
+// NOTE: a hashRowContainer may be shallow copied by the invoker, define all the
+// member attributes as pointer type to avoid unexpected problems.
 type hashRowContainer struct {
 	sc   *stmtctx.StatementContext
 	hCtx *hashContext
-	stat hashStatistic
+	stat *hashStatistic
 
 	// hashTable stores the map of hashKey and RowPtr
 	hashTable baseHashTable
@@ -97,16 +85,23 @@ type hashRowContainer struct {
 	rowContainer *chunk.RowContainer
 }
 
-func newHashRowContainer(sCtx sessionctx.Context, estCount int, hCtx *hashContext) *hashRowContainer {
+func newHashRowContainer(sCtx sessionctx.Context, estCount int, hCtx *hashContext, allTypes []*types.FieldType) *hashRowContainer {
 	maxChunkSize := sCtx.GetSessionVars().MaxChunkSize
-	rc := chunk.NewRowContainer(hCtx.allTypes, maxChunkSize)
+	rc := chunk.NewRowContainer(allTypes, maxChunkSize)
 	c := &hashRowContainer{
 		sc:           sCtx.GetSessionVars().StmtCtx,
 		hCtx:         hCtx,
+		stat:         new(hashStatistic),
 		hashTable:    newConcurrentMapHashTable(),
 		rowContainer: rc,
 	}
 	return c
+}
+
+func (c *hashRowContainer) ShallowCopy() *hashRowContainer {
+	newHRC := *c
+	newHRC.rowContainer = c.rowContainer.ShallowCopyWithNewMutex()
+	return &newHRC
 }
 
 // GetMatchedRowsAndPtrs get matched rows and Ptrs from probeRow. It can be called
@@ -131,7 +126,7 @@ func (c *hashRowContainer) GetMatchedRowsAndPtrs(probeKey uint64, probeRow chunk
 			return
 		}
 		if !ok {
-			c.stat.probeCollision++
+			atomic.AddInt64(&c.stat.probeCollision, 1)
 			continue
 		}
 		matched = append(matched, matchedRow)
@@ -177,7 +172,7 @@ func (c *hashRowContainer) PutChunkSelected(chk *chunk.Chunk, selected, ignoreNu
 	hCtx := c.hCtx
 	for keyIdx, colIdx := range c.hCtx.keyColIdx {
 		ignoreNull := len(ignoreNulls) > keyIdx && ignoreNulls[keyIdx]
-		err := codec.HashChunkSelected(c.sc, hCtx.hashVals, chk, hCtx.allTypes[colIdx], colIdx, hCtx.buf, hCtx.hasNull, selected, ignoreNull)
+		err := codec.HashChunkSelected(c.sc, hCtx.hashVals, chk, hCtx.allTypes[keyIdx], colIdx, hCtx.buf, hCtx.hasNull, selected, ignoreNull)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -191,18 +186,6 @@ func (c *hashRowContainer) PutChunkSelected(chk *chunk.Chunk, selected, ignoreNu
 		c.hashTable.Put(key, rowPtr)
 	}
 	return nil
-}
-
-// getJoinKeyFromChkRow fetches join keys from row and calculate the hash value.
-func (*hashRowContainer) getJoinKeyFromChkRow(sc *stmtctx.StatementContext, row chunk.Row, hCtx *hashContext) (hasNull bool, key uint64, err error) {
-	for _, i := range hCtx.keyColIdx {
-		if row.IsNull(i) {
-			return true, 0, nil
-		}
-	}
-	hCtx.initHash(1)
-	err = codec.HashChunkRow(sc, hCtx.hashVals[0], row, hCtx.allTypes, hCtx.keyColIdx, hCtx.buf)
-	return false, hCtx.hashVals[0].Sum64(), err
 }
 
 // NumChunks returns the number of chunks in the rowContainer

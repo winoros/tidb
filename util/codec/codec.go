@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -23,8 +24,8 @@ import (
 	"unsafe"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
@@ -330,14 +331,7 @@ func encodeHashChunkRowIdx(sc *stmtctx.StatementContext, row chunk.Row, tp *type
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
 		flag = uintFlag
 		t := row.GetTime(idx)
-		// Encoding timestamp need to consider timezone.
-		// If it's not in UTC, transform to UTC first.
-		if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
-			err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
-			if err != nil {
-				return
-			}
-		}
+
 		var v uint64
 		v, err = t.ToPackedUint()
 		if err != nil {
@@ -357,15 +351,27 @@ func encodeHashChunkRowIdx(sc *stmtctx.StatementContext, row chunk.Row, tp *type
 			return
 		}
 	case mysql.TypeEnum:
-		flag = compactBytesFlag
-		v := uint64(row.GetEnum(idx).ToNumber())
-		str := tp.Elems[v-1]
-		b = ConvertByCollation(hack.Slice(str), tp)
+		if mysql.HasEnumSetAsIntFlag(tp.Flag) {
+			flag = uvarintFlag
+			v := uint64(row.GetEnum(idx).ToNumber())
+			b = (*[sizeUint64]byte)(unsafe.Pointer(&v))[:]
+		} else {
+			flag = compactBytesFlag
+			v := uint64(row.GetEnum(idx).ToNumber())
+			str := ""
+			if enum, err := types.ParseEnumValue(tp.Elems, v); err == nil {
+				// str will be empty string if v out of definition of enum.
+				str = enum.Name
+			}
+			b = ConvertByCollation(hack.Slice(str), tp)
+		}
 	case mysql.TypeSet:
 		flag = compactBytesFlag
-		v := uint64(row.GetSet(idx).ToNumber())
-		str := tp.Elems[v-1]
-		b = ConvertByCollation(hack.Slice(str), tp)
+		s, err := types.ParseSetValue(tp.Elems, row.GetSet(idx).Value)
+		if err != nil {
+			return 0, nil, err
+		}
+		b = ConvertByCollation(hack.Slice(s.Name), tp)
 	case mysql.TypeBit:
 		// We don't need to handle errors here since the literal is ensured to be able to store in uint64 in convertToMysqlBit.
 		flag = uvarintFlag
@@ -495,14 +501,7 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 				isNull[i] = !ignoreNull
 			} else {
 				buf[0] = uintFlag
-				// Encoding timestamp need to consider timezone.
-				// If it's not in UTC, transform to UTC first.
-				if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
-					err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
-					if err != nil {
-						return
-					}
-				}
+
 				var v uint64
 				v, err = t.ToPackedUint()
 				if err != nil {
@@ -566,10 +565,18 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 			if column.IsNull(i) {
 				buf[0], b = NilFlag, nil
 				isNull[i] = !ignoreNull
+			} else if mysql.HasEnumSetAsIntFlag(tp.Flag) {
+				buf[0] = uvarintFlag
+				v := uint64(column.GetEnum(i).ToNumber())
+				b = (*[sizeUint64]byte)(unsafe.Pointer(&v))[:]
 			} else {
 				buf[0] = compactBytesFlag
 				v := uint64(column.GetEnum(i).ToNumber())
-				str := tp.Elems[v-1]
+				str := ""
+				if enum, err := types.ParseEnumValue(tp.Elems, v); err == nil {
+					// str will be empty string if v out of definition of enum.
+					str = enum.Name
+				}
 				b = ConvertByCollation(hack.Slice(str), tp)
 			}
 
@@ -588,9 +595,11 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 				isNull[i] = !ignoreNull
 			} else {
 				buf[0] = compactBytesFlag
-				v := uint64(column.GetSet(i).ToNumber())
-				str := tp.Elems[v-1]
-				b = ConvertByCollation(hack.Slice(str), tp)
+				s, err := types.ParseSetValue(tp.Elems, column.GetSet(i).Value)
+				if err != nil {
+					return err
+				}
+				b = ConvertByCollation(hack.Slice(s.Name), tp)
 			}
 
 			// As the golang doc described, `Hash.Write` never returns an error.
@@ -656,8 +665,8 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 // If two rows are logically equal, it will generate the same bytes.
 func HashChunkRow(sc *stmtctx.StatementContext, w io.Writer, row chunk.Row, allTypes []*types.FieldType, colIdx []int, buf []byte) (err error) {
 	var b []byte
-	for _, idx := range colIdx {
-		buf[0], b, err = encodeHashChunkRowIdx(sc, row, allTypes[idx], idx)
+	for i, idx := range colIdx {
+		buf[0], b, err = encodeHashChunkRowIdx(sc, row, allTypes[i], idx)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -679,13 +688,16 @@ func EqualChunkRow(sc *stmtctx.StatementContext,
 	row1 chunk.Row, allTypes1 []*types.FieldType, colIdx1 []int,
 	row2 chunk.Row, allTypes2 []*types.FieldType, colIdx2 []int,
 ) (bool, error) {
+	if len(colIdx1) != len(colIdx2) {
+		return false, errors.Errorf("Internal error: Hash columns count mismatch, col1: %d, col2: %d", len(colIdx1), len(colIdx2))
+	}
 	for i := range colIdx1 {
 		idx1, idx2 := colIdx1[i], colIdx2[i]
-		flag1, b1, err := encodeHashChunkRowIdx(sc, row1, allTypes1[idx1], idx1)
+		flag1, b1, err := encodeHashChunkRowIdx(sc, row1, allTypes1[i], idx1)
 		if err != nil {
 			return false, errors.Trace(err)
 		}
-		flag2, b2, err := encodeHashChunkRowIdx(sc, row2, allTypes2[idx2], idx2)
+		flag2, b2, err := encodeHashChunkRowIdx(sc, row2, allTypes2[i], idx2)
 		if err != nil {
 			return false, errors.Trace(err)
 		}
@@ -724,7 +736,8 @@ func Decode(b []byte, size int) ([]types.Datum, error) {
 
 // DecodeRange decodes the range values from a byte slice that generated by EncodeKey.
 // It handles some special values like `MinNotNull` and `MaxValueDatum`.
-func DecodeRange(b []byte, size int) ([]types.Datum, []byte, error) {
+// loc can be nil and only used in when the corresponding type is `mysql.TypeTimestamp`.
+func DecodeRange(b []byte, size int, idxColumnTypes []byte, loc *time.Location) ([]types.Datum, []byte, error) {
 	if len(b) < 1 {
 		return nil, b, errors.New("invalid encoded key: length of key is zero")
 	}
@@ -734,13 +747,27 @@ func DecodeRange(b []byte, size int) ([]types.Datum, []byte, error) {
 		values = make([]types.Datum, 0, size)
 	)
 
+	i := 0
 	for len(b) > 1 {
 		var d types.Datum
-		b, d, err = DecodeOne(b)
+		if idxColumnTypes == nil {
+			b, d, err = DecodeOne(b)
+		} else {
+			if i >= len(idxColumnTypes) {
+				return values, b, errors.New("invalid length of index's columns")
+			}
+			if types.IsTypeTime(idxColumnTypes[i]) {
+				// handle datetime values specially since they are encoded to int and we'll get int values if using DecodeOne.
+				b, d, err = DecodeAsDateTime(b, idxColumnTypes[i], loc)
+			} else {
+				b, d, err = DecodeOne(b)
+			}
+		}
 		if err != nil {
 			return values, b, errors.Trace(err)
 		}
 		values = append(values, d)
+		i++
 	}
 
 	if len(b) == 1 {
@@ -833,6 +860,40 @@ func DecodeOne(b []byte) (remain []byte, d types.Datum, err error) {
 	return b, d, nil
 }
 
+// DecodeAsDateTime decodes on datum from []byte of `KindMysqlTime`.
+func DecodeAsDateTime(b []byte, tp byte, loc *time.Location) (remain []byte, d types.Datum, err error) {
+	if len(b) < 1 {
+		return nil, d, errors.New("invalid encoded key")
+	}
+	flag := b[0]
+	b = b[1:]
+	switch flag {
+	case uintFlag:
+		var v uint64
+		b, v, err = DecodeUint(b)
+		if err != nil {
+			return b, d, err
+		}
+		t := types.NewTime(types.ZeroCoreTime, tp, 0)
+		err = t.FromPackedUint(v)
+		if err == nil {
+			if tp == mysql.TypeTimestamp && !t.IsZero() && loc != nil {
+				err = t.ConvertTimeZone(time.UTC, loc)
+				if err != nil {
+					return b, d, err
+				}
+			}
+			d.SetMysqlTime(t)
+		}
+	default:
+		return b, d, errors.Errorf("invalid encoded key flag %v", flag)
+	}
+	if err != nil {
+		return b, d, errors.Trace(err)
+	}
+	return b, d, nil
+}
+
 // CutOne cuts the first encoded value from b.
 // It will return the first encoded item and the remains as byte slice.
 func CutOne(b []byte) (data []byte, remain []byte, err error) {
@@ -869,6 +930,7 @@ func SetRawValues(data []byte, values []types.Datum) error {
 
 // peek peeks the first encoded value from b and returns its length.
 func peek(b []byte) (length int, err error) {
+	originLength := len(b)
 	if len(b) < 1 {
 		return 0, errors.New("invalid encoded key")
 	}
@@ -900,6 +962,12 @@ func peek(b []byte) (length int, err error) {
 		return 0, errors.Trace(err)
 	}
 	length += l
+	if length < 0 {
+		return 0, errors.New("invalid encoded key")
+	} else if length > originLength {
+		return 0, errors.Errorf("invalid encoded key, "+
+			"expected length: %d, actual length: %d", length, originLength)
+	}
 	return
 }
 
@@ -1197,9 +1265,7 @@ func HashGroupKey(sc *stmtctx.StatementContext, n int, col *chunk.Column, buf []
 				buf[i] = append(buf[i], NilFlag)
 			} else {
 				buf[i] = append(buf[i], jsonFlag)
-				j := col.GetJSON(i)
-				buf[i] = append(buf[i], j.TypeCode)
-				buf[i] = append(buf[i], j.Value...)
+				buf[i] = col.GetJSON(i).HashValue(buf[i])
 			}
 		}
 	case types.ETString:

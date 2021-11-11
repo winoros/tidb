@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -19,9 +20,10 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
@@ -58,6 +60,15 @@ func (a *AggFuncDesc) String() string {
 	for i, arg := range a.Args {
 		buffer.WriteString(arg.String())
 		if i+1 != len(a.Args) {
+			buffer.WriteString(", ")
+		}
+	}
+	if len(a.OrderByItems) > 0 {
+		buffer.WriteString(" order by ")
+	}
+	for i, arg := range a.OrderByItems {
+		buffer.WriteString(arg.String())
+		if i+1 != len(a.OrderByItems) {
 			buffer.WriteString(", ")
 		}
 	}
@@ -137,7 +148,7 @@ func (a *AggFuncDesc) Split(ordinal []int) (partialAggDesc, finalAggDesc *AggFun
 			RetType: a.RetTp,
 		})
 		finalAggDesc.Args = args
-		if finalAggDesc.Name == ast.AggFuncGroupConcat {
+		if finalAggDesc.Name == ast.AggFuncGroupConcat || finalAggDesc.Name == ast.AggFuncApproxPercentile {
 			finalAggDesc.Args = append(finalAggDesc.Args, a.Args[len(a.Args)-1]) // separator
 		}
 	}
@@ -209,7 +220,7 @@ func (a *AggFuncDesc) GetAggFunc(ctx sessionctx.Context) Aggregation {
 		var s string
 		var err error
 		var maxLen uint64
-		s, err = variable.GetSessionSystemVar(ctx.GetSessionVars(), variable.GroupConcatMaxLen)
+		s, err = variable.GetSessionOrGlobalSystemVar(ctx.GetSessionVars(), variable.GroupConcatMaxLen)
 		if err != nil {
 			panic(fmt.Sprintf("Error happened when GetAggFunc: no system variable named '%s'", variable.GroupConcatMaxLen))
 		}
@@ -271,4 +282,44 @@ func (a *AggFuncDesc) evalNullValueInOuterJoin4BitOr(ctx sessionctx.Context, sch
 		return types.NewDatum(0), true
 	}
 	return con.Value, true
+}
+
+// UpdateNotNullFlag4RetType checks if we should remove the NotNull flag for the return type of the agg.
+func (a *AggFuncDesc) UpdateNotNullFlag4RetType(hasGroupBy, allAggsFirstRow bool) error {
+	var removeNotNull bool
+	switch a.Name {
+	case ast.AggFuncCount, ast.AggFuncApproxCountDistinct, ast.AggFuncApproxPercentile,
+		ast.AggFuncBitAnd, ast.AggFuncBitOr, ast.AggFuncBitXor,
+		ast.WindowFuncFirstValue, ast.WindowFuncLastValue, ast.WindowFuncNthValue, ast.WindowFuncRowNumber,
+		ast.WindowFuncRank, ast.WindowFuncDenseRank, ast.WindowFuncCumeDist, ast.WindowFuncNtile, ast.WindowFuncPercentRank,
+		ast.WindowFuncLead, ast.WindowFuncLag, ast.AggFuncJsonObjectAgg, ast.AggFuncJsonArrayagg,
+		ast.AggFuncVarSamp, ast.AggFuncVarPop, ast.AggFuncStddevPop, ast.AggFuncStddevSamp:
+		removeNotNull = false
+	case ast.AggFuncSum, ast.AggFuncAvg, ast.AggFuncGroupConcat:
+		if !hasGroupBy {
+			removeNotNull = true
+		}
+	// `select max(a) from empty_tbl` returns `null`, while `select max(a) from empty_tbl group by b` returns empty.
+	case ast.AggFuncMax, ast.AggFuncMin:
+		if !hasGroupBy && a.RetTp.Tp != mysql.TypeBit {
+			removeNotNull = true
+		}
+	// `select distinct a from empty_tbl` returns empty
+	// `select a from empty_tbl group by b` returns empty
+	// `select a, max(a) from empty_tbl` returns `(null, null)`
+	// `select a, max(a) from empty_tbl group by b` returns empty
+	// `select a, count(a) from empty_tbl` returns `(null, 0)`
+	// `select a, count(a) from empty_tbl group by b` returns empty
+	case ast.AggFuncFirstRow:
+		if !allAggsFirstRow && !hasGroupBy {
+			removeNotNull = true
+		}
+	default:
+		return errors.Errorf("unsupported agg function: %s", a.Name)
+	}
+	if removeNotNull {
+		a.RetTp = a.RetTp.Clone()
+		a.RetTp.Flag &^= mysql.NotNullFlag
+	}
+	return nil
 }

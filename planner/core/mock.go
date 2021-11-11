@@ -8,17 +8,20 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package core
 
 import (
-	"github.com/pingcap/parser/auth"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
+	"fmt"
+
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/parser/auth"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
@@ -41,9 +44,9 @@ func newDateType() types.FieldType {
 
 // MockSignedTable is only used for plan related tests.
 func MockSignedTable() *model.TableInfo {
-	// column: a, b, c, d, e, c_str, d_str, e_str, f, g
+	// column: a, b, c, d, e, c_str, d_str, e_str, f, g, h, i_date
 	// PK: a
-	// indices: c_d_e, e, f, g, f_g, c_d_e_str, c_d_e_str_prefix
+	// indices: c_d_e, e, f, g, f_g, c_d_e_str, e_d_c_str_prefix
 	indices := []*model.IndexInfo{
 		{
 			Name: model.NewCIStr("c_d_e"),
@@ -332,6 +335,34 @@ func MockUnsignedTable() *model.TableInfo {
 	return table
 }
 
+// MockNoPKTable is only used for plan related tests.
+func MockNoPKTable() *model.TableInfo {
+	// column: a, b
+	col0 := &model.ColumnInfo{
+		State:     model.StatePublic,
+		Offset:    1,
+		Name:      model.NewCIStr("a"),
+		FieldType: newLongType(),
+		ID:        2,
+	}
+	col1 := &model.ColumnInfo{
+		State:     model.StatePublic,
+		Offset:    2,
+		Name:      model.NewCIStr("b"),
+		FieldType: newLongType(),
+		ID:        3,
+	}
+	// Column 'a', 'b' is not null.
+	col0.Flag = mysql.NotNullFlag
+	col1.Flag = mysql.UnsignedFlag
+	table := &model.TableInfo{
+		Columns:    []*model.ColumnInfo{col0, col1},
+		Name:       model.NewCIStr("t3"),
+		PKIsHandle: true,
+	}
+	return table
+}
+
 // MockView is only used for plan related tests.
 func MockView() *model.TableInfo {
 	selectStmt := "select b,c,d from t"
@@ -370,7 +401,9 @@ func MockContext() sessionctx.Context {
 	}
 	ctx.GetSessionVars().CurrentDB = "test"
 	do := &domain.Domain{}
-	do.CreateStatsHandle(ctx)
+	if err := do.CreateStatsHandle(ctx); err != nil {
+		panic(fmt.Sprintf("create mock context panic: %+v", err))
+	}
 	domain.BindDomain(ctx, do)
 	return ctx
 }

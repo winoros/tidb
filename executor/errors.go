@@ -8,43 +8,64 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package executor
 
 import (
-	"github.com/pingcap/parser/terror"
 	mysql "github.com/pingcap/tidb/errno"
+	parser_mysql "github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/util/dbterror"
 )
 
 // Error instances.
 var (
-	ErrGetStartTS      = terror.ClassExecutor.New(mysql.ErrGetStartTS, mysql.MySQLErrName[mysql.ErrGetStartTS])
-	ErrUnknownPlan     = terror.ClassExecutor.New(mysql.ErrUnknownPlan, mysql.MySQLErrName[mysql.ErrUnknownPlan])
-	ErrPrepareMulti    = terror.ClassExecutor.New(mysql.ErrPrepareMulti, mysql.MySQLErrName[mysql.ErrPrepareMulti])
-	ErrPrepareDDL      = terror.ClassExecutor.New(mysql.ErrPrepareDDL, mysql.MySQLErrName[mysql.ErrPrepareDDL])
-	ErrResultIsEmpty   = terror.ClassExecutor.New(mysql.ErrResultIsEmpty, mysql.MySQLErrName[mysql.ErrResultIsEmpty])
-	ErrBuildExecutor   = terror.ClassExecutor.New(mysql.ErrBuildExecutor, mysql.MySQLErrName[mysql.ErrBuildExecutor])
-	ErrBatchInsertFail = terror.ClassExecutor.New(mysql.ErrBatchInsertFail, mysql.MySQLErrName[mysql.ErrBatchInsertFail])
+	ErrGetStartTS           = dbterror.ClassExecutor.NewStd(mysql.ErrGetStartTS)
+	ErrUnknownPlan          = dbterror.ClassExecutor.NewStd(mysql.ErrUnknownPlan)
+	ErrPrepareMulti         = dbterror.ClassExecutor.NewStd(mysql.ErrPrepareMulti)
+	ErrPrepareDDL           = dbterror.ClassExecutor.NewStd(mysql.ErrPrepareDDL)
+	ErrResultIsEmpty        = dbterror.ClassExecutor.NewStd(mysql.ErrResultIsEmpty)
+	ErrBuildExecutor        = dbterror.ClassExecutor.NewStd(mysql.ErrBuildExecutor)
+	ErrBatchInsertFail      = dbterror.ClassExecutor.NewStd(mysql.ErrBatchInsertFail)
+	ErrUnsupportedPs        = dbterror.ClassExecutor.NewStd(mysql.ErrUnsupportedPs)
+	ErrSubqueryMoreThan1Row = dbterror.ClassExecutor.NewStd(mysql.ErrSubqueryNo1Row)
+	ErrIllegalGrantForTable = dbterror.ClassExecutor.NewStd(mysql.ErrIllegalGrantForTable)
 
-	ErrCantCreateUserWithGrant     = terror.ClassExecutor.New(mysql.ErrCantCreateUserWithGrant, mysql.MySQLErrName[mysql.ErrCantCreateUserWithGrant])
-	ErrPasswordNoMatch             = terror.ClassExecutor.New(mysql.ErrPasswordNoMatch, mysql.MySQLErrName[mysql.ErrPasswordNoMatch])
-	ErrCannotUser                  = terror.ClassExecutor.New(mysql.ErrCannotUser, mysql.MySQLErrName[mysql.ErrCannotUser])
-	ErrPasswordFormat              = terror.ClassExecutor.New(mysql.ErrPasswordFormat, mysql.MySQLErrName[mysql.ErrPasswordFormat])
-	ErrCantChangeTxCharacteristics = terror.ClassExecutor.New(mysql.ErrCantChangeTxCharacteristics, mysql.MySQLErrName[mysql.ErrCantChangeTxCharacteristics])
-	ErrPsManyParam                 = terror.ClassExecutor.New(mysql.ErrPsManyParam, mysql.MySQLErrName[mysql.ErrPsManyParam])
-	ErrAdminCheckTable             = terror.ClassExecutor.New(mysql.ErrAdminCheckTable, mysql.MySQLErrName[mysql.ErrAdminCheckTable])
-	ErrDBaccessDenied              = terror.ClassExecutor.New(mysql.ErrDBaccessDenied, mysql.MySQLErrName[mysql.ErrDBaccessDenied])
-	ErrTableaccessDenied           = terror.ClassExecutor.New(mysql.ErrTableaccessDenied, mysql.MySQLErrName[mysql.ErrTableaccessDenied])
-	ErrBadDB                       = terror.ClassExecutor.New(mysql.ErrBadDB, mysql.MySQLErrName[mysql.ErrBadDB])
-	ErrWrongObject                 = terror.ClassExecutor.New(mysql.ErrWrongObject, mysql.MySQLErrName[mysql.ErrWrongObject])
-	ErrRoleNotGranted              = terror.ClassPrivilege.New(mysql.ErrRoleNotGranted, mysql.MySQLErrName[mysql.ErrRoleNotGranted])
-	ErrDeadlock                    = terror.ClassExecutor.New(mysql.ErrLockDeadlock, mysql.MySQLErrName[mysql.ErrLockDeadlock])
-	ErrQueryInterrupted            = terror.ClassExecutor.New(mysql.ErrQueryInterrupted, mysql.MySQLErrName[mysql.ErrQueryInterrupted])
+	ErrCantCreateUserWithGrant       = dbterror.ClassExecutor.NewStd(mysql.ErrCantCreateUserWithGrant)
+	ErrPasswordNoMatch               = dbterror.ClassExecutor.NewStd(mysql.ErrPasswordNoMatch)
+	ErrCannotUser                    = dbterror.ClassExecutor.NewStd(mysql.ErrCannotUser)
+	ErrGrantRole                     = dbterror.ClassExecutor.NewStd(mysql.ErrGrantRole)
+	ErrPasswordFormat                = dbterror.ClassExecutor.NewStd(mysql.ErrPasswordFormat)
+	ErrCantChangeTxCharacteristics   = dbterror.ClassExecutor.NewStd(mysql.ErrCantChangeTxCharacteristics)
+	ErrPsManyParam                   = dbterror.ClassExecutor.NewStd(mysql.ErrPsManyParam)
+	ErrAdminCheckTable               = dbterror.ClassExecutor.NewStd(mysql.ErrAdminCheckTable)
+	ErrDBaccessDenied                = dbterror.ClassExecutor.NewStd(mysql.ErrDBaccessDenied)
+	ErrTableaccessDenied             = dbterror.ClassExecutor.NewStd(mysql.ErrTableaccessDenied)
+	ErrBadDB                         = dbterror.ClassExecutor.NewStd(mysql.ErrBadDB)
+	ErrWrongObject                   = dbterror.ClassExecutor.NewStd(mysql.ErrWrongObject)
+	ErrWrongUsage                    = dbterror.ClassExecutor.NewStd(mysql.ErrWrongUsage)
+	ErrRoleNotGranted                = dbterror.ClassPrivilege.NewStd(mysql.ErrRoleNotGranted)
+	ErrDeadlock                      = dbterror.ClassExecutor.NewStd(mysql.ErrLockDeadlock)
+	ErrQueryInterrupted              = dbterror.ClassExecutor.NewStd(mysql.ErrQueryInterrupted)
+	ErrDynamicPrivilegeNotRegistered = dbterror.ClassExecutor.NewStd(mysql.ErrDynamicPrivilegeNotRegistered)
+	ErrIllegalPrivilegeLevel         = dbterror.ClassExecutor.NewStd(mysql.ErrIllegalPrivilegeLevel)
+	ErrInvalidSplitRegionRanges      = dbterror.ClassExecutor.NewStd(mysql.ErrInvalidSplitRegionRanges)
+	ErrViewInvalid                   = dbterror.ClassExecutor.NewStd(mysql.ErrViewInvalid)
 
-	ErrBRIEBackupFailed  = terror.ClassExecutor.New(mysql.ErrBRIEBackupFailed, mysql.MySQLErrName[mysql.ErrBRIEBackupFailed])
-	ErrBRIERestoreFailed = terror.ClassExecutor.New(mysql.ErrBRIERestoreFailed, mysql.MySQLErrName[mysql.ErrBRIERestoreFailed])
-	ErrBRIEImportFailed  = terror.ClassExecutor.New(mysql.ErrBRIEImportFailed, mysql.MySQLErrName[mysql.ErrBRIEImportFailed])
-	ErrBRIEExportFailed  = terror.ClassExecutor.New(mysql.ErrBRIEExportFailed, mysql.MySQLErrName[mysql.ErrBRIEExportFailed])
+	ErrBRIEBackupFailed              = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEBackupFailed)
+	ErrBRIERestoreFailed             = dbterror.ClassExecutor.NewStd(mysql.ErrBRIERestoreFailed)
+	ErrBRIEImportFailed              = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEImportFailed)
+	ErrBRIEExportFailed              = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEExportFailed)
+	ErrCTEMaxRecursionDepth          = dbterror.ClassExecutor.NewStd(mysql.ErrCTEMaxRecursionDepth)
+	ErrDataInConsistentExtraIndex    = dbterror.ClassExecutor.NewStd(mysql.ErrDataInConsistentExtraIndex)
+	ErrDataInConsistentMisMatchIndex = dbterror.ClassExecutor.NewStd(mysql.ErrDataInConsistentMisMatchIndex)
+	ErrNotSupportedWithSem           = dbterror.ClassOptimizer.NewStd(mysql.ErrNotSupportedWithSem)
+	ErrPluginIsNotLoaded             = dbterror.ClassExecutor.NewStd(mysql.ErrPluginIsNotLoaded)
+	ErrSetPasswordAuthPlugin         = dbterror.ClassExecutor.NewStd(mysql.ErrSetPasswordAuthPlugin)
+	ErrFuncNotEnabled                = dbterror.ClassExecutor.NewStdErr(mysql.ErrNotSupportedYet, parser_mysql.Message("%-.32s is not supported. To enable this experimental feature, set '%-.32s' in the configuration file.", nil))
+
+	errUnsupportedFlashbackTmpTable = dbterror.ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message("Recover/flashback table is not supported on temporary tables", nil))
+	errTruncateWrongInsertValue     = dbterror.ClassTable.NewStdErr(mysql.ErrTruncatedWrongValue, parser_mysql.Message("Incorrect %-.32s value: '%-.128s' for column '%.192s' at row %d", nil))
 )

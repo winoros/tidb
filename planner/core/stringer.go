@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -27,18 +28,34 @@ func ToString(p Plan) string {
 	return strings.Join(strs, "->")
 }
 
+func needIncludeChildrenString(plan Plan) bool {
+	switch x := plan.(type) {
+	case *LogicalUnionAll, *PhysicalUnionAll, *LogicalPartitionUnionAll:
+		// after https://github.com/pingcap/tidb/pull/25218, the union may contain less than 2 children,
+		// but we still wants to include its child plan's information when calling `toString` on union.
+		return true
+	case LogicalPlan:
+		return len(x.Children()) > 1
+	case PhysicalPlan:
+		return len(x.Children()) > 1
+	default:
+		return false
+	}
+}
+
 func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 	switch x := in.(type) {
 	case LogicalPlan:
-		if len(x.Children()) > 1 {
+		if needIncludeChildrenString(in) {
 			idxs = append(idxs, len(strs))
 		}
 
 		for _, c := range x.Children() {
 			strs, idxs = toString(c, strs, idxs)
 		}
+	case *PhysicalExchangeReceiver: // do nothing
 	case PhysicalPlan:
-		if len(x.Children()) > 1 {
+		if needIncludeChildrenString(in) {
 			idxs = append(idxs, len(strs))
 		}
 
@@ -266,22 +283,34 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = fmt.Sprintf("Window(%s)", x.ExplainInfo())
 	case *PhysicalShuffle:
 		str = fmt.Sprintf("Partition(%s)", x.ExplainInfo())
-	case *PhysicalShuffleDataSourceStub:
-		str = fmt.Sprintf("PartitionDataSourceStub(%s)", x.ExplainInfo())
+	case *PhysicalShuffleReceiverStub:
+		str = fmt.Sprintf("PartitionReceiverStub(%s)", x.ExplainInfo())
 	case *PointGetPlan:
-		str = fmt.Sprintf("PointGet(")
+		str = "PointGet("
 		if x.IndexInfo != nil {
 			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
 		} else {
 			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handle)
 		}
 	case *BatchPointGetPlan:
-		str = fmt.Sprintf("BatchPointGet(")
+		str = "BatchPointGet("
 		if x.IndexInfo != nil {
 			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
 		} else {
 			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handles)
 		}
+	case *PhysicalExchangeReceiver:
+		str = "Recv("
+		for _, task := range x.Tasks {
+			str += fmt.Sprintf("%d, ", task.ID)
+		}
+		str += ")"
+	case *PhysicalExchangeSender:
+		str = "Send("
+		for _, task := range x.TargetTasks {
+			str += fmt.Sprintf("%d, ", task.ID)
+		}
+		str += ")"
 	default:
 		str = fmt.Sprintf("%T", in)
 	}

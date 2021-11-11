@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -20,11 +21,11 @@ import (
 
 	"github.com/cznic/mathutil"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
@@ -42,7 +43,6 @@ type requiredRowsSelectResult struct {
 	numNextCalled   int
 }
 
-func (r *requiredRowsSelectResult) Fetch(context.Context)                   {}
 func (r *requiredRowsSelectResult) NextRaw(context.Context) ([]byte, error) { return nil, nil }
 func (r *requiredRowsSelectResult) Close() error                            { return nil }
 
@@ -89,16 +89,24 @@ func (r *requiredRowsSelectResult) genValue(valType *types.FieldType) interface{
 	}
 }
 
+type totalRowsContextKey struct{}
+
+var totalRowsKey = totalRowsContextKey{}
+
+type expectedRowsRetContextKey struct{}
+
+var expectedRowsRetKey = expectedRowsRetContextKey{}
+
 func mockDistsqlSelectCtxSet(totalRows int, expectedRowsRet []int) context.Context {
 	ctx := context.Background()
-	ctx = context.WithValue(ctx, "totalRows", totalRows)
-	ctx = context.WithValue(ctx, "expectedRowsRet", expectedRowsRet)
+	ctx = context.WithValue(ctx, totalRowsKey, totalRows)
+	ctx = context.WithValue(ctx, expectedRowsRetKey, expectedRowsRet)
 	return ctx
 }
 
 func mockDistsqlSelectCtxGet(ctx context.Context) (totalRows int, expectedRowsRet []int) {
-	totalRows = ctx.Value("totalRows").(int)
-	expectedRowsRet = ctx.Value("expectedRowsRet").([]int)
+	totalRows = ctx.Value(totalRowsKey).(int)
+	expectedRowsRet = ctx.Value(expectedRowsRetKey).([]int)
 	return
 }
 
@@ -123,8 +131,7 @@ func buildTableReader(sctx sessionctx.Context) Executor {
 }
 
 func buildMockDAGRequest(sctx sessionctx.Context) *tipb.DAGRequest {
-	builder := newExecutorBuilder(sctx, nil)
-	req, _, err := builder.constructDAGReq([]core.PhysicalPlan{&core.PhysicalTableScan{
+	req, _, err := constructDAGReq(sctx, []core.PhysicalPlan{&core.PhysicalTableScan{
 		Columns: []*model.ColumnInfo{},
 		Table:   &model.TableInfo{ID: 12345, PKIsHandle: false},
 		Desc:    false,

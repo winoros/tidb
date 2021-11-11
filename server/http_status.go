@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -21,6 +22,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -29,19 +31,22 @@ import (
 	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/fn"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/printer"
+	"github.com/pingcap/tidb/util/topsql/tracecpu"
 	"github.com/pingcap/tidb/util/versioninfo"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/soheilhy/cmux"
@@ -80,7 +85,8 @@ func (s *Server) listenStatusHTTPServer() error {
 	}
 
 	logutil.BgLogger().Info("for status and metrics report", zap.String("listening on addr", s.statusAddr))
-	tlsConfig, err := s.cfg.Security.ToTLSConfig()
+	clusterSecurity := s.cfg.Security.ClusterSecurity()
+	tlsConfig, err := clusterSecurity.ToTLSConfig()
 	if err != nil {
 		logutil.BgLogger().Error("invalid TLS config", zap.Error(err))
 		return errors.Trace(err)
@@ -103,6 +109,87 @@ func (s *Server) listenStatusHTTPServer() error {
 	return nil
 }
 
+// Ballast try to reduce the GC frequency by using Ballast Object
+type Ballast struct {
+	ballast     []byte
+	ballastLock sync.Mutex
+
+	maxSize int
+}
+
+func newBallast(maxSize int) *Ballast {
+	var b Ballast
+	b.maxSize = 1024 * 1024 * 1024 * 2
+	if maxSize > 0 {
+		b.maxSize = maxSize
+	} else {
+		// we try to use the total amount of ram as a reference to set the default ballastMaxSz
+		// since the fatal throw "runtime: out of memory" would never yield to `recover`
+		totalRAMSz, err := memory.MemTotal()
+		if err != nil {
+			logutil.BgLogger().Error("failed to get the total amount of RAM on this system", zap.Error(err))
+		} else {
+			maxSzAdvice := totalRAMSz >> 2
+			if uint64(b.maxSize) > maxSzAdvice {
+				b.maxSize = int(maxSzAdvice)
+			}
+		}
+	}
+	return &b
+}
+
+// GetSize get the size of ballast object
+func (b *Ballast) GetSize() int {
+	var sz int
+	b.ballastLock.Lock()
+	sz = len(b.ballast)
+	b.ballastLock.Unlock()
+	return sz
+}
+
+// SetSize set the size of ballast object
+func (b *Ballast) SetSize(newSz int) error {
+	if newSz < 0 {
+		return fmt.Errorf("newSz cannot be negative: %d", newSz)
+	}
+	if newSz > b.maxSize {
+		return fmt.Errorf("newSz cannot be bigger than %d but it has value %d", b.maxSize, newSz)
+	}
+	b.ballastLock.Lock()
+	b.ballast = make([]byte, newSz)
+	b.ballastLock.Unlock()
+	return nil
+}
+
+// GenHTTPHandler generate a HTTP handler to get/set the size of this ballast object
+func (b *Ballast) GenHTTPHandler() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, err := w.Write([]byte(strconv.Itoa(b.GetSize())))
+			terror.Log(err)
+		case http.MethodPost:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				terror.Log(err)
+				return
+			}
+			newSz, err := strconv.Atoi(string(body))
+			if err == nil {
+				err = b.SetSize(newSz)
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				errStr := err.Error()
+				if _, err := w.Write([]byte(errStr)); err != nil {
+					terror.Log(err)
+				}
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) startHTTPServer() {
 	router := mux.NewRouter()
 
@@ -114,14 +201,21 @@ func (s *Server) startHTTPServer() {
 	router.Handle("/stats/dump/{db}/{table}", s.newStatsHandler()).Name("StatsDump")
 	router.Handle("/stats/dump/{db}/{table}/{snapshot}", s.newStatsHistoryHandler()).Name("StatsHistoryDump")
 
-	router.Handle("/settings", settingsHandler{}).Name("Settings")
-	router.Handle("/binlog/recover", binlogRecover{}).Name("BinlogRecover")
+	router.Handle("/plan_replayer/dump/{filename}", s.newPlanReplayerHandler()).Name("PlanReplayerDump")
 
 	tikvHandlerTool := s.newTikvHandlerTool()
+	router.Handle("/settings", settingsHandler{tikvHandlerTool}).Name("Settings")
+	router.Handle("/binlog/recover", binlogRecover{}).Name("BinlogRecover")
+
 	router.Handle("/schema", schemaHandler{tikvHandlerTool}).Name("Schema")
 	router.Handle("/schema/{db}", schemaHandler{tikvHandlerTool})
 	router.Handle("/schema/{db}/{table}", schemaHandler{tikvHandlerTool})
 	router.Handle("/tables/{colID}/{colTp}/{colFlag}/{colLen}", valueHandler{})
+
+	router.Handle("/schema_storage", schemaStorageHandler{tikvHandlerTool}).Name("Schema Storage")
+	router.Handle("/schema_storage/{db}", schemaStorageHandler{tikvHandlerTool})
+	router.Handle("/schema_storage/{db}/{table}", schemaStorageHandler{tikvHandlerTool})
+
 	router.Handle("/ddl/history", ddlHistoryJobHandler{tikvHandlerTool}).Name("DDL_History")
 	router.Handle("/ddl/owner/resign", ddlResignOwnerHandler{tikvHandlerTool.Store.(kv.Storage)}).Name("DDL_Owner_Resign")
 
@@ -141,6 +235,7 @@ func (s *Server) startHTTPServer() {
 	if s.cfg.Store == "tikv" {
 		// HTTP path for tikv.
 		router.Handle("/tables/{db}/{table}/regions", tableHandler{tikvHandlerTool, opTableRegions})
+		router.Handle("/tables/{db}/{table}/ranges", tableHandler{tikvHandlerTool, opTableRanges})
 		router.Handle("/tables/{db}/{table}/scatter", tableHandler{tikvHandlerTool, opTableScatter})
 		router.Handle("/tables/{db}/{table}/stop-scatter", tableHandler{tikvHandlerTool, opStopTableScatter})
 		router.Handle("/tables/{db}/{table}/disk-usage", tableHandler{tikvHandlerTool, opTableDiskUsage})
@@ -150,9 +245,11 @@ func (s *Server) startHTTPServer() {
 	}
 
 	// HTTP path for get MVCC info
+	router.Handle("/mvcc/key/{db}/{table}", mvccTxnHandler{tikvHandlerTool, opMvccGetByKey})
 	router.Handle("/mvcc/key/{db}/{table}/{handle}", mvccTxnHandler{tikvHandlerTool, opMvccGetByKey})
 	router.Handle("/mvcc/txn/{startTS}/{db}/{table}", mvccTxnHandler{tikvHandlerTool, opMvccGetByTxn})
 	router.Handle("/mvcc/hex/{hexKey}", mvccTxnHandler{tikvHandlerTool, opMvccGetByHex})
+	router.Handle("/mvcc/index/{db}/{table}/{index}", mvccTxnHandler{tikvHandlerTool, opMvccGetByIdx})
 	router.Handle("/mvcc/index/{db}/{table}/{index}/{handle}", mvccTxnHandler{tikvHandlerTool, opMvccGetByIdx})
 
 	// HTTP path for generate metric profile.
@@ -179,9 +276,43 @@ func (s *Server) startHTTPServer() {
 
 	serverMux.HandleFunc("/debug/pprof/", pprof.Index)
 	serverMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	serverMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	serverMux.HandleFunc("/debug/pprof/profile", tracecpu.ProfileHTTPHandler)
 	serverMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	serverMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	ballast := newBallast(s.cfg.MaxBallastObjectSize)
+	{
+		err := ballast.SetSize(s.cfg.BallastObjectSize)
+		if err != nil {
+			logutil.BgLogger().Error("set initial ballast object size failed", zap.Error(err))
+		}
+	}
+	serverMux.HandleFunc("/debug/ballast-object-sz", ballast.GenHTTPHandler())
+
+	serverMux.HandleFunc("/debug/gogc", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, err := w.Write([]byte(strconv.Itoa(util.GetGOGC())))
+			terror.Log(err)
+		case http.MethodPost:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				terror.Log(err)
+				return
+			}
+
+			val, err := strconv.Atoi(string(body))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				if _, err := w.Write([]byte(err.Error())); err != nil {
+					terror.Log(err)
+				}
+				return
+			}
+
+			util.SetGOGC(val)
+		}
+	})
 
 	serverMux.HandleFunc("/debug/zip", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="tidb_debug"`+time.Now().Format("20060102150405")+".zip"))
@@ -222,7 +353,7 @@ func (s *Server) startHTTPServer() {
 			serveError(w, http.StatusInternalServerError, fmt.Sprintf("Create zipped %s fail: %v", "profile", err))
 			return
 		}
-		if err := rpprof.StartCPUProfile(fw); err != nil {
+		if err := tracecpu.StartCPUProfile(fw); err != nil {
 			serveError(w, http.StatusInternalServerError,
 				fmt.Sprintf("Could not enable CPU profiling: %s", err))
 			return
@@ -232,7 +363,11 @@ func (s *Server) startHTTPServer() {
 			sec = 10
 		}
 		sleepWithCtx(r.Context(), time.Duration(sec)*time.Second)
-		rpprof.StopCPUProfile()
+		err = tracecpu.StopCPUProfile()
+		if err != nil {
+			serveError(w, http.StatusInternalServerError, fmt.Sprintf("Create zipped %s fail: %v", "config", err))
+			return
+		}
 
 		// dump config
 		fw, err = zw.Create("config")
@@ -260,8 +395,6 @@ func (s *Server) startHTTPServer() {
 		err = zw.Close()
 		terror.Log(err)
 	})
-	fetcher := sqlInfoFetcher{store: tikvHandlerTool.Store}
-	serverMux.HandleFunc("/debug/sub-optimal-plan", fetcher.zipInfoForSQL)
 
 	// failpoint is enabled only for tests so we can add some http APIs here for tests.
 	failpoint.Inject("enableTestAPI", func() {
@@ -272,6 +405,9 @@ func (s *Server) startHTTPServer() {
 
 		router.Handle("/test/{mod}/{op}", &testHandler{tikvHandlerTool, 0})
 	})
+
+	// ddlHook is enabled only for tests so we can substitute the callback in the DDL.
+	router.Handle("/test/ddl/hook", &ddlHookHandler{tikvHandlerTool.Store.(kv.Storage)})
 
 	var (
 		httpRouterPage bytes.Buffer
@@ -364,7 +500,13 @@ type status struct {
 
 func (s *Server) handleStatus(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
+	// If the server is in the process of shutting down, return a non-200 status.
+	// It is important not to return status{} as acquiring the s.ConnectionCount()
+	// acquires a lock that may already be held by the shutdown process.
+	if s.inShutdownMode {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	st := status{
 		Connections: s.ConnectionCount(),
 		Version:     mysql.ServerVersion,
@@ -374,8 +516,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		logutil.BgLogger().Error("encode json failed", zap.Error(err))
-	} else {
-		_, err = w.Write(js)
-		terror.Log(errors.Trace(err))
+		return
 	}
+	_, err = w.Write(js)
+	terror.Log(errors.Trace(err))
 }

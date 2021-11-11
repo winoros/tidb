@@ -18,7 +18,8 @@
       "select t1.a, t1.b from t t1, t t2 where t1.a = t2.a and t1.a = 10 and t2.a = 5",
       "select a, b from ((select a, b from t) union all(select c as a, d as b from t)) as t1 where a > 1",
       "select a, b from (select a, b, min(a) over(partition by b) as min_a from t)as tt where a < 10 and b > 10 and b = min_a",
-      "select b, c from (select b, c from t where b > 1 and c > 1) as t1 where b > 2 and c > 2"
+      "select b, c from (select b, c from t where b > 1 and c > 1) as t1 where b > 2 and c > 2",
+      "select * from t t1 join t t2 on t1.a = t2.a and t1.a > 2"
     ]
   },
   {
@@ -215,6 +216,33 @@
       "select max(a), min(b), avg(c) from t group by a+b",
       "select max(a), min(b), avg(a / b) from t group by a",
       "select max(a), min(b), avg(a / b) from t group by (a+b)"
+    ]
+  },
+  {
+    "name": "TestMergeAdjacentWindow",
+    "cases": [
+      "select a, b, max(b) over (partition by c), sum(c) over (partition by c) from t",
+      "select a, b, max(b) over (partition by c), sum(c) over (partition by a) from t",
+      "select a, max(b) over (partition by c, d), sum(c) over (partition by c, d) from t",
+      "select a, max(b) over (partition by c, d), sum(c) over (partition by d, c) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc), sum(d) over (partition by c order by d desc) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc), sum(d) over (partition by c order by d) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc), sum(d) over (partition by a order by b desc) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows 2 preceding), sum(d) over (partition by c order by d desc rows 2 preceding) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows between 2 preceding and 2 following), sum(d) over (partition by c order by d desc rows between 2 preceding and 2 following) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows between 2 preceding and 2 following), sum(d) over (partition by c order by d desc rows between 3 preceding and 2 following) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows between 3 preceding and 2 following), sum(d) over (partition by c order by d desc rows between 2 preceding and 2 following) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows between 2 preceding and 2 following), sum(d) over (partition by c order by d desc range between 2 preceding and 2 following) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows 2 preceding), sum(d) over (partition by c order by d desc range between unbounded preceding and current row) from t",
+      "select a, b, c, d, max(b) over (partition by c order by d desc rows 2 preceding), sum(d) over (partition by c order by d desc rows 3 preceding) from t",
+      "select a, b, max(b) over (partition by c), c, d, dd from (select a, b, c, d, sum(d) over (partition by c) as dd from t) as tt",
+      "select a, b, max(b) over (partition by c), c, d, dd from (select a, b, c, d, sum(d) over (partition by a) as dd from t) as tt",
+      "select a, b, rank() over (), max(b) over (partition by c), c, d, dd from (select a, b, c, d, sum(d) over (partition by c) as dd from t) as tt",
+      "select a, b, sum(bb) over (partition by a) as 'sum_bb' from (select a, b, max(b) over (partition by a) as 'bb' from t) as tt",
+      "select a, b, sum(bb) over (partition by a) as 'sum_bb', c from (select a, b, c, max(b) over (partition by a) as 'bb' from t) as tt",
+      "select a, b, rank() over (partition by a), sum(bb) over (partition by a) as 'sum_bb', c from (select a, b, c, max(b) over (partition by a) as 'bb' from t) as tt",
+      "select a, b, sum(bb) over (partition by a) as 'sum_bb', c, rank() over (partition by a) from (select a, b, c, max(b) over (partition by a) as 'bb' from t) as tt",
+      "select a, b, sum(bb) over (partition by a) as 'sum_bb', c, rank() over () from (select a, b, c, max(b) over (partition by a) as 'bb' from t) as tt"
     ]
   }
 ]

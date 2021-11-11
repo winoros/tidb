@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -91,49 +92,6 @@ func (p *PhysicalHashJoin) ResolveIndices() (err error) {
 		}
 		p.RightJoinKeys[i] = rArg.(*expression.Column)
 		p.EqualConditions[i] = expression.NewFunctionInternal(fun.GetCtx(), fun.FuncName.L, fun.GetType(), lArg, rArg).(*expression.ScalarFunction)
-	}
-	for i, expr := range p.LeftConditions {
-		p.LeftConditions[i], err = expr.ResolveIndices(lSchema)
-		if err != nil {
-			return err
-		}
-	}
-	for i, expr := range p.RightConditions {
-		p.RightConditions[i], err = expr.ResolveIndices(rSchema)
-		if err != nil {
-			return err
-		}
-	}
-	for i, expr := range p.OtherConditions {
-		p.OtherConditions[i], err = expr.ResolveIndices(expression.MergeSchema(lSchema, rSchema))
-		if err != nil {
-			return err
-		}
-	}
-	return
-}
-
-// ResolveIndices implements Plan interface.
-func (p *PhysicalBroadCastJoin) ResolveIndices() (err error) {
-	err = p.physicalSchemaProducer.ResolveIndices()
-	if err != nil {
-		return err
-	}
-	lSchema := p.children[0].Schema()
-	rSchema := p.children[1].Schema()
-	for i, col := range p.LeftJoinKeys {
-		newKey, err := col.ResolveIndices(lSchema)
-		if err != nil {
-			return err
-		}
-		p.LeftJoinKeys[i] = newKey.(*expression.Column)
-	}
-	for i, col := range p.RightJoinKeys {
-		newKey, err := col.ResolveIndices(rSchema)
-		if err != nil {
-			return err
-		}
-		p.RightJoinKeys[i] = newKey.(*expression.Column)
 	}
 	for i, expr := range p.LeftConditions {
 		p.LeftConditions[i], err = expr.ResolveIndices(lSchema)
@@ -251,6 +209,17 @@ func (p *PhysicalIndexJoin) ResolveIndices() (err error) {
 			p.CompareFilters.affectedColSchema.Columns[i] = resolvedCol.(*expression.Column)
 		}
 	}
+	for i := range p.OuterHashKeys {
+		outerKey, err := p.OuterHashKeys[i].ResolveIndices(p.children[1-p.InnerChildIdx].Schema())
+		if err != nil {
+			return err
+		}
+		innerKey, err := p.InnerHashKeys[i].ResolveIndices(p.children[p.InnerChildIdx].Schema())
+		if err != nil {
+			return err
+		}
+		p.OuterHashKeys[i], p.InnerHashKeys[i] = outerKey.(*expression.Column), innerKey.(*expression.Column)
+	}
 	return
 }
 
@@ -310,6 +279,12 @@ func (p *PhysicalIndexReader) ResolveIndices() (err error) {
 	for i, col := range p.OutputColumns {
 		newCol, err := col.ResolveIndices(p.indexPlan.Schema())
 		if err != nil {
+			// Check if there is duplicate virtual expression column matched.
+			newExprCol, isOK := col.ResolveIndicesByVirtualExpr(p.indexPlan.Schema())
+			if isOK {
+				p.OutputColumns[i] = newExprCol.(*expression.Column)
+				continue
+			}
 			return err
 		}
 		p.OutputColumns[i] = newCol.(*expression.Column)
@@ -378,10 +353,32 @@ func (p *PhysicalSelection) ResolveIndices() (err error) {
 	for i, expr := range p.Conditions {
 		p.Conditions[i], err = expr.ResolveIndices(p.children[0].Schema())
 		if err != nil {
+			// Check if there is duplicate virtual expression column matched.
+			newCond, isOk := expr.ResolveIndicesByVirtualExpr(p.children[0].Schema())
+			if isOk {
+				p.Conditions[i] = newCond
+				continue
+			}
 			return err
 		}
 	}
-	return
+	return nil
+}
+
+// ResolveIndices implements Plan interface.
+func (p *PhysicalExchangeSender) ResolveIndices() (err error) {
+	err = p.basePhysicalPlan.ResolveIndices()
+	if err != nil {
+		return err
+	}
+	for i, col := range p.HashCols {
+		colExpr, err1 := col.Col.ResolveIndices(p.children[0].Schema())
+		if err1 != nil {
+			return err1
+		}
+		p.HashCols[i].Col, _ = colExpr.(*expression.Column)
+	}
+	return err
 }
 
 // ResolveIndices implements Plan interface.
@@ -487,11 +484,15 @@ func (p *PhysicalShuffle) ResolveIndices() (err error) {
 	if err != nil {
 		return err
 	}
-	for i := range p.HashByItems {
-		// "Shuffle" get value of items from `DataSource`, other than children[0].
-		p.HashByItems[i], err = p.HashByItems[i].ResolveIndices(p.DataSource.Schema())
-		if err != nil {
-			return err
+	// There may be one or more DataSource
+	for i := range p.ByItemArrays {
+		// Each DataSource has an array of HashByItems
+		for j := range p.ByItemArrays[i] {
+			// "Shuffle" get value of items from `DataSource`, other than children[0].
+			p.ByItemArrays[i][j], err = p.ByItemArrays[i][j].ResolveIndices(p.DataSources[i].Schema())
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return err

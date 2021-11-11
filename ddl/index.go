@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,25 +16,24 @@ package ddl
 
 import (
 	"context"
-	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/charset"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/charset"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/store/tikv"
-	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
@@ -43,6 +43,8 @@ import (
 	decoder "github.com/pingcap/tidb/util/rowDecoder"
 	"github.com/pingcap/tidb/util/timeutil"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/zap"
 )
 
@@ -64,7 +66,7 @@ func buildIndexColumns(columns []*model.ColumnInfo, indexPartSpecifications []*a
 			return nil, errKeyColumnDoesNotExits.GenWithStack("column does not exist: %s", ip.Column.Name)
 		}
 
-		if err := checkIndexColumn(col, ip); err != nil {
+		if err := checkIndexColumn(col, ip.Length); err != nil {
 			return nil, err
 		}
 
@@ -98,6 +100,9 @@ func checkPKOnGeneratedColumn(tblInfo *model.TableInfo, indexPartSpecifications 
 		}
 		// Virtual columns cannot be used in primary key.
 		if lastCol.IsGenerated() && !lastCol.GeneratedStored {
+			if lastCol.Hidden {
+				return nil, ErrFunctionalIndexPrimaryKey
+			}
 			return nil, ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("Defining a virtual generated column as primary key")
 		}
 	}
@@ -105,67 +110,72 @@ func checkPKOnGeneratedColumn(tblInfo *model.TableInfo, indexPartSpecifications 
 	return lastCol, nil
 }
 
-func checkIndexPrefixLength(columns []*model.ColumnInfo, idxColumns []*model.IndexColumn) error {
-	// The sum of length of all index columns.
-	sumLength := 0
-	for _, ic := range idxColumns {
-		col := model.FindColumnInfo(columns, ic.Name.L)
-		if col == nil {
-			return errKeyColumnDoesNotExits.GenWithStack("column does not exist: %s", ic.Name)
-		}
-
-		indexColumnLength, err := getIndexColumnLength(col, ic.Length)
-		if err != nil {
-			return err
-		}
-		sumLength += indexColumnLength
-		// The sum of all lengths must be shorter than the max length for prefix.
-		if sumLength > config.GetGlobalConfig().MaxIndexLength {
-			return errTooLongKey.GenWithStackByArgs(config.GetGlobalConfig().MaxIndexLength)
-		}
+func checkIndexPrefixLength(columns []*model.ColumnInfo, idxColumns []*model.IndexColumn, pkLenAppendToKey int) error {
+	idxLen, err := indexColumnsLen(columns, idxColumns)
+	if err != nil {
+		return err
+	}
+	if idxLen+pkLenAppendToKey > config.GetGlobalConfig().MaxIndexLength {
+		return errTooLongKey.GenWithStackByArgs(config.GetGlobalConfig().MaxIndexLength)
 	}
 	return nil
 }
 
-func checkIndexColumn(col *model.ColumnInfo, ic *ast.IndexPartSpecification) error {
+func checkIndexColumn(col *model.ColumnInfo, indexColumnLen int) error {
 	if col.Flen == 0 && (types.IsTypeChar(col.FieldType.Tp) || types.IsTypeVarchar(col.FieldType.Tp)) {
-		return errors.Trace(errWrongKeyColumn.GenWithStackByArgs(ic.Column.Name))
+		if col.Hidden {
+			return errors.Trace(errWrongKeyColumnFunctionalIndex.GenWithStackByArgs(col.GeneratedExprString))
+		}
+		return errors.Trace(errWrongKeyColumn.GenWithStackByArgs(col.Name))
 	}
 
 	// JSON column cannot index.
 	if col.FieldType.Tp == mysql.TypeJSON {
+		if col.Hidden {
+			return errFunctionalIndexOnJSONOrGeometryFunction
+		}
 		return errors.Trace(errJSONUsedAsKey.GenWithStackByArgs(col.Name.O))
 	}
 
 	// Length must be specified and non-zero for BLOB and TEXT column indexes.
 	if types.IsTypeBlob(col.FieldType.Tp) {
-		if ic.Length == types.UnspecifiedLength {
+		if indexColumnLen == types.UnspecifiedLength {
+			if col.Hidden {
+				return errFunctionalIndexOnBlob
+			}
 			return errors.Trace(errBlobKeyWithoutLength.GenWithStackByArgs(col.Name.O))
 		}
-		if ic.Length == types.ErrorLength {
+		if indexColumnLen == types.ErrorLength {
 			return errors.Trace(errKeyPart0.GenWithStackByArgs(col.Name.O))
 		}
 	}
 
 	// Length can only be specified for specifiable types.
-	if ic.Length != types.UnspecifiedLength && !types.IsTypePrefixable(col.FieldType.Tp) {
+	if indexColumnLen != types.UnspecifiedLength && !types.IsTypePrefixable(col.FieldType.Tp) {
 		return errors.Trace(errIncorrectPrefixKey)
 	}
 
 	// Key length must be shorter or equal to the column length.
-	if ic.Length != types.UnspecifiedLength &&
+	if indexColumnLen != types.UnspecifiedLength &&
 		types.IsTypeChar(col.FieldType.Tp) {
-		if col.Flen < ic.Length {
+		if col.Flen < indexColumnLen {
 			return errors.Trace(errIncorrectPrefixKey)
 		}
 		// Length must be non-zero for char.
-		if ic.Length == types.ErrorLength {
+		if indexColumnLen == types.ErrorLength {
 			return errors.Trace(errKeyPart0.GenWithStackByArgs(col.Name.O))
 		}
 	}
 
+	if types.IsString(col.FieldType.Tp) {
+		desc, err := charset.GetCharsetInfo(col.Charset)
+		if err != nil {
+			return err
+		}
+		indexColumnLen *= desc.Maxlen
+	}
 	// Specified length must be shorter than the max length for prefix.
-	if ic.Length > config.GetGlobalConfig().MaxIndexLength {
+	if indexColumnLen > config.GetGlobalConfig().MaxIndexLength {
 		return errTooLongKey.GenWithStackByArgs(config.GetGlobalConfig().MaxIndexLength)
 	}
 	return nil
@@ -183,15 +193,13 @@ func getIndexColumnLength(col *model.ColumnInfo, colLen int) (int, error) {
 	switch col.Tp {
 	case mysql.TypeBit:
 		return (length + 7) >> 3, nil
-	case mysql.TypeVarchar, mysql.TypeString:
+	case mysql.TypeVarchar, mysql.TypeString, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeBlob, mysql.TypeLongBlob:
 		// Different charsets occupy different numbers of bytes on each character.
-		desc, err := charset.GetCharsetDesc(col.Charset)
+		desc, err := charset.GetCharsetInfo(col.Charset)
 		if err != nil {
 			return 0, errUnsupportedCharset.GenWithStackByArgs(col.Charset, col.Collate)
 		}
 		return desc.Maxlen * length, nil
-	case mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeBlob, mysql.TypeLongBlob:
-		return length, nil
 	case mysql.TypeTiny, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeDouble, mysql.TypeShort:
 		return mysql.DefaultLengthOfMysqlTypes[col.Tp], nil
 	case mysql.TypeFloat:
@@ -425,13 +433,16 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK boo
 		}
 		return ver, err
 	}
-	for _, hiddenCol := range hiddenCols {
-		columnInfo := model.FindColumnInfo(tblInfo.Columns, hiddenCol.Name.L)
-		if columnInfo != nil && columnInfo.State == model.StatePublic {
-			// We already have a column with the same column name.
-			job.State = model.JobStateCancelled
-			// TODO: refine the error message
-			return ver, infoschema.ErrColumnExists.GenWithStackByArgs(hiddenCol.Name)
+
+	if indexInfo == nil {
+		for _, hiddenCol := range hiddenCols {
+			columnInfo := model.FindColumnInfo(tblInfo.Columns, hiddenCol.Name.L)
+			if columnInfo != nil && columnInfo.State == model.StatePublic {
+				// We already have a column with the same column name.
+				job.State = model.JobStateCancelled
+				// TODO: refine the error message
+				return ver, infoschema.ErrColumnExists.GenWithStackByArgs(hiddenCol.Name)
+			}
 		}
 	}
 
@@ -482,7 +493,10 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK boo
 		indexInfo.Global = global
 		indexInfo.ID = allocateIndexID(tblInfo)
 		tblInfo.Indices = append(tblInfo.Indices, indexInfo)
-
+		if err = checkTooManyIndexes(tblInfo.Indices); err != nil {
+			job.State = model.JobStateCancelled
+			return ver, errors.Trace(err)
+		}
 		// Here we need do this check before set state to `DeleteOnly`,
 		// because if hidden columns has been set to `DeleteOnly`,
 		// the `DeleteOnly` columns are missing when we do this check.
@@ -496,42 +510,49 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK boo
 	switch indexInfo.State {
 	case model.StateNone:
 		// none -> delete only
-		job.SchemaState = model.StateDeleteOnly
 		indexInfo.State = model.StateDeleteOnly
-		updateHiddenColumns(tblInfo, indexInfo, model.StateDeleteOnly)
+		updateHiddenColumns(tblInfo, indexInfo, model.StatePublic)
 		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != indexInfo.State)
-		metrics.AddIndexProgress.Set(0)
+		if err != nil {
+			return ver, err
+		}
+		job.SchemaState = model.StateDeleteOnly
+		metrics.GetBackfillProgressByLabel(metrics.LblAddIndex).Set(0)
 	case model.StateDeleteOnly:
 		// delete only -> write only
-		job.SchemaState = model.StateWriteOnly
 		indexInfo.State = model.StateWriteOnly
-		updateHiddenColumns(tblInfo, indexInfo, model.StateWriteOnly)
 		_, err = checkPrimaryKeyNotNull(w, sqlMode, t, job, tblInfo, indexInfo)
 		if err != nil {
 			break
 		}
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		if err != nil {
+			return ver, err
+		}
+		job.SchemaState = model.StateWriteOnly
 	case model.StateWriteOnly:
 		// write only -> reorganization
-		job.SchemaState = model.StateWriteReorganization
 		indexInfo.State = model.StateWriteReorganization
-		updateHiddenColumns(tblInfo, indexInfo, model.StateWriteReorganization)
 		_, err = checkPrimaryKeyNotNull(w, sqlMode, t, job, tblInfo, indexInfo)
 		if err != nil {
 			break
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		if err != nil {
+			return ver, err
 		}
 		// Initialize SnapshotVer to 0 for later reorganization check.
 		job.SnapshotVer = 0
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		job.SchemaState = model.StateWriteReorganization
 	case model.StateWriteReorganization:
 		// reorganization -> public
-		updateHiddenColumns(tblInfo, indexInfo, model.StatePublic)
 		tbl, err := getTable(d.store, schemaID, tblInfo)
 		if err != nil {
 			return ver, errors.Trace(err)
 		}
 
-		reorgInfo, err := getReorgInfo(d, t, job, tbl)
+		elements := []*meta.Element{{ID: indexInfo.ID, TypeKey: meta.IndexElementKey}}
+		reorgInfo, err := getReorgInfo(d, t, job, tbl, elements)
 		if err != nil || reorgInfo.first {
 			// If we run reorg firstly, we should update the job snapshot version
 			// and then run the reorg next time.
@@ -553,6 +574,9 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK boo
 			if kv.ErrKeyExists.Equal(err) || errCancelledDDLJob.Equal(err) || errCantDecodeRecord.Equal(err) {
 				logutil.BgLogger().Warn("[ddl] run add index job failed, convert job to rollback", zap.String("job", job.String()), zap.Error(err))
 				ver, err = convertAddIdxJob2RollbackJob(t, job, tblInfo, indexInfo, err)
+				if err1 := t.RemoveDDLReorgHandle(job, reorgInfo.elements); err1 != nil {
+					logutil.BgLogger().Warn("[ddl] run add index job failed, convert job to rollback, RemoveDDLReorgHandle failed", zap.String("job", job.String()), zap.Error(err1))
+				}
 			}
 			// Clean up the channel of notifyCancelReorgJob. Make sure it can't affect other jobs.
 			w.reorgCtx.cleanNotifyReorgCancel()
@@ -599,31 +623,38 @@ func onDropIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	switch indexInfo.State {
 	case model.StatePublic:
 		// public -> write only
-		job.SchemaState = model.StateWriteOnly
 		indexInfo.State = model.StateWriteOnly
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateWriteOnly
+	case model.StateWriteOnly:
+		// write only -> delete only
+		indexInfo.State = model.StateDeleteOnly
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateDeleteOnly
+	case model.StateDeleteOnly:
+		// delete only -> reorganization
+		indexInfo.State = model.StateDeleteReorganization
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateDeleteReorganization
+	case model.StateDeleteReorganization:
+		// reorganization -> absent
 		if len(dependentHiddenCols) > 0 {
 			firstHiddenOffset := dependentHiddenCols[0].Offset
 			for i := 0; i < len(dependentHiddenCols); i++ {
-				tblInfo.Columns[firstHiddenOffset].State = model.StateWriteOnly
 				// Set this column's offset to the last and reset all following columns' offsets.
 				adjustColumnInfoInDropColumn(tblInfo, firstHiddenOffset)
 			}
 		}
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
-	case model.StateWriteOnly:
-		// write only -> delete only
-		job.SchemaState = model.StateDeleteOnly
-		indexInfo.State = model.StateDeleteOnly
-		updateHiddenColumns(tblInfo, indexInfo, model.StateDeleteOnly)
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
-	case model.StateDeleteOnly:
-		// delete only -> reorganization
-		job.SchemaState = model.StateDeleteReorganization
-		indexInfo.State = model.StateDeleteReorganization
-		updateHiddenColumns(tblInfo, indexInfo, model.StateDeleteReorganization)
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
-	case model.StateDeleteReorganization:
-		// reorganization -> absent
+
 		newIndices := make([]*model.IndexInfo, 0, len(tblInfo.Indices))
 		for _, idx := range tblInfo.Indices {
 			if idx.Name.L != indexInfo.Name.L {
@@ -635,6 +666,11 @@ func onDropIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 		dropIndexColumnFlag(tblInfo, indexInfo)
 
 		tblInfo.Columns = tblInfo.Columns[:len(tblInfo.Columns)-len(dependentHiddenCols)]
+		failpoint.Inject("mockExceedErrorLimit", func(val failpoint.Value) {
+			if val.(bool) {
+				panic("panic test in cancelling add index")
+			}
+		})
 
 		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != model.StateNone)
 		if err != nil {
@@ -684,21 +720,191 @@ func checkDropIndex(t *meta.Meta, job *model.Job) (*model.TableInfo, *model.Inde
 	}
 
 	// Check that drop primary index will not cause invisible implicit primary index.
-	newIndices := make([]*model.IndexInfo, 0, len(tblInfo.Indices))
-	for _, idx := range tblInfo.Indices {
-		if idx.Name.L != indexInfo.Name.L {
-			newIndices = append(newIndices, idx)
-		}
-	}
-	newTbl := tblInfo.Clone()
-	newTbl.Indices = newIndices
-	err = checkInvisibleIndexOnPK(newTbl)
-	if err != nil {
-		job.State = model.JobStateCancelled
+	if err := checkInvisibleIndexesOnPK(tblInfo, []*model.IndexInfo{indexInfo}, job); err != nil {
 		return nil, nil, errors.Trace(err)
 	}
 
 	return tblInfo, indexInfo, nil
+}
+
+func onDropIndexes(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	tblInfo, indexNames, ifExists, err := getSchemaInfos(t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	indexInfos, err := checkDropIndexes(tblInfo, job, indexNames, ifExists)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	if len(indexInfos) == 0 {
+		job.State = model.JobStateCancelled
+		return ver, nil
+	}
+
+	dependentHiddenCols := make([]*model.ColumnInfo, 0)
+	for _, indexInfo := range indexInfos {
+		for _, indexColumn := range indexInfo.Columns {
+			if tblInfo.Columns[indexColumn.Offset].Hidden {
+				dependentHiddenCols = append(dependentHiddenCols, tblInfo.Columns[indexColumn.Offset])
+			}
+		}
+	}
+
+	originalState := indexInfos[0].State
+	switch indexInfos[0].State {
+	case model.StatePublic:
+		// public -> write only
+		setIndicesState(indexInfos, model.StateWriteOnly)
+		setColumnsState(dependentHiddenCols, model.StateWriteOnly)
+		for _, colInfo := range dependentHiddenCols {
+			adjustColumnInfoInDropColumn(tblInfo, colInfo.Offset)
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateWriteOnly
+	case model.StateWriteOnly:
+		// write only -> delete only
+		setIndicesState(indexInfos, model.StateDeleteOnly)
+		setColumnsState(dependentHiddenCols, model.StateDeleteOnly)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateDeleteOnly
+	case model.StateDeleteOnly:
+		// delete only -> reorganization
+		setIndicesState(indexInfos, model.StateDeleteReorganization)
+		setColumnsState(dependentHiddenCols, model.StateDeleteReorganization)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		job.SchemaState = model.StateDeleteReorganization
+	case model.StateDeleteReorganization:
+		// reorganization -> absent
+		indexIDs := make([]int64, 0, len(indexInfos))
+		indexNames := make(map[string]bool, len(indexInfos))
+		for _, indexInfo := range indexInfos {
+			indexNames[indexInfo.Name.L] = true
+			indexIDs = append(indexIDs, indexInfo.ID)
+		}
+
+		newIndices := make([]*model.IndexInfo, 0, len(tblInfo.Indices))
+		for _, idx := range tblInfo.Indices {
+			if _, ok := indexNames[idx.Name.L]; !ok {
+				newIndices = append(newIndices, idx)
+			}
+		}
+		tblInfo.Indices = newIndices
+
+		// Set column index flag.
+		for _, indexInfo := range indexInfos {
+			dropIndexColumnFlag(tblInfo, indexInfo)
+		}
+
+		tblInfo.Columns = tblInfo.Columns[:len(tblInfo.Columns)-len(dependentHiddenCols)]
+
+		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != model.StateNone)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+
+		job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
+		job.Args = append(job.Args, indexIDs, getPartitionIDs(tblInfo))
+	default:
+		err = ErrInvalidDDLState.GenWithStackByArgs("index", indexInfos[0].State)
+	}
+
+	return ver, errors.Trace(err)
+}
+
+func getSchemaInfos(t *meta.Meta, job *model.Job) (*model.TableInfo, []model.CIStr, []bool, error) {
+	schemaID := job.SchemaID
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
+	if err != nil {
+		return nil, nil, nil, errors.Trace(err)
+	}
+
+	var indexNames []model.CIStr
+	var ifExists []bool
+	if err = job.DecodeArgs(&indexNames, &ifExists); err != nil {
+		return nil, nil, nil, errors.Trace(err)
+	}
+
+	return tblInfo, indexNames, ifExists, nil
+}
+
+func checkDropIndexes(tblInfo *model.TableInfo, job *model.Job, indexNames []model.CIStr, ifExists []bool) ([]*model.IndexInfo, error) {
+	var warnings []*errors.Error
+	indexInfos := make([]*model.IndexInfo, 0, len(indexNames))
+	UniqueIndexNames := make(map[model.CIStr]bool, len(indexNames))
+	for i, indexName := range indexNames {
+		// Double check the index is exists.
+		indexInfo := tblInfo.FindIndexByName(indexName.L)
+		if indexInfo == nil {
+			if ifExists[i] {
+				warnings = append(warnings, toTError(ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)))
+				continue
+			}
+			job.State = model.JobStateCancelled
+			return nil, ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)
+		}
+
+		// Double check for drop index on auto_increment column.
+		if err := checkDropIndexOnAutoIncrementColumn(tblInfo, indexInfo); err != nil {
+			job.State = model.JobStateCancelled
+			return nil, autoid.ErrWrongAutoKey
+		}
+
+		// Check for dropping duplicate indexes.
+		if UniqueIndexNames[indexName] {
+			if !ifExists[i] {
+				job.State = model.JobStateCancelled
+				return nil, ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)
+			}
+			warnings = append(warnings, toTError(ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)))
+		}
+		UniqueIndexNames[indexName] = true
+
+		indexInfos = append(indexInfos, indexInfo)
+	}
+
+	// Check that drop primary index will not cause invisible implicit primary index.
+	if err := checkInvisibleIndexesOnPK(tblInfo, indexInfos, job); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	job.MultiSchemaInfo = &model.MultiSchemaInfo{Warnings: warnings}
+
+	return indexInfos, nil
+}
+
+func checkInvisibleIndexesOnPK(tblInfo *model.TableInfo, indexInfos []*model.IndexInfo, job *model.Job) error {
+	newIndices := make([]*model.IndexInfo, 0, len(tblInfo.Indices))
+	for _, oidx := range tblInfo.Indices {
+		needAppend := true
+		for _, idx := range indexInfos {
+			if idx.Name.L == oidx.Name.L {
+				needAppend = false
+				break
+			}
+		}
+		if needAppend {
+			newIndices = append(newIndices, oidx)
+		}
+	}
+	newTbl := tblInfo.Clone()
+	newTbl.Indices = newIndices
+	if err := checkInvisibleIndexOnPK(newTbl); err != nil {
+		job.State = model.JobStateCancelled
+		return err
+	}
+
+	return nil
 }
 
 func checkDropIndexOnAutoIncrementColumn(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) error {
@@ -786,52 +992,84 @@ type indexRecord struct {
 	handle kv.Handle
 	key    []byte        // It's used to lock a record. Record it to reduce the encoding time.
 	vals   []types.Datum // It's the index values.
+	rsData []types.Datum // It's the restored data for handle.
 	skip   bool          // skip indicates that the index key is already exists, we should not add it.
 }
 
-type addIndexWorker struct {
+type baseIndexWorker struct {
 	*backfillWorker
-	index         table.Index
+	indexes []table.Index
+
 	metricCounter prometheus.Counter
 
 	// The following attributes are used to reduce memory allocation.
-	defaultVals        []types.Datum
-	idxRecords         []*indexRecord
-	rowMap             map[int64]types.Datum
-	rowDecoder         *decoder.RowDecoder
+	defaultVals []types.Datum
+	idxRecords  []*indexRecord
+	rowMap      map[int64]types.Datum
+	rowDecoder  *decoder.RowDecoder
+
+	sqlMode mysql.SQLMode
+}
+
+type addIndexWorker struct {
+	baseIndexWorker
+	index table.Index
+
+	// The following attributes are used to reduce memory allocation.
 	idxKeyBufs         [][]byte
 	batchCheckKeys     []kv.Key
 	distinctCheckFlags []bool
 }
 
-func newAddIndexWorker(sessCtx sessionctx.Context, worker *worker, id int, t table.PhysicalTable, indexInfo *model.IndexInfo, decodeColMap map[int64]decoder.Column) *addIndexWorker {
+func newAddIndexWorker(sessCtx sessionctx.Context, worker *worker, id int, t table.PhysicalTable, indexInfo *model.IndexInfo, decodeColMap map[int64]decoder.Column, sqlMode mysql.SQLMode) *addIndexWorker {
 	index := tables.NewIndex(t.GetPhysicalID(), t.Meta(), indexInfo)
 	rowDecoder := decoder.NewRowDecoder(t, t.WritableCols(), decodeColMap)
 	return &addIndexWorker{
-		backfillWorker: newBackfillWorker(sessCtx, worker, id, t),
-		index:          index,
-		metricCounter:  metrics.BackfillTotalCounter.WithLabelValues("add_idx_speed"),
-		rowDecoder:     rowDecoder,
-		defaultVals:    make([]types.Datum, len(t.WritableCols())),
-		rowMap:         make(map[int64]types.Datum, len(decodeColMap)),
+		baseIndexWorker: baseIndexWorker{
+			backfillWorker: newBackfillWorker(sessCtx, worker, id, t),
+			indexes:        []table.Index{index},
+			rowDecoder:     rowDecoder,
+			defaultVals:    make([]types.Datum, len(t.WritableCols())),
+			rowMap:         make(map[int64]types.Datum, len(decodeColMap)),
+			metricCounter:  metrics.BackfillTotalCounter.WithLabelValues("add_idx_speed"),
+			sqlMode:        sqlMode,
+		},
+		index: index,
 	}
 }
 
-func (w *addIndexWorker) AddMetricInfo(cnt float64) {
+func (w *baseIndexWorker) AddMetricInfo(cnt float64) {
 	w.metricCounter.Add(cnt)
 }
 
-// getIndexRecord gets index columns values from raw binary value row.
-func (w *addIndexWorker) getIndexRecord(handle kv.Handle, recordKey []byte, rawRecord []byte) (*indexRecord, error) {
-	t := w.table
-	cols := t.WritableCols()
-	idxInfo := w.index.Meta()
+// mockNotOwnerErrOnce uses to make sure `notOwnerErr` only mock error once.
+var mockNotOwnerErrOnce uint32
+
+// getIndexRecord gets index columns values use w.rowDecoder, and generate indexRecord.
+func (w *baseIndexWorker) getIndexRecord(idxInfo *model.IndexInfo, handle kv.Handle, recordKey []byte) (*indexRecord, error) {
+	cols := w.table.WritableCols()
 	sysZone := timeutil.SystemLocation()
-	_, err := w.rowDecoder.DecodeAndEvalRowWithMap(w.sessCtx, handle, rawRecord, time.UTC, sysZone, w.rowMap)
-	if err != nil {
-		return nil, errors.Trace(errCantDecodeRecord.GenWithStackByArgs("index", err))
-	}
+	failpoint.Inject("MockGetIndexRecordErr", func(val failpoint.Value) {
+		if valStr, ok := val.(string); ok {
+			switch valStr {
+			case "cantDecodeRecordErr":
+				failpoint.Return(nil, errors.Trace(errCantDecodeRecord.GenWithStackByArgs("index",
+					errors.New("mock can't decode record error"))))
+			case "modifyColumnNotOwnerErr":
+				if idxInfo.Name.O == "_Idx$_idx" && handle.IntValue() == 7168 && atomic.CompareAndSwapUint32(&mockNotOwnerErrOnce, 0, 1) {
+					failpoint.Return(nil, errors.Trace(errNotOwner))
+				}
+			case "addIdxNotOwnerErr":
+				// For the case of the old TiDB version(do not exist the element information) is upgraded to the new TiDB version.
+				// First step, we need to exit "addPhysicalTableIndex".
+				if idxInfo.Name.O == "idx2" && handle.IntValue() == 6144 && atomic.CompareAndSwapUint32(&mockNotOwnerErrOnce, 1, 2) {
+					failpoint.Return(nil, errors.Trace(errNotOwner))
+				}
+			}
+		}
+	})
 	idxVal := make([]types.Datum, len(idxInfo.Columns))
+	var err error
 	for j, v := range idxInfo.Columns {
 		col := cols[v.Offset]
 		idxColumnVal, ok := w.rowMap[col.ID]
@@ -856,74 +1094,81 @@ func (w *addIndexWorker) getIndexRecord(handle kv.Handle, recordKey []byte, rawR
 		}
 		idxVal[j] = idxColumnVal
 	}
-	// If there are generated column, rowDecoder will use column value that not in idxInfo.Columns to calculate
-	// the generated value, so we need to clear up the reusing map.
-	w.cleanRowMap()
-	idxRecord := &indexRecord{handle: handle, key: recordKey, vals: idxVal}
+
+	rsData := tables.TryGetHandleRestoredDataWrapper(w.table, nil, w.rowMap, idxInfo)
+	idxRecord := &indexRecord{handle: handle, key: recordKey, vals: idxVal, rsData: rsData}
 	return idxRecord, nil
 }
 
-func (w *addIndexWorker) cleanRowMap() {
+func (w *baseIndexWorker) cleanRowMap() {
 	for id := range w.rowMap {
 		delete(w.rowMap, id)
 	}
 }
 
-// getNextHandle gets next handle of entry that we are going to process.
-func (w *addIndexWorker) getNextHandle(taskRange reorgBackfillTask, taskDone bool) (nextHandle kv.Handle) {
+// getNextKey gets next key of entry that we are going to process.
+func (w *baseIndexWorker) getNextKey(taskRange reorgBackfillTask, taskDone bool) (nextKey kv.Key) {
 	if !taskDone {
 		// The task is not done. So we need to pick the last processed entry's handle and add one.
-		return w.idxRecords[len(w.idxRecords)-1].handle.Next()
+		lastHandle := w.idxRecords[len(w.idxRecords)-1].handle
+		recordKey := tablecodec.EncodeRecordKey(w.table.RecordPrefix(), lastHandle)
+		return recordKey.Next()
 	}
-
-	// The task is done. So we need to choose a handle outside this range.
-	// Some corner cases should be considered:
-	// - The end of task range is MaxInt64.
-	// - The end of the task is excluded in the range.
-	if (taskRange.endHandle.IsInt() && taskRange.endHandle.IntValue() == math.MaxInt64) || !taskRange.endIncluded {
-		return taskRange.endHandle
-	}
-
-	return taskRange.endHandle.Next()
+	return taskRange.endKey.Next()
 }
 
-// fetchRowColVals fetch w.batchCnt count rows that need to backfill indices, and build the corresponding indexRecord slice.
+func (w *baseIndexWorker) updateRowDecoder(handle kv.Handle, recordKey []byte, rawRecord []byte) error {
+	sysZone := timeutil.SystemLocation()
+	_, err := w.rowDecoder.DecodeAndEvalRowWithMap(w.sessCtx, handle, rawRecord, time.UTC, sysZone, w.rowMap)
+	if err != nil {
+		return errors.Trace(errCantDecodeRecord.GenWithStackByArgs("index", err))
+	}
+	return nil
+}
+
+// fetchRowColVals fetch w.batchCnt count records that need to reorganize indices, and build the corresponding indexRecord slice.
 // fetchRowColVals returns:
 // 1. The corresponding indexRecord slice.
 // 2. Next handle of entry that we need to process.
 // 3. Boolean indicates whether the task is done.
 // 4. error occurs in fetchRowColVals. nil if no error occurs.
-func (w *addIndexWorker) fetchRowColVals(txn kv.Transaction, taskRange reorgBackfillTask) ([]*indexRecord, kv.Handle, bool, error) {
+func (w *baseIndexWorker) fetchRowColVals(txn kv.Transaction, taskRange reorgBackfillTask) ([]*indexRecord, kv.Key, bool, error) {
 	// TODO: use tableScan to prune columns.
 	w.idxRecords = w.idxRecords[:0]
 	startTime := time.Now()
 
-	// taskDone means that the added handle is out of taskRange.endHandle.
+	// taskDone means that the reorged handle is out of taskRange.endHandle.
 	taskDone := false
 	oprStartTime := startTime
-	err := iterateSnapshotRows(w.sessCtx.GetStore(), w.priority, w.table, txn.StartTS(), taskRange.startHandle, taskRange.endHandle, taskRange.endIncluded,
+	err := iterateSnapshotRows(w.sessCtx.GetStore(), w.priority, w.table, txn.StartTS(), taskRange.startKey, taskRange.endKey,
 		func(handle kv.Handle, recordKey kv.Key, rawRow []byte) (bool, error) {
 			oprEndTime := time.Now()
-			logSlowOperations(oprEndTime.Sub(oprStartTime), "iterateSnapshotRows in addIndexWorker fetchRowColVals", 0)
+			logSlowOperations(oprEndTime.Sub(oprStartTime), "iterateSnapshotRows in baseIndexWorker fetchRowColVals", 0)
 			oprStartTime = oprEndTime
 
-			if !taskRange.endIncluded {
-				taskDone = handle.Compare(taskRange.endHandle) >= 0
-			} else {
-				taskDone = handle.Compare(taskRange.endHandle) > 0
-			}
+			taskDone = recordKey.Cmp(taskRange.endKey) > 0
 
 			if taskDone || len(w.idxRecords) >= w.batchCnt {
 				return false, nil
 			}
 
-			idxRecord, err1 := w.getIndexRecord(handle, recordKey, rawRow)
-			if err1 != nil {
-				return false, errors.Trace(err1)
+			// Decode one row, generate records of this row.
+			err := w.updateRowDecoder(handle, recordKey, rawRow)
+			if err != nil {
+				return false, err
 			}
+			for _, index := range w.indexes {
+				idxRecord, err1 := w.getIndexRecord(index.Meta(), handle, recordKey)
+				if err1 != nil {
+					return false, errors.Trace(err1)
+				}
+				w.idxRecords = append(w.idxRecords, idxRecord)
+			}
+			// If there are generated column, rowDecoder will use column value that not in idxInfo.Columns to calculate
+			// the generated value, so we need to clear up the reusing map.
+			w.cleanRowMap()
 
-			w.idxRecords = append(w.idxRecords, idxRecord)
-			if handle.Equal(taskRange.endHandle) {
+			if recordKey.Cmp(taskRange.endKey) == 0 {
 				// If taskRange.endIncluded == false, we will not reach here when handle == taskRange.endHandle
 				taskDone = true
 				return false, nil
@@ -935,8 +1180,9 @@ func (w *addIndexWorker) fetchRowColVals(txn kv.Transaction, taskRange reorgBack
 		taskDone = true
 	}
 
-	logutil.BgLogger().Debug("[ddl] txn fetches handle info", zap.Uint64("txnStartTS", txn.StartTS()), zap.String("taskRange", taskRange.String()), zap.Duration("takeTime", time.Since(startTime)))
-	return w.idxRecords, w.getNextHandle(taskRange, taskDone), taskDone, errors.Trace(err)
+	logutil.BgLogger().Debug("[ddl] txn fetches handle info", zap.Uint64("txnStartTS", txn.StartTS()),
+		zap.String("taskRange", taskRange.String()), zap.Duration("takeTime", time.Since(startTime)))
+	return w.idxRecords, w.getNextKey(taskRange, taskDone), taskDone, errors.Trace(err)
 }
 
 func (w *addIndexWorker) initBatchCheckBufs(batchCount int) {
@@ -946,6 +1192,39 @@ func (w *addIndexWorker) initBatchCheckBufs(batchCount int) {
 
 	w.batchCheckKeys = w.batchCheckKeys[:0]
 	w.distinctCheckFlags = w.distinctCheckFlags[:0]
+}
+
+func (w *addIndexWorker) checkHandleExists(key kv.Key, value []byte, handle kv.Handle) error {
+	idxInfo := w.index.Meta()
+	tblInfo := w.table.Meta()
+	idxColLen := len(idxInfo.Columns)
+	h, err := tablecodec.DecodeIndexHandle(key, value, idxColLen)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	hasBeenBackFilled := h.Equal(handle)
+	if hasBeenBackFilled {
+		return nil
+	}
+	colInfos := tables.BuildRowcodecColInfoForIndexColumns(idxInfo, tblInfo)
+	values, err := tablecodec.DecodeIndexKV(key, value, idxColLen, tablecodec.HandleNotNeeded, colInfos)
+	if err != nil {
+		return err
+	}
+	indexName := w.index.Meta().Name.String()
+	valueStr := make([]string, 0, idxColLen)
+	for i, val := range values[:idxColLen] {
+		d, err := tablecodec.DecodeColumnValue(val, colInfos[i].Ft, time.Local)
+		if err != nil {
+			return kv.ErrKeyExists.FastGenByArgs(key.String(), indexName)
+		}
+		str, err := d.ToString()
+		if err != nil {
+			str = string(val)
+		}
+		valueStr = append(valueStr, str)
+	}
+	return kv.ErrKeyExists.FastGenByArgs(strings.Join(valueStr, "-"), indexName)
 }
 
 func (w *addIndexWorker) batchCheckUniqueKey(txn kv.Transaction, idxRecords []*indexRecord) error {
@@ -981,22 +1260,20 @@ func (w *addIndexWorker) batchCheckUniqueKey(txn kv.Transaction, idxRecords []*i
 	for i, key := range w.batchCheckKeys {
 		if val, found := batchVals[string(key)]; found {
 			if w.distinctCheckFlags[i] {
-				handle, err1 := tablecodec.DecodeHandleInUniqueIndexValue(val, w.table.Meta().IsCommonHandle)
-				if err1 != nil {
-					return errors.Trace(err1)
-				}
-
-				if handle != idxRecords[i].handle {
-					return errors.Trace(kv.ErrKeyExists)
+				if err := w.checkHandleExists(key, val, idxRecords[i].handle); err != nil {
+					return errors.Trace(err)
 				}
 			}
 			idxRecords[i].skip = true
-		} else {
+		} else if w.distinctCheckFlags[i] {
 			// The keys in w.batchCheckKeys also maybe duplicate,
 			// so we need to backfill the not found key into `batchVals` map.
-			if w.distinctCheckFlags[i] {
-				batchVals[string(key)] = tablecodec.EncodeHandleInUniqueIndexValue(idxRecords[i].handle, false)
+			needRsData := tables.NeedRestoredData(w.index.Meta().Columns, w.table.Meta().Columns)
+			val, err := tablecodec.GenIndexValuePortal(stmtCtx, w.table.Meta(), w.index.Meta(), needRsData, w.distinctCheckFlags[i], false, idxRecords[i].vals, idxRecords[i].handle, 0, idxRecords[i].rsData)
+			if err != nil {
+				return errors.Trace(err)
 			}
+			batchVals[string(key)] = val
 		}
 	}
 	// Constrains is already checked.
@@ -1007,7 +1284,6 @@ func (w *addIndexWorker) batchCheckUniqueKey(txn kv.Transaction, idxRecords []*i
 // BackfillDataInTxn will backfill table index in a transaction, lock corresponding rowKey, if the value of rowKey is changed,
 // indicate that index columns values may changed, index is not allowed to be added, so the txn will rollback and retry.
 // BackfillDataInTxn will add w.batchCnt indices once, default value of w.batchCnt is 128.
-// TODO: make w.batchCnt can be modified by system variable.
 func (w *addIndexWorker) BackfillDataInTxn(handleRange reorgBackfillTask) (taskCtx backfillTaskContext, errInTxn error) {
 	failpoint.Inject("errorMockPanic", func(val failpoint.Value) {
 		if val.(bool) {
@@ -1016,16 +1292,16 @@ func (w *addIndexWorker) BackfillDataInTxn(handleRange reorgBackfillTask) (taskC
 	})
 
 	oprStartTime := time.Now()
-	errInTxn = kv.RunInNewTxn(w.sessCtx.GetStore(), true, func(txn kv.Transaction) error {
+	errInTxn = kv.RunInNewTxn(context.Background(), w.sessCtx.GetStore(), true, func(ctx context.Context, txn kv.Transaction) error {
 		taskCtx.addedCount = 0
 		taskCtx.scanCount = 0
 		txn.SetOption(kv.Priority, w.priority)
 
-		idxRecords, nextHandle, taskDone, err := w.fetchRowColVals(txn, handleRange)
+		idxRecords, nextKey, taskDone, err := w.fetchRowColVals(txn, handleRange)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		taskCtx.nextHandle = nextHandle
+		taskCtx.nextKey = nextKey
 		taskCtx.done = taskDone
 
 		err = w.batchCheckUniqueKey(txn, idxRecords)
@@ -1049,7 +1325,7 @@ func (w *addIndexWorker) BackfillDataInTxn(handleRange reorgBackfillTask) (taskC
 			}
 
 			// Create the index.
-			handle, err := w.index.Create(w.sessCtx, txn.GetUnionStore(), idxRecord.vals, idxRecord.handle)
+			handle, err := w.index.Create(w.sessCtx, txn, idxRecord.vals, idxRecord.handle, idxRecord.rsData)
 			if err != nil {
 				if kv.ErrKeyExists.Equal(err) && idxRecord.handle.Equal(handle) {
 					// Index already exists, skip it.
@@ -1070,7 +1346,7 @@ func (w *addIndexWorker) BackfillDataInTxn(handleRange reorgBackfillTask) (taskC
 
 func (w *worker) addPhysicalTableIndex(t table.PhysicalTable, indexInfo *model.IndexInfo, reorgInfo *reorgInfo) error {
 	logutil.BgLogger().Info("[ddl] start to add table index", zap.String("job", reorgInfo.Job.String()), zap.String("reorgInfo", reorgInfo.String()))
-	return w.writePhysicalTableRecord(t.(table.PhysicalTable), typeAddIndexWorker, indexInfo, nil, nil, reorgInfo)
+	return w.writePhysicalTableRecord(t, typeAddIndexWorker, indexInfo, nil, nil, reorgInfo)
 }
 
 // addTableIndex handles the add index reorganization state for a table.
@@ -1120,10 +1396,9 @@ func (w *worker) updateReorgInfo(t table.PartitionedTable, reorg *reorgInfo) (bo
 
 	failpoint.Inject("mockUpdateCachedSafePoint", func(val failpoint.Value) {
 		if val.(bool) {
-			// 18 is for the logical time.
-			ts := oracle.GetPhysical(time.Now()) << 18
+			ts := oracle.GoTimeToTS(time.Now())
 			s := reorg.d.store.(tikv.Storage)
-			s.UpdateSPCache(uint64(ts), time.Now())
+			s.UpdateSPCache(ts, time.Now())
 			time.Sleep(time.Millisecond * 3)
 		}
 	})
@@ -1135,15 +1410,17 @@ func (w *worker) updateReorgInfo(t table.PartitionedTable, reorg *reorgInfo) (bo
 	if err != nil {
 		return false, errors.Trace(err)
 	}
-	reorg.StartHandle, reorg.EndHandle, reorg.PhysicalTableID = start, end, pid
+	reorg.StartKey, reorg.EndKey, reorg.PhysicalTableID = start, end, pid
 
 	// Write the reorg info to store so the whole reorganize process can recover from panic.
-	err = kv.RunInNewTxn(reorg.d.store, true, func(txn kv.Transaction) error {
-		return errors.Trace(reorg.UpdateReorgMeta(txn, reorg.StartHandle, reorg.EndHandle, reorg.PhysicalTableID))
-	})
-	logutil.BgLogger().Info("[ddl] job update reorgInfo", zap.Int64("jobID", reorg.Job.ID),
-		zap.Int64("partitionTableID", pid), zap.String("startHandle", toString(start)),
-		zap.String("endHandle", toString(end)), zap.Error(err))
+	err = reorg.UpdateReorgMeta(start)
+	logutil.BgLogger().Info("[ddl] job update reorgInfo",
+		zap.Int64("jobID", reorg.Job.ID),
+		zap.ByteString("elementType", reorg.currElement.TypeKey),
+		zap.Int64("elementID", reorg.currElement.ID),
+		zap.Int64("partitionTableID", pid),
+		zap.String("startHandle", tryDecodeToHandleString(start)),
+		zap.String("endHandle", tryDecodeToHandleString(end)), zap.Error(err))
 	return false, errors.Trace(err)
 }
 
@@ -1191,6 +1468,138 @@ func indexColumnSliceEqual(a, b []*model.IndexColumn) bool {
 		}
 	}
 	return true
+}
+
+type cleanUpIndexWorker struct {
+	baseIndexWorker
+}
+
+func newCleanUpIndexWorker(sessCtx sessionctx.Context, worker *worker, id int, t table.PhysicalTable, decodeColMap map[int64]decoder.Column, sqlMode mysql.SQLMode) *cleanUpIndexWorker {
+	indexes := make([]table.Index, 0, len(t.Indices()))
+	rowDecoder := decoder.NewRowDecoder(t, t.WritableCols(), decodeColMap)
+	for _, index := range t.Indices() {
+		if index.Meta().Global {
+			indexes = append(indexes, index)
+		}
+	}
+	return &cleanUpIndexWorker{
+		baseIndexWorker: baseIndexWorker{
+			backfillWorker: newBackfillWorker(sessCtx, worker, id, t),
+			indexes:        indexes,
+			rowDecoder:     rowDecoder,
+			defaultVals:    make([]types.Datum, len(t.WritableCols())),
+			rowMap:         make(map[int64]types.Datum, len(decodeColMap)),
+			metricCounter:  metrics.BackfillTotalCounter.WithLabelValues("clean_up_idx_speed"),
+			sqlMode:        sqlMode,
+		},
+	}
+}
+
+func (w *cleanUpIndexWorker) BackfillDataInTxn(handleRange reorgBackfillTask) (taskCtx backfillTaskContext, errInTxn error) {
+	failpoint.Inject("errorMockPanic", func(val failpoint.Value) {
+		if val.(bool) {
+			panic("panic test")
+		}
+	})
+
+	oprStartTime := time.Now()
+	errInTxn = kv.RunInNewTxn(context.Background(), w.sessCtx.GetStore(), true, func(ctx context.Context, txn kv.Transaction) error {
+		taskCtx.addedCount = 0
+		taskCtx.scanCount = 0
+		txn.SetOption(kv.Priority, w.priority)
+
+		idxRecords, nextKey, taskDone, err := w.fetchRowColVals(txn, handleRange)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		taskCtx.nextKey = nextKey
+		taskCtx.done = taskDone
+
+		txn.SetDiskFullOpt(kvrpcpb.DiskFullOpt_AllowedOnAlmostFull)
+
+		n := len(w.indexes)
+		for i, idxRecord := range idxRecords {
+			taskCtx.scanCount++
+			// we fetch records row by row, so records will belong to
+			// index[0], index[1] ... index[n-1], index[0], index[1] ...
+			// respectively. So indexes[i%n] is the index of idxRecords[i].
+			err := w.indexes[i%n].Delete(w.sessCtx.GetSessionVars().StmtCtx, txn, idxRecord.vals, idxRecord.handle)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			taskCtx.addedCount++
+		}
+		return nil
+	})
+	logSlowOperations(time.Since(oprStartTime), "cleanUpIndexBackfillDataInTxn", 3000)
+
+	return
+}
+
+// cleanupPhysicalTableIndex handles the drop partition reorganization state for a non-partitioned table or a partition.
+func (w *worker) cleanupPhysicalTableIndex(t table.PhysicalTable, reorgInfo *reorgInfo) error {
+	logutil.BgLogger().Info("[ddl] start to clean up index", zap.String("job", reorgInfo.Job.String()), zap.String("reorgInfo", reorgInfo.String()))
+	return w.writePhysicalTableRecord(t, typeCleanUpIndexWorker, nil, nil, nil, reorgInfo)
+}
+
+// cleanupGlobalIndex handles the drop partition reorganization state to clean up index entries of partitions.
+func (w *worker) cleanupGlobalIndexes(tbl table.PartitionedTable, partitionIDs []int64, reorgInfo *reorgInfo) error {
+	var err error
+	var finish bool
+	for !finish {
+		p := tbl.GetPartition(reorgInfo.PhysicalTableID)
+		if p == nil {
+			return errCancelledDDLJob.GenWithStack("Can not find partition id %d for table %d", reorgInfo.PhysicalTableID, tbl.Meta().ID)
+		}
+		err = w.cleanupPhysicalTableIndex(p, reorgInfo)
+		if err != nil {
+			break
+		}
+		finish, err = w.updateReorgInfoForPartitions(tbl, reorgInfo, partitionIDs)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	return errors.Trace(err)
+}
+
+// updateReorgInfoForPartitions will find the next partition in partitionIDs according to current reorgInfo.
+// If no more partitions, or table t is not a partitioned table, returns true to
+// indicate that the reorganize work is finished.
+func (w *worker) updateReorgInfoForPartitions(t table.PartitionedTable, reorg *reorgInfo, partitionIDs []int64) (bool, error) {
+	pi := t.Meta().GetPartitionInfo()
+	if pi == nil {
+		return true, nil
+	}
+
+	var pid int64
+	for i, pi := range partitionIDs {
+		if pi == reorg.PhysicalTableID {
+			if i == len(partitionIDs)-1 {
+				return true, nil
+			}
+		}
+		pid = partitionIDs[i+1]
+	}
+
+	currentVer, err := getValidCurrentVersion(reorg.d.store)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	start, end, err := getTableRange(reorg.d, t.GetPartition(pid), currentVer.Ver, reorg.Job.Priority)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	reorg.StartKey, reorg.EndKey, reorg.PhysicalTableID = start, end, pid
+
+	// Write the reorg info to store so the whole reorganize process can recover from panic.
+	err = reorg.UpdateReorgMeta(reorg.StartKey)
+	logutil.BgLogger().Info("[ddl] job update reorgInfo", zap.Int64("jobID", reorg.Job.ID),
+		zap.ByteString("elementType", reorg.currElement.TypeKey), zap.Int64("elementID", reorg.currElement.ID),
+		zap.Int64("partitionTableID", pid), zap.String("startHandle", tryDecodeToHandleString(start)),
+		zap.String("endHandle", tryDecodeToHandleString(end)), zap.Error(err))
+	return false, errors.Trace(err)
 }
 
 func findIndexesByColName(indexes []*model.IndexInfo, colName string) ([]*model.IndexInfo, []int) {

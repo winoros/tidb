@@ -8,9 +8,11 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build ignore
 // +build ignore
 
 package main
@@ -18,8 +20,8 @@ package main
 import (
 	"bytes"
 	"go/format"
-	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"text/template"
 
@@ -38,6 +40,7 @@ var addOrSubTime = template.Must(template.New("").Parse(`
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -46,8 +49,8 @@ var addOrSubTime = template.Must(template.New("").Parse(`
 package expression
 
 import (
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 )
@@ -93,7 +96,7 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 	}
 	buf0 := result
 {{ else }}
-	buf0, err := b.bufAllocator.get(types.ET{{.TypeA.ETName}}, n)
+	buf0, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -114,7 +117,7 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 	}
 {{ end }}
 
-	buf1, err := b.bufAllocator.get(types.ET{{.TypeB.ETName}}, n)
+	buf1, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -182,7 +185,7 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 		if err != nil {
 			return err
 		}
-		
+
 	{{ else if or (eq .SigName "builtinAddDatetimeAndStringSig") (eq .SigName "builtinSubDatetimeAndStringSig") }}
 		{{ if eq $.FuncName "AddTime" }}
 		{{ template "ConvertStringToDuration" . }}
@@ -242,6 +245,7 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 		fsp1 := int8(b.args[1].GetType().Decimal)
 		arg1Duration := types.Duration{Duration: arg1, Fsp: fsp1}
 		var output string
+		var isNull bool
 		if isDuration(arg0) {
 			{{ if eq $.FuncName "AddTime" }}
 			output, err = strDurationAddDuration(sc, arg0, arg1Duration)
@@ -258,17 +262,23 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 			}
 		} else {
 			{{ if eq $.FuncName "AddTime" }}
-			output, err = strDatetimeAddDuration(sc, arg0, arg1Duration)
+			output, isNull, err = strDatetimeAddDuration(sc, arg0, arg1Duration)
 			{{ else }}
-			output, err = strDatetimeSubDuration(sc, arg0, arg1Duration)
+			output, isNull, err = strDatetimeSubDuration(sc, arg0, arg1Duration)
 			{{ end }}
 			if err != nil {
 				return err
+			}
+			if isNull {
+				sc.AppendWarning(err)
+				{{ template "SetNull" . }}
+				continue
 			}
 		}
 	{{ else if or (eq .SigName "builtinAddStringAndStringSig") (eq .SigName "builtinSubStringAndStringSig") }}
 		{{ template "ConvertStringToDuration" . }}
 		var output string
+		var isNull bool
 		if isDuration(arg0) {
 			{{ if eq $.FuncName "AddTime" }}
 			output, err = strDurationAddDuration(sc, arg0, arg1Duration)
@@ -285,12 +295,17 @@ func (b *{{.SigName}}) vecEval{{ .Output.TypeName }}(input *chunk.Chunk, result 
 			}
 		} else {
 			{{ if eq $.FuncName "AddTime" }}
-			output, err = strDatetimeAddDuration(sc, arg0, arg1Duration)
+			output, isNull, err = strDatetimeAddDuration(sc, arg0, arg1Duration)
 			{{ else }}
-			output, err = strDatetimeSubDuration(sc, arg0, arg1Duration)
+			output, isNull, err = strDatetimeSubDuration(sc, arg0, arg1Duration)
 			{{ end }}
 			if err != nil {
 				return err
+			}
+			if isNull {
+				sc.AppendWarning(err)
+				{{ template "SetNull" . }}
+				continue
 			}
 		}
 	{{ else if or (eq .SigName "builtinAddDateAndDurationSig") (eq .SigName "builtinSubDateAndDurationSig") }}
@@ -339,14 +354,14 @@ func (b *{{.SigName}}) vectorized() bool {
 
 var timeDiff = template.Must(template.New("").Parse(`
 {{ define "BufAllocator0" }}
-	buf0, err := b.bufAllocator.get(types.ET{{.TypeA.ETName}}, n)
+	buf0, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
 	defer b.bufAllocator.put(buf0)
 {{ end }}
 {{ define "BufAllocator1" }}
-	buf1, err := b.bufAllocator.get(types.ET{{.TypeB.ETName}}, n)
+	buf1, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -528,7 +543,7 @@ func (b *{{.SigName}}) vecEvalTime(input *chunk.Chunk, result *chunk.Column) err
 		return nil
 	}
 
-	intervalBuf, err := b.bufAllocator.get(types.ETString, n)
+	intervalBuf, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -634,6 +649,7 @@ var testFile = template.Must(template.New("").Funcs(testFileFuncs).Parse(`
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -645,9 +661,8 @@ import (
 	"math"
 	"testing"
 
-	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -782,12 +797,12 @@ var vecBuiltin{{.Category}}GeneratedCases = map[string][]vecExprBenchCase{
 {{ end }}
 }
 
-func (s *testVectorizeSuite1) TestVectorizedBuiltin{{.Category}}EvalOneVecGenerated(c *C) {
-	testVectorizedEvalOneVec(c, vecBuiltin{{.Category}}GeneratedCases)
+func TestVectorizedBuiltin{{.Category}}EvalOneVecGenerated(t *testing.T) {
+	testVectorizedEvalOneVec(t, vecBuiltin{{.Category}}GeneratedCases)
 }
 
-func (s *testVectorizeSuite1) TestVectorizedBuiltin{{.Category}}FuncGenerated(c *C) {
-	testVectorizedBuiltinFunc(c, vecBuiltin{{.Category}}GeneratedCases)
+func TestVectorizedBuiltin{{.Category}}FuncGenerated(t *testing.T) {
+	testVectorizedBuiltinFunc(t, vecBuiltin{{.Category}}GeneratedCases)
 }
 
 func BenchmarkVectorizedBuiltin{{.Category}}EvalOneVecGenerated(b *testing.B) {
@@ -932,7 +947,7 @@ func generateDotGo(fileName string) error {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 func generateTestDotGo(fileName string) error {
@@ -946,7 +961,7 @@ func generateTestDotGo(fileName string) error {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 // generateOneFile generate one xxx.go file and the associated xxx_test.go file.

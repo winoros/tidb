@@ -8,26 +8,27 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package structure
 
 import (
-	"github.com/pingcap/parser/terror"
 	mysql "github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/util/dbterror"
 )
 
 var (
 	// ErrInvalidHashKeyFlag used by structure
-	ErrInvalidHashKeyFlag = terror.ClassStructure.New(mysql.ErrInvalidHashKeyFlag, mysql.MySQLErrName[mysql.ErrInvalidHashKeyFlag])
+	ErrInvalidHashKeyFlag = dbterror.ClassStructure.NewStd(mysql.ErrInvalidHashKeyFlag)
 	// ErrInvalidListIndex used by structure
-	ErrInvalidListIndex = terror.ClassStructure.New(mysql.ErrInvalidListIndex, mysql.MySQLErrName[mysql.ErrInvalidListIndex])
+	ErrInvalidListIndex = dbterror.ClassStructure.NewStd(mysql.ErrInvalidListIndex)
 	// ErrInvalidListMetaData used by structure
-	ErrInvalidListMetaData = terror.ClassStructure.New(mysql.ErrInvalidListMetaData, mysql.MySQLErrName[mysql.ErrInvalidListMetaData])
+	ErrInvalidListMetaData = dbterror.ClassStructure.NewStd(mysql.ErrInvalidListMetaData)
 	// ErrWriteOnSnapshot used by structure
-	ErrWriteOnSnapshot = terror.ClassStructure.New(mysql.ErrWriteOnSnapshot, mysql.MySQLErrName[mysql.ErrWriteOnSnapshot])
+	ErrWriteOnSnapshot = dbterror.ClassStructure.NewStd(mysql.ErrWriteOnSnapshot)
 )
 
 // NewStructure creates a TxStructure with Retriever, RetrieverMutator and key prefix.

@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -29,17 +30,19 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/diagnosticspb"
 	"github.com/pingcap/log"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/sysutil"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/pdapi"
 	"github.com/pingcap/tidb/util/set"
 	"go.uber.org/zap"
@@ -53,9 +56,12 @@ type dummyCloser struct{}
 
 func (dummyCloser) close() error { return nil }
 
+func (dummyCloser) getRuntimeStats() execdetails.RuntimeStats { return nil }
+
 type memTableRetriever interface {
 	retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error)
 	close() error
+	getRuntimeStats() execdetails.RuntimeStats
 }
 
 // MemTableReaderExec executes memTable information retrieving from the MemTable components
@@ -127,6 +133,9 @@ func (e *MemTableReaderExec) Next(ctx context.Context, req *chunk.Chunk) error {
 
 // Close implements the Executor Close interface.
 func (e *MemTableReaderExec) Close() error {
+	if stats := e.retriever.getRuntimeStats(); stats != nil && e.runtimeStats != nil {
+		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id, stats)
+	}
 	return e.retriever.close()
 }
 
@@ -150,6 +159,9 @@ func fetchClusterConfig(sctx sessionctx.Context, nodeTypes, nodeAddrs set.String
 		idx  int
 		rows [][]types.Datum
 		err  error
+	}
+	if !hasPriv(sctx, mysql.ConfigPriv) {
+		return nil, plannercore.ErrSpecificAccessDenied.GenWithStackByArgs("CONFIG")
 	}
 	serversInfo, err := infoschema.GetClusterServerInfo(sctx)
 	failpoint.Inject("mockClusterConfigServerInfo", func(val failpoint.Value) {
@@ -182,10 +194,10 @@ func fetchClusterConfig(sctx sessionctx.Context, nodeTypes, nodeAddrs set.String
 				switch typ {
 				case "pd":
 					url = fmt.Sprintf("%s://%s%s", util.InternalHTTPSchema(), statusAddr, pdapi.Config)
-				case "tikv", "tidb":
+				case "tikv", "tidb", "tiflash":
 					url = fmt.Sprintf("%s://%s/config", util.InternalHTTPSchema(), statusAddr)
 				default:
-					ch <- result{err: errors.Errorf("unknown node type: %s(%s)", typ, address)}
+					ch <- result{err: errors.Errorf("currently we do not support get config from node type: %s(%s)", typ, address)}
 					return
 				}
 
@@ -219,10 +231,13 @@ func fetchClusterConfig(sctx sessionctx.Context, nodeTypes, nodeAddrs set.String
 				}
 				var items []item
 				for key, val := range data {
+					if config.ContainHiddenConfig(key) {
+						continue
+					}
 					var str string
-					switch val.(type) {
+					switch val := val.(type) {
 					case string: // remove quotes
-						str = val.(string)
+						str = val
 					default:
 						tmp, err := json.Marshal(val)
 						if err != nil {
@@ -276,6 +291,17 @@ type clusterServerInfoRetriever struct {
 
 // retrieve implements the memTableRetriever interface
 func (e *clusterServerInfoRetriever) retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error) {
+	switch e.serverInfoType {
+	case diagnosticspb.ServerInfoType_LoadInfo,
+		diagnosticspb.ServerInfoType_SystemInfo:
+		if !hasPriv(sctx, mysql.ProcessPriv) {
+			return nil, plannercore.ErrSpecificAccessDenied.GenWithStackByArgs("PROCESS")
+		}
+	case diagnosticspb.ServerInfoType_HardwareInfo:
+		if !hasPriv(sctx, mysql.ConfigPriv) {
+			return nil, plannercore.ErrSpecificAccessDenied.GenWithStackByArgs("CONFIG")
+		}
+	}
 	if e.extractor.SkipRequest || e.retrieved {
 		return nil, nil
 	}
@@ -356,7 +382,8 @@ func getServerInfoByGRPC(ctx context.Context, address string, tp diagnosticspb.S
 	opt := grpc.WithInsecure()
 	security := config.GetGlobalConfig().Security
 	if len(security.ClusterSSLCA) != 0 {
-		tlsConfig, err := security.ToTLSConfig()
+		clusterSecurity := security.ClusterSecurity()
+		tlsConfig, err := clusterSecurity.ToTLSConfig()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -384,8 +411,8 @@ func getServerInfoByGRPC(ctx context.Context, address string, tp diagnosticspb.S
 }
 
 func parseFailpointServerInfo(s string) []infoschema.ServerInfo {
-	var serversInfo []infoschema.ServerInfo
 	servers := strings.Split(s, ";")
+	serversInfo := make([]infoschema.ServerInfo, 0, len(servers))
 	for _, server := range servers {
 		parts := strings.Split(server, ",")
 		serversInfo = append(serversInfo, infoschema.ServerInfo{
@@ -467,6 +494,9 @@ func (h *logResponseHeap) Pop() interface{} {
 }
 
 func (e *clusterLogRetriever) initialize(ctx context.Context, sctx sessionctx.Context) ([]chan logStreamResult, error) {
+	if !hasPriv(sctx, mysql.ProcessPriv) {
+		return nil, plannercore.ErrSpecificAccessDenied.GenWithStackByArgs("PROCESS")
+	}
 	serversInfo, err := infoschema.GetClusterServerInfo(sctx)
 	failpoint.Inject("mockClusterLogServerInfo", func(val failpoint.Value) {
 		// erase the error
@@ -483,7 +513,7 @@ func (e *clusterLogRetriever) initialize(ctx context.Context, sctx sessionctx.Co
 	nodeTypes := e.extractor.NodeTypes
 	serversInfo = filterClusterServerInfo(serversInfo, nodeTypes, instances)
 
-	var levels []diagnosticspb.LogLevel
+	var levels = make([]diagnosticspb.LogLevel, 0, len(e.extractor.LogLevels))
 	for l := range e.extractor.LogLevels {
 		levels = append(levels, sysutil.ParseLogLevel(l))
 	}
@@ -520,7 +550,8 @@ func (e *clusterLogRetriever) startRetrieving(
 	opt := grpc.WithInsecure()
 	security := config.GetGlobalConfig().Security
 	if len(security.ClusterSSLCA) != 0 {
-		tlsConfig, err := security.ToTLSConfig()
+		clusterSecurity := security.ClusterSecurity()
+		tlsConfig, err := clusterSecurity.ToTLSConfig()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -659,5 +690,9 @@ func (e *clusterLogRetriever) close() error {
 	if e.cancel != nil {
 		e.cancel()
 	}
+	return nil
+}
+
+func (e *clusterLogRetriever) getRuntimeStats() execdetails.RuntimeStats {
 	return nil
 }

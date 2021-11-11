@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,9 +18,9 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -35,7 +36,7 @@ func (s *testEvaluatorSuite) TestNewValuesFunc(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestEvaluateExprWithNull(c *C) {
-	tblInfo := newTestTableBuilder("").add("col0", mysql.TypeLonglong).add("col1", mysql.TypeLonglong).build()
+	tblInfo := newTestTableBuilder("").add("col0", mysql.TypeLonglong, 0).add("col1", mysql.TypeLonglong, 0).build()
 	schema := tableInfoToSchemaForTest(tblInfo)
 	col0 := schema.Columns[0]
 	col1 := schema.Columns[1]
@@ -52,6 +53,32 @@ func (s *testEvaluatorSuite) TestEvaluateExprWithNull(c *C) {
 	// ifnull(null, ifnull(null, 1))
 	res = EvaluateExprWithNull(s.ctx, schema, outerIfNull)
 	c.Assert(res.Equal(s.ctx, NewOne()), IsTrue)
+}
+
+func (s *testEvaluatorSerialSuites) TestEvaluateExprWithNullAndParameters(c *C) {
+	tblInfo := newTestTableBuilder("").add("col0", mysql.TypeLonglong, 0).build()
+	schema := tableInfoToSchemaForTest(tblInfo)
+	col0 := schema.Columns[0]
+
+	defer func(original bool) {
+		s.ctx.GetSessionVars().StmtCtx.UseCache = original
+	}(s.ctx.GetSessionVars().StmtCtx.UseCache)
+	s.ctx.GetSessionVars().StmtCtx.UseCache = true
+
+	// cases for parameters
+	ltWithoutParam, err := newFunctionForTest(s.ctx, ast.LT, col0, NewOne())
+	c.Assert(err, IsNil)
+	res := EvaluateExprWithNull(s.ctx, schema, ltWithoutParam)
+	c.Assert(res.Equal(s.ctx, NewNull()), IsTrue) // the expression is evaluated to null
+
+	param := NewOne()
+	param.ParamMarker = &ParamMarker{ctx: s.ctx, order: 0}
+	s.ctx.GetSessionVars().PreparedParams = append(s.ctx.GetSessionVars().PreparedParams, types.NewIntDatum(10))
+	ltWithParam, err := newFunctionForTest(s.ctx, ast.LT, col0, param)
+	c.Assert(err, IsNil)
+	res = EvaluateExprWithNull(s.ctx, schema, ltWithParam)
+	_, isScalarFunc := res.(*ScalarFunction)
+	c.Assert(isScalarFunc, IsTrue) // the expression with parameters is not evaluated
 }
 
 func (s *testEvaluatorSuite) TestConstant(c *C) {
@@ -142,15 +169,17 @@ type testTableBuilder struct {
 	tableName   string
 	columnNames []string
 	tps         []byte
+	flags       []uint
 }
 
 func newTestTableBuilder(tableName string) *testTableBuilder {
 	return &testTableBuilder{tableName: tableName}
 }
 
-func (builder *testTableBuilder) add(name string, tp byte) *testTableBuilder {
+func (builder *testTableBuilder) add(name string, tp byte, flag uint) *testTableBuilder {
 	builder.columnNames = append(builder.columnNames, name)
 	builder.tps = append(builder.tps, tp)
+	builder.flags = append(builder.flags, flag)
 	return builder
 }
 
@@ -165,6 +194,7 @@ func (builder *testTableBuilder) build() *model.TableInfo {
 		fieldType := types.NewFieldType(tp)
 		fieldType.Flen, fieldType.Decimal = mysql.GetDefaultFieldLengthAndDecimal(tp)
 		fieldType.Charset, fieldType.Collate = types.DefaultCharsetForType(tp)
+		fieldType.Flag = builder.flags[i]
 		ti.Columns = append(ti.Columns, &model.ColumnInfo{
 			ID:        int64(i + 1),
 			Name:      model.NewCIStr(colName),
@@ -203,12 +233,12 @@ func (s *testEvaluatorSuite) TestEvalExpr(c *C) {
 		var err error
 		c.Assert(colExpr.Vectorized(), IsTrue)
 		ctx.GetSessionVars().EnableVectorizedExpression = false
-		err = EvalExpr(ctx, colExpr, input, colBuf)
+		err = EvalExpr(ctx, colExpr, colExpr.GetType().EvalType(), input, colBuf)
 		if err != nil {
 			c.Fatal(err)
 		}
 		ctx.GetSessionVars().EnableVectorizedExpression = true
-		err = EvalExpr(ctx, colExpr, input, colBuf2)
+		err = EvalExpr(ctx, colExpr, colExpr.GetType().EvalType(), input, colBuf2)
 		if err != nil {
 			c.Fatal(err)
 		}

@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -55,5 +56,6 @@ func (s *inspectionSummarySuite) TestInspectionRules(c *C) {
 		rules, err := session.ResultSetToStringSlice(context.Background(), tk.Se, rs)
 		c.Assert(err, IsNil)
 		c.Assert(len(rules), Equals, ca.ruleCount)
+		c.Assert(rs.Close(), IsNil)
 	}
 }

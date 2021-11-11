@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,11 +19,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"runtime/trace"
+	"time"
 
 	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
@@ -62,6 +66,7 @@ func (e *InsertExec) exec(ctx context.Context, rows [][]types.Datum) error {
 	if err != nil {
 		return err
 	}
+	setResourceGroupTagForTxn(sessVars.StmtCtx, txn)
 	txnSize := txn.Size()
 	sessVars.StmtCtx.AddRecordRows(uint64(len(rows)))
 	// If you use the IGNORE keyword, duplicate-key error that occurs while executing the INSERT statement are ignored.
@@ -82,6 +87,8 @@ func (e *InsertExec) exec(ctx context.Context, rows [][]types.Datum) error {
 			return err
 		}
 	} else {
+		e.collectRuntimeStatsEnabled()
+		start := time.Now()
 		for i, row := range rows {
 			var err error
 			sizeHintStep := int(sessVars.ShardAllocateStep)
@@ -99,6 +106,9 @@ func (e *InsertExec) exec(ctx context.Context, rows [][]types.Datum) error {
 				return err
 			}
 		}
+		if e.stats != nil {
+			e.stats.CheckInsertTime += time.Since(start)
+		}
 	}
 	e.memTracker.Consume(int64(txn.Size() - txnSize))
 	return nil
@@ -113,6 +123,9 @@ func prefetchUniqueIndices(ctx context.Context, txn kv.Transaction, rows []toBeC
 
 	nKeys := 0
 	for _, r := range rows {
+		if r.ignored {
+			continue
+		}
 		if r.handleKey != nil {
 			nKeys++
 		}
@@ -120,6 +133,9 @@ func prefetchUniqueIndices(ctx context.Context, txn kv.Transaction, rows []toBeC
 	}
 	batchKeys := make([]kv.Key, 0, nKeys)
 	for _, r := range rows {
+		if r.ignored {
+			continue
+		}
 		if r.handleKey != nil {
 			batchKeys = append(batchKeys, r.handleKey.newKey)
 		}
@@ -145,7 +161,7 @@ func prefetchConflictedOldRows(ctx context.Context, txn kv.Transaction, rows []t
 				if err != nil {
 					return err
 				}
-				batchKeys = append(batchKeys, r.t.RecordKey(handle))
+				batchKeys = append(batchKeys, tablecodec.EncodeRecordKey(r.t.RecordPrefix(), handle))
 			}
 		}
 	}
@@ -153,7 +169,12 @@ func prefetchConflictedOldRows(ctx context.Context, txn kv.Transaction, rows []t
 	return err
 }
 
-func prefetchDataCache(ctx context.Context, txn kv.Transaction, rows []toBeCheckedRow) error {
+func (e *InsertValues) prefetchDataCache(ctx context.Context, txn kv.Transaction, rows []toBeCheckedRow) error {
+	// Temporary table need not to do prefetch because its all data are stored in the memory.
+	if e.Table.Meta().TempTableType != model.TempTableNone {
+		return nil
+	}
+
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("prefetchDataCache", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
@@ -167,10 +188,15 @@ func prefetchDataCache(ctx context.Context, txn kv.Transaction, rows []toBeCheck
 }
 
 // updateDupRow updates a duplicate row to a new row.
-func (e *InsertExec) updateDupRow(ctx context.Context, txn kv.Transaction, row toBeCheckedRow, handle kv.Handle, onDuplicate []*expression.Assignment) error {
+func (e *InsertExec) updateDupRow(ctx context.Context, idxInBatch int, txn kv.Transaction, row toBeCheckedRow, handle kv.Handle, onDuplicate []*expression.Assignment) error {
 	oldRow, err := getOldRow(ctx, e.ctx, txn, row.t, handle, e.GenExprs)
 	if err != nil {
 		return err
+	}
+	// get the extra columns from the SELECT clause and get the final `oldRow`.
+	if len(e.ctx.GetSessionVars().CurrInsertBatchExtraCols) > 0 {
+		extraCols := e.ctx.GetSessionVars().CurrInsertBatchExtraCols[idxInBatch]
+		oldRow = append(oldRow, extraCols...)
 	}
 
 	err = e.doDupRowUpdate(ctx, handle, oldRow, row.row, e.OnDuplicate)
@@ -184,6 +210,7 @@ func (e *InsertExec) updateDupRow(ctx context.Context, txn kv.Transaction, row t
 // batchUpdateDupRows updates multi-rows in batch if they are duplicate with rows in table.
 func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.Datum) error {
 	// Get keys need to be checked.
+	start := time.Now()
 	toBeCheckedRows, err := getKeysNeedCheck(ctx, e.ctx, e.Table, newRows)
 	if err != nil {
 		return err
@@ -197,14 +224,17 @@ func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.D
 	if e.collectRuntimeStatsEnabled() {
 		if snapshot := txn.GetSnapshot(); snapshot != nil {
 			snapshot.SetOption(kv.CollectRuntimeStats, e.stats.SnapshotRuntimeStats)
-			defer snapshot.DelOption(kv.CollectRuntimeStats)
+			defer snapshot.SetOption(kv.CollectRuntimeStats, nil)
 		}
 	}
-
+	prefetchStart := time.Now()
 	// Use BatchGet to fill cache.
 	// It's an optimization and could be removed without affecting correctness.
-	if err = prefetchDataCache(ctx, txn, toBeCheckedRows); err != nil {
+	if err = e.prefetchDataCache(ctx, txn, toBeCheckedRows); err != nil {
 		return err
+	}
+	if e.stats != nil {
+		e.stats.Prefetch += time.Since(prefetchStart)
 	}
 
 	for i, r := range toBeCheckedRows {
@@ -214,7 +244,7 @@ func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.D
 				return err
 			}
 
-			err = e.updateDupRow(ctx, txn, r, handle, e.OnDuplicate)
+			err = e.updateDupRow(ctx, i, txn, r, handle, e.OnDuplicate)
 			if err == nil {
 				continue
 			}
@@ -236,7 +266,7 @@ func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.D
 				return err
 			}
 
-			err = e.updateDupRow(ctx, txn, r, handle, e.OnDuplicate)
+			err = e.updateDupRow(ctx, i, txn, r, handle, e.OnDuplicate)
 			if err != nil {
 				if kv.IsErrNotFound(err) {
 					// Data index inconsistent? A unique key provide the handle information, but the
@@ -264,12 +294,19 @@ func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.D
 			}
 		}
 	}
+	if e.stats != nil {
+		e.stats.CheckInsertTime += time.Since(start)
+	}
 	return nil
 }
 
 // Next implements the Executor Next interface.
 func (e *InsertExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
+	if e.collectRuntimeStatsEnabled() {
+		ctx = context.WithValue(ctx, autoid.AllocatorRuntimeStatsCtxKey, e.stats.AllocatorRuntimeStats)
+	}
+
 	if len(e.children) > 0 && e.children[0] != nil {
 		return insertRowsFromSelect(ctx, e)
 	}
@@ -279,6 +316,7 @@ func (e *InsertExec) Next(ctx context.Context, req *chunk.Chunk) error {
 // Close implements the Executor Close interface.
 func (e *InsertExec) Close() error {
 	e.ctx.GetSessionVars().CurrInsertValues = chunk.Row{}
+	e.ctx.GetSessionVars().CurrInsertBatchExtraCols = e.ctx.GetSessionVars().CurrInsertBatchExtraCols[0:0:0]
 	e.setMessage()
 	if e.SelectExec != nil {
 		return e.SelectExec.Close()
@@ -309,11 +347,19 @@ func (e *InsertExec) initEvalBuffer4Dup() {
 	// Use writable columns for old row for update.
 	numWritableCols := len(e.Table.WritableCols())
 
-	evalBufferTypes := make([]*types.FieldType, 0, numCols+numWritableCols)
+	extraLen := 0
+	if e.SelectExec != nil {
+		extraLen = e.SelectExec.Schema().Len() - e.rowLen
+	}
+
+	evalBufferTypes := make([]*types.FieldType, 0, numCols+numWritableCols+extraLen)
 
 	// Append the old row before the new row, to be consistent with "Schema4OnDuplicate" in the "Insert" PhysicalPlan.
 	for _, col := range e.Table.WritableCols() {
 		evalBufferTypes = append(evalBufferTypes, &col.FieldType)
+	}
+	if extraLen > 0 {
+		evalBufferTypes = append(evalBufferTypes, e.SelectExec.base().retFieldTypes[numWritableCols:]...)
 	}
 	for _, col := range e.Table.Cols() {
 		evalBufferTypes = append(evalBufferTypes, &col.FieldType)
@@ -333,7 +379,6 @@ func (e *InsertExec) doDupRowUpdate(ctx context.Context, handle kv.Handle, oldRo
 	// See http://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
 	e.curInsertVals.SetDatums(newRow...)
 	e.ctx.GetSessionVars().CurrInsertValues = e.curInsertVals.ToRow()
-
 	// NOTE: In order to execute the expression inside the column assignment,
 	// we have to put the value of "oldRow" before "newRow" in "row4Update" to
 	// be consistent with "Schema4OnDuplicate" in the "Insert" PhysicalPlan.
@@ -381,7 +426,7 @@ func (e *InsertExec) setMessage() {
 				numDuplicates = stmtCtx.UpdatedRows()
 			}
 		}
-		msg := fmt.Sprintf(mysql.MySQLErrName[mysql.ErrInsertInfo], numRecords, numDuplicates, numWarnings)
+		msg := fmt.Sprintf(mysql.MySQLErrName[mysql.ErrInsertInfo].Raw, numRecords, numDuplicates, numWarnings)
 		stmtCtx.SetMessage(msg)
 	}
 }

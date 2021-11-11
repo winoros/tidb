@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,39 +18,62 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"io"
 	"os"
 	"strings"
+	"testing"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/terror"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/stretchr/testify/assert"
 )
 
-func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, reader *bufio.Reader) ([][]types.Datum, error) {
-	retriever.parsedSlowLogCh = make(chan parsedSlowLog, 100)
+func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+	retriever.taskList = make(chan slowLogTask, 100)
 	ctx := context.Background()
 	retriever.parseSlowLog(ctx, sctx, reader, 64)
-	slowLog := <-retriever.parsedSlowLogCh
-	rows, err := slowLog.rows, slowLog.err
-	if err == io.EOF {
-		err = nil
+	task, ok := <-retriever.taskList
+	if !ok {
+		return nil, nil
 	}
+	var rows [][]types.Datum
+	var err error
+	result := <-task.resultCh
+	rows, err = result.rows, result.err
 	return rows, err
 }
 
-func parseSlowLog(sctx sessionctx.Context, reader *bufio.Reader) ([][]types.Datum, error) {
-	retriever := &slowQueryRetriever{}
+func newSlowQueryRetriever() (*slowQueryRetriever, error) {
+	newISBuilder, err := infoschema.NewBuilder(nil).InitWithDBInfos(nil, nil, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	is := newISBuilder.Build()
+	tbl, err := is.TableByName(util.InformationSchemaName, model.NewCIStr(infoschema.TableSlowQuery))
+	if err != nil {
+		return nil, err
+	}
+	return &slowQueryRetriever{outputCols: tbl.Meta().Columns}, nil
+}
+
+func parseSlowLog(sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+	retriever, err := newSlowQueryRetriever()
+	if err != nil {
+		return nil, err
+	}
 	// Ignore the error is ok for test.
-	terror.Log(retriever.initialize(sctx))
-	rows, err := parseLog(retriever, sctx, reader)
+	terror.Log(retriever.initialize(context.Background(), sctx))
+	rows, err := parseLog(retriever, sctx, reader, logNum)
 	return rows, err
 }
 
@@ -68,6 +92,7 @@ func (s *testExecSerialSuite) TestParseSlowLogPanic(c *C) {
 # Mem_max: 70724
 # Disk_max: 65536
 # Plan_from_cache: true
+# Plan_from_binding: true
 # Succ: false
 # Plan_digest: 60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4
 # Prev_stmt: update t set i = 1;
@@ -82,7 +107,7 @@ select * from t;`
 	c.Assert(err, IsNil)
 	sctx := mock.NewContext()
 	sctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(sctx, reader)
+	_, err = parseSlowLog(sctx, reader, 64)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "panic test")
 }
@@ -95,15 +120,21 @@ func (s *testExecSuite) TestParseSlowLogFile(c *C) {
 # Exec_retry_time: 0.12 Exec_retry_count: 57
 # Query_time: 0.216905
 # Cop_time: 0.38 Process_time: 0.021 Request_count: 1 Total_keys: 637 Processed_keys: 436
+# Rocksdb_delete_skipped_count: 10 Rocksdb_key_skipped_count: 10 Rocksdb_block_cache_hit_count: 10 Rocksdb_block_read_count: 10 Rocksdb_block_read_byte: 100
 # Is_internal: true
 # Digest: 42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772
 # Stats: t1:1,t2:2
 # Cop_proc_avg: 0.1 Cop_proc_p90: 0.2 Cop_proc_max: 0.03 Cop_proc_addr: 127.0.0.1:20160
 # Cop_wait_avg: 0.05 Cop_wait_p90: 0.6 Cop_wait_max: 0.8 Cop_wait_addr: 0.0.0.0:20160
+# Cop_backoff_regionMiss_total_times: 200 Cop_backoff_regionMiss_total_time: 0.2 Cop_backoff_regionMiss_max_time: 0.2 Cop_backoff_regionMiss_max_addr: 127.0.0.1 Cop_backoff_regionMiss_avg_time: 0.2 Cop_backoff_regionMiss_p90_time: 0.2
+# Cop_backoff_rpcPD_total_times: 200 Cop_backoff_rpcPD_total_time: 0.2 Cop_backoff_rpcPD_max_time: 0.2 Cop_backoff_rpcPD_max_addr: 127.0.0.1 Cop_backoff_rpcPD_avg_time: 0.2 Cop_backoff_rpcPD_p90_time: 0.2
+# Cop_backoff_rpcTiKV_total_times: 200 Cop_backoff_rpcTiKV_total_time: 0.2 Cop_backoff_rpcTiKV_max_time: 0.2 Cop_backoff_rpcTiKV_max_addr: 127.0.0.1 Cop_backoff_rpcTiKV_avg_time: 0.2 Cop_backoff_rpcTiKV_p90_time: 0.2
 # Mem_max: 70724
 # Disk_max: 65536
 # Plan_from_cache: true
+# Plan_from_binding: true
 # Succ: false
+# IsExplicitTxn: true
 # Plan_digest: 60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4
 # Prev_stmt: update t set i = 1;
 use test;
@@ -113,7 +144,7 @@ select * from t;`
 	c.Assert(err, IsNil)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	rows, err := parseSlowLog(ctx, reader)
+	rows, err := parseSlowLog(ctx, reader, 64)
 	c.Assert(err, IsNil)
 	c.Assert(len(rows), Equals, 1)
 	recordString := ""
@@ -125,7 +156,36 @@ select * from t;`
 		}
 		recordString += str
 	}
-	expectRecordString := "2019-04-28 15:24:04.309074,405888132465033227,root,localhost,0,57,0.12,0.216905,0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0.38,0.021,0,0,0,1,637,0,,,1,42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772,t1:1,t2:2,0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,1,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,update t set i = 1;,select * from t;"
+	expectRecordString := `2019-04-28 15:24:04.309074,` +
+		`405888132465033227,root,localhost,0,57,0.12,0.216905,` +
+		`0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0.38,0.021,0,0,0,1,637,0,10,10,10,10,100,,,1,42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772,t1:1,t2:2,` +
+		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,` +
+		`Cop_backoff_regionMiss_total_times: 200 Cop_backoff_regionMiss_total_time: 0.2 Cop_backoff_regionMiss_max_time: 0.2 Cop_backoff_regionMiss_max_addr: 127.0.0.1 Cop_backoff_regionMiss_avg_time: 0.2 Cop_backoff_regionMiss_p90_time: 0.2 Cop_backoff_rpcPD_total_times: 200 Cop_backoff_rpcPD_total_time: 0.2 Cop_backoff_rpcPD_max_time: 0.2 Cop_backoff_rpcPD_max_addr: 127.0.0.1 Cop_backoff_rpcPD_avg_time: 0.2 Cop_backoff_rpcPD_p90_time: 0.2 Cop_backoff_rpcTiKV_total_times: 200 Cop_backoff_rpcTiKV_total_time: 0.2 Cop_backoff_rpcTiKV_max_time: 0.2 Cop_backoff_rpcTiKV_max_addr: 127.0.0.1 Cop_backoff_rpcTiKV_avg_time: 0.2 Cop_backoff_rpcTiKV_p90_time: 0.2,` +
+		`0,0,1,1,1,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
+		`update t set i = 1;,select * from t;`
+	c.Assert(expectRecordString, Equals, recordString)
+
+	// Issue 20928
+	reader = bufio.NewReader(bytes.NewBufferString(slowLogStr))
+	rows, err = parseSlowLog(ctx, reader, 1)
+	c.Assert(err, IsNil)
+	c.Assert(len(rows), Equals, 1)
+	recordString = ""
+	for i, value := range rows[0] {
+		str, err := value.ToString()
+		c.Assert(err, IsNil)
+		if i > 0 {
+			recordString += ","
+		}
+		recordString += str
+	}
+	expectRecordString = `2019-04-28 15:24:04.309074,` +
+		`405888132465033227,root,localhost,0,57,0.12,0.216905,` +
+		`0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0.38,0.021,0,0,0,1,637,0,10,10,10,10,100,,,1,42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772,t1:1,t2:2,` +
+		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,` +
+		`Cop_backoff_regionMiss_total_times: 200 Cop_backoff_regionMiss_total_time: 0.2 Cop_backoff_regionMiss_max_time: 0.2 Cop_backoff_regionMiss_max_addr: 127.0.0.1 Cop_backoff_regionMiss_avg_time: 0.2 Cop_backoff_regionMiss_p90_time: 0.2 Cop_backoff_rpcPD_total_times: 200 Cop_backoff_rpcPD_total_time: 0.2 Cop_backoff_rpcPD_max_time: 0.2 Cop_backoff_rpcPD_max_addr: 127.0.0.1 Cop_backoff_rpcPD_avg_time: 0.2 Cop_backoff_rpcPD_p90_time: 0.2 Cop_backoff_rpcTiKV_total_times: 200 Cop_backoff_rpcTiKV_total_time: 0.2 Cop_backoff_rpcTiKV_max_time: 0.2 Cop_backoff_rpcTiKV_max_addr: 127.0.0.1 Cop_backoff_rpcTiKV_avg_time: 0.2 Cop_backoff_rpcTiKV_p90_time: 0.2,` +
+		`0,0,1,1,1,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
+		`update t set i = 1;,select * from t;`
 	c.Assert(expectRecordString, Equals, recordString)
 
 	// fix sql contain '# ' bug
@@ -143,7 +203,7 @@ select a# from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader)
+	_, err = parseSlowLog(ctx, reader, 64)
 	c.Assert(err, IsNil)
 
 	// test for time format compatibility.
@@ -154,7 +214,7 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	rows, err = parseSlowLog(ctx, reader)
+	rows, err = parseSlowLog(ctx, reader, 64)
 	c.Assert(err, IsNil)
 	c.Assert(len(rows) == 2, IsTrue)
 	t0Str, err := rows[0][0].ToString()
@@ -171,11 +231,11 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader)
+	_, err = parseSlowLog(ctx, reader, 64)
 	c.Assert(err, IsNil)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(warnings, HasLen, 1)
-	c.Assert(warnings[0].Err.Error(), Equals, "Parse slow log at line 2 failed. Field: `Succ`, error: strconv.ParseBool: parsing \"abc\": invalid syntax")
+	c.Assert(warnings[0].Err.Error(), Equals, "Parse slow log at line 2, failed field is Succ, failed value is abc, error is strconv.ParseBool: parsing \"abc\": invalid syntax")
 }
 
 // It changes variable.MaxOfMaxAllowedPacket, so must be stayed in SerialSuite.
@@ -195,13 +255,13 @@ select * from t;
 	sql := strings.Repeat("x", int(variable.MaxOfMaxAllowedPacket+1))
 	slowLog.WriteString(sql)
 	reader := bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader)
+	_, err = parseSlowLog(ctx, reader, 64)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "single line length exceeds limit: 65536")
 
 	variable.MaxOfMaxAllowedPacket = originValue
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader)
+	_, err = parseSlowLog(ctx, reader, 64)
 	c.Assert(err, IsNil)
 }
 
@@ -252,33 +312,25 @@ select * from t;`)
 	c.Assert(err, IsNil)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(ctx, scanner)
+	_, err = parseSlowLog(ctx, scanner, 64)
 	c.Assert(err, IsNil)
 
 	// Test parser error.
 	slowLog = bytes.NewBufferString(
 		`# Time: 2019-05-12-11:23:29.614327491 +0800
 # Txn_start_ts: 405888132465033227#
+select * from t;
 `)
-
 	scanner = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, scanner)
+	_, err = parseSlowLog(ctx, scanner, 64)
 	c.Assert(err, IsNil)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(warnings, HasLen, 1)
-	c.Assert(warnings[0].Err.Error(), Equals, "Parse slow log at line 2 failed. Field: `Txn_start_ts`, error: strconv.ParseUint: parsing \"405888132465033227#\": invalid syntax")
+	c.Assert(warnings[0].Err.Error(), Equals, "Parse slow log at line 2, failed field is Txn_start_ts, failed value is 405888132465033227#, error is strconv.ParseUint: parsing \"405888132465033227#\": invalid syntax")
 
 }
 
 func (s *testExecSuite) TestSlowQueryRetriever(c *C) {
-	writeFile := func(file string, data string) {
-		f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		c.Assert(err, IsNil)
-		_, err = f.Write([]byte(data))
-		c.Assert(f.Close(), IsNil)
-		c.Assert(err, IsNil)
-	}
-
 	logData0 := ""
 	logData1 := `
 # Time: 2020-02-15T18:00:01.000000+08:00
@@ -297,20 +349,16 @@ select 5;
 select 6;
 # Time: 2020-04-15T18:00:05.299063744+08:00
 select 7;`
+	logData := []string{logData0, logData1, logData2, logData3}
 
 	fileName0 := "tidb-slow-2020-02-14T19-04-05.01.log"
 	fileName1 := "tidb-slow-2020-02-15T19-04-05.01.log"
 	fileName2 := "tidb-slow-2020-02-16T19-04-05.01.log"
 	fileName3 := "tidb-slow.log"
-	writeFile(fileName0, logData0)
-	writeFile(fileName1, logData1)
-	writeFile(fileName2, logData2)
-	writeFile(fileName3, logData3)
+	fileNames := []string{fileName0, fileName1, fileName2, fileName3}
+	prepareLogs(c, logData, fileNames)
 	defer func() {
-		os.Remove(fileName0)
-		os.Remove(fileName1)
-		os.Remove(fileName2)
-		os.Remove(fileName3)
+		removeFiles(fileNames)
 	}()
 
 	cases := []struct {
@@ -410,18 +458,18 @@ select 7;`
 			c.Assert(err, IsNil)
 			endTime, err := ParseTime(cas.endTime)
 			c.Assert(err, IsNil)
-			extractor.StartTime = startTime
-			extractor.EndTime = endTime
-
+			extractor.TimeRanges = []*plannercore.TimeRange{{StartTime: startTime, EndTime: endTime}}
 		}
-		retriever := &slowQueryRetriever{extractor: extractor}
-		err := retriever.initialize(sctx)
+		retriever, err := newSlowQueryRetriever()
+		c.Assert(err, IsNil)
+		retriever.extractor = extractor
+		err = retriever.initialize(context.Background(), sctx)
 		c.Assert(err, IsNil)
 		comment := Commentf("case id: %v", i)
 		c.Assert(retriever.files, HasLen, len(cas.files), comment)
 		if len(retriever.files) > 0 {
 			reader := bufio.NewReader(retriever.files[0].file)
-			rows, err := parseLog(retriever, sctx, reader)
+			rows, err := parseLog(retriever, sctx, reader, 64)
 			c.Assert(err, IsNil)
 			c.Assert(len(rows), Equals, len(cas.querys), comment)
 			for i, row := range rows {
@@ -434,5 +482,195 @@ select 7;`
 			c.Assert(file.file.Close(), IsNil)
 		}
 		c.Assert(retriever.close(), IsNil)
+	}
+}
+
+func TestSplitbyColon(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		line   string
+		fields []string
+		values []string
+	}{
+		{
+			"",
+			[]string{},
+			[]string{},
+		},
+		{
+			"123a",
+			[]string{},
+			[]string{"123a"},
+		},
+		{
+			"1a: 2b",
+			[]string{"1a"},
+			[]string{"2b"},
+		},
+		{
+			"1a: [2b 3c] 4d: 5e",
+			[]string{"1a", "4d"},
+			[]string{"[2b 3c]", "5e"},
+		},
+		{
+			"1a: [2b,3c] 4d: 5e",
+			[]string{"1a", "4d"},
+			[]string{"[2b,3c]", "5e"},
+		},
+		{
+
+			"Time: 2021-09-08T14:39:54.506967433+08:00",
+			[]string{"Time"},
+			[]string{"2021-09-08T14:39:54.506967433+08:00"},
+		},
+	}
+	for _, c := range cases {
+		resFields, resValues := splitByColon(c.line)
+		assert.Equal(t, c.fields, resFields)
+		assert.Equal(t, c.values, resValues)
+	}
+}
+
+func (s *testExecSuite) TestBatchLogForReversedScan(c *C) {
+	logData0 := ""
+	logData1 := `
+# Time: 2020-02-15T18:00:01.000000+08:00
+select 1;
+# Time: 2020-02-15T19:00:05.000000+08:00
+select 2;
+# Time: 2020-02-15T20:00:05.000000+08:00`
+	logData2 := `select 3;
+# Time: 2020-02-16T18:00:01.000000+08:00
+select 4;
+# Time: 2020-02-16T18:00:05.000000+08:00
+select 5;`
+	logData3 := `
+# Time: 2020-02-16T19:00:00.000000+08:00
+select 6;
+# Time: 2020-02-17T18:00:05.000000+08:00
+select 7;
+# Time: 2020-04-15T18:00:05.299063744+08:00`
+	logData4 := `select 8;
+# Time: 2020-04-15T19:00:05.299063744+08:00
+select 9;`
+	logData := []string{logData0, logData1, logData2, logData3, logData4}
+
+	fileName0 := "tidb-slow-2020-02-14T19-04-05.01.log"
+	fileName1 := "tidb-slow-2020-02-15T19-04-05.01.log"
+	fileName2 := "tidb-slow-2020-02-16T19-04-05.01.log"
+	fileName3 := "tidb-slow-2020-02-17T19-04-05.01.log"
+	fileName4 := "tidb-slow.log"
+	fileNames := []string{fileName0, fileName1, fileName2, fileName3, fileName4}
+	prepareLogs(c, logData, fileNames)
+	defer func() {
+		removeFiles(fileNames)
+	}()
+
+	cases := []struct {
+		startTime string
+		endTime   string
+		files     []string
+		logs      [][]string
+	}{
+		{
+			startTime: "2020-02-15T18:00:00.000000+08:00",
+			endTime:   "2020-02-15T19:00:00.000000+08:00",
+			files:     []string{fileName1},
+			logs: [][]string{
+				{"# Time: 2020-02-15T19:00:05.000000+08:00",
+					"select 2;",
+					"# Time: 2020-02-15T18:00:01.000000+08:00",
+					"select 1;"},
+			},
+		},
+		{
+			startTime: "2020-02-15T20:00:05.000000+08:00",
+			endTime:   "2020-02-17T19:00:00.000000+08:00",
+			files:     []string{fileName1, fileName2, fileName3},
+			logs: [][]string{
+				{"# Time: 2020-02-17T18:00:05.000000+08:00",
+					"select 7;",
+					"# Time: 2020-02-16T19:00:00.000000+08:00",
+					"select 6;",
+					"# Time: 2020-02-16T18:00:05.000000+08:00",
+					"select 5;",
+					"# Time: 2020-02-16T18:00:01.000000+08:00",
+					"select 4;",
+					"# Time: 2020-02-16T18:00:01.000000+08:00",
+					"select 3;"},
+			},
+		},
+		{
+			startTime: "2020-02-16T19:00:00.000000+08:00",
+			endTime:   "2020-04-15T20:00:00.000000+08:00",
+			files:     []string{fileName3, fileName4},
+			logs: [][]string{
+				{"# Time: 2020-04-15T19:00:05.299063744+08:00",
+					"select 9;",
+					"Time: 2020-04-15T18:00:05.299063744+08:00",
+					"select 8;",
+					"# Time: 2020-02-17T18:00:05.000000+08:00",
+					"select 7;",
+					"# Time: 2020-02-16T19:00:00.000000+08:00",
+					"select 6;"},
+			},
+		},
+	}
+
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	c.Assert(err, IsNil)
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().TimeZone = loc
+	sctx.GetSessionVars().SlowQueryFile = fileName3
+	for i, cas := range cases {
+		extractor := &plannercore.SlowQueryExtractor{Enable: (len(cas.startTime) > 0 && len(cas.endTime) > 0), Desc: true}
+		if extractor.Enable {
+			startTime, err := ParseTime(cas.startTime)
+			c.Assert(err, IsNil)
+			endTime, err := ParseTime(cas.endTime)
+			c.Assert(err, IsNil)
+			extractor.TimeRanges = []*plannercore.TimeRange{{StartTime: startTime, EndTime: endTime}}
+		}
+		retriever, err := newSlowQueryRetriever()
+		c.Assert(err, IsNil)
+		retriever.extractor = extractor
+		sctx.GetSessionVars().SlowQueryFile = fileName4
+		err = retriever.initialize(context.Background(), sctx)
+		c.Assert(err, IsNil)
+		comment := Commentf("case id: %v", i)
+		c.Assert(retriever.files, HasLen, len(cas.files), comment)
+		if len(retriever.files) > 0 {
+			reader := bufio.NewReader(retriever.files[0].file)
+			offset := &offset{length: 0, offset: 0}
+			rows, err := retriever.getBatchLogForReversedScan(context.Background(), reader, offset, 3)
+			c.Assert(err, IsNil)
+			for _, row := range rows {
+				for j, log := range row {
+					c.Assert(log, Equals, cas.logs[0][j], comment)
+				}
+			}
+		}
+		c.Assert(retriever.close(), IsNil)
+	}
+}
+
+func prepareLogs(c *C, logData []string, fileNames []string) {
+	writeFile := func(file string, data string) {
+		f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		c.Assert(err, IsNil)
+		_, err = f.Write([]byte(data))
+		c.Assert(f.Close(), IsNil)
+		c.Assert(err, IsNil)
+	}
+
+	for i, log := range logData {
+		writeFile(fileNames[i], log)
+	}
+}
+
+func removeFiles(fileNames []string) {
+	for _, fileName := range fileNames {
+		os.Remove(fileName)
 	}
 }

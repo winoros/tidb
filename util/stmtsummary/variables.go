@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -104,14 +105,10 @@ func getBoolFinalVariable(varType int, sessionValue, globalValue string) int64 {
 
 // normalizeEnableValue converts 'ON' or '1' to 1 and 'OFF' or '0' to 0.
 func normalizeEnableValue(value string) int64 {
-	switch {
-	case strings.EqualFold(value, "ON"):
+	if strings.EqualFold(value, "ON") || value == "1" {
 		return 1
-	case value == "1":
-		return 1
-	default:
-		return 0
 	}
+	return 0
 }
 
 func getIntFinalVariable(varType int, sessionValue, globalValue string, minValue int64) int64 {

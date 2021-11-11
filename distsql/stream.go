@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,14 +19,15 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tipb/go-tipb"
 )
 
@@ -47,8 +49,6 @@ type streamResult struct {
 	fetchDuration    time.Duration
 	durationReported bool
 }
-
-func (r *streamResult) Fetch(context.Context) {}
 
 func (r *streamResult) Next(ctx context.Context, chk *chunk.Chunk) error {
 	chk.Reset()
@@ -97,14 +97,14 @@ func (r *streamResult) readDataFromResponse(ctx context.Context, resp kv.Respons
 		return false, errors.Errorf("stream response error: [%d]%s\n", stream.Error.Code, stream.Error.Msg)
 	}
 	for _, warning := range stream.Warnings {
-		r.ctx.GetSessionVars().StmtCtx.AppendWarning(terror.ClassTiKV.Synthesize(terror.ErrCode(warning.Code), warning.Msg))
+		r.ctx.GetSessionVars().StmtCtx.AppendWarning(dbterror.ClassTiKV.Synthesize(terror.ErrCode(warning.Code), warning.Msg))
 	}
 
 	err = result.Unmarshal(stream.Data)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
-	r.feedback.Update(resultSubset.GetStartKey(), stream.OutputCounts)
+	r.feedback.Update(resultSubset.GetStartKey(), stream.OutputCounts, stream.Ndvs)
 	r.partialCount++
 
 	hasStats, ok := resultSubset.(CopRuntimeStats)
@@ -170,5 +170,8 @@ func (r *streamResult) Close() error {
 		metrics.DistSQLScanKeysHistogram.Observe(float64(r.feedback.Actual()))
 	}
 	metrics.DistSQLPartialCountHistogram.Observe(float64(r.partialCount))
+	if r.resp != nil {
+		return r.resp.Close()
+	}
 	return nil
 }

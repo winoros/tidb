@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -20,19 +21,22 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain/infosync"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 type DDLForTest interface {
@@ -40,14 +44,6 @@ type DDLForTest interface {
 	SetHook(h Callback)
 	// SetInterceptor sets the interceptor.
 	SetInterceptor(h Interceptor)
-}
-
-// SetHook implements DDL.SetHook interface.
-func (d *ddl) SetHook(h Callback) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.mu.hook = h
 }
 
 // SetInterceptor implements DDL.SetInterceptor interface.
@@ -63,11 +59,19 @@ func (d *ddl) generalWorker() *worker {
 	return d.workers[generalWorker]
 }
 
+// GetMaxRowID is used for test.
+func GetMaxRowID(store kv.Storage, priority int, t table.Table, startHandle, endHandle kv.Key) (kv.Key, error) {
+	return getRangeEndKey(store, priority, t, startHandle, endHandle)
+}
+
 func TestT(t *testing.T) {
 	CustomVerboseFlag = true
 	*CustomParallelSuiteFlag = true
 	logLevel := os.Getenv("log_level")
-	logutil.InitLogger(logutil.NewLogConfig(logLevel, "", "", logutil.EmptyFileLogConfig, false))
+	err := logutil.InitLogger(logutil.NewLogConfig(logLevel, "", "", logutil.EmptyFileLogConfig, false))
+	if err != nil {
+		t.Fatal(err)
+	}
 	autoid.SetStep(5000)
 	ReorgWaitTimeout = 30 * time.Millisecond
 	batchInsertDeleteRangeSize = 2
@@ -76,11 +80,13 @@ func TestT(t *testing.T) {
 		// Test for table lock.
 		conf.EnableTableLock = true
 		conf.Log.SlowThreshold = 10000
-		// Test for add/drop primary key.
-		conf.AlterPrimaryKey = true
+		conf.TiKVClient.AsyncCommit.SafeWindow = 0
+		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
+		conf.Experimental.AllowsExpressionIndex = true
 	})
+	tikv.EnableFailpoints()
 
-	_, err := infosync.GlobalInfoSyncerInit(context.Background(), "t", nil, true)
+	_, err = infosync.GlobalInfoSyncerInit(context.Background(), "t", func() uint64 { return 1 }, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +97,10 @@ func TestT(t *testing.T) {
 }
 
 func testNewDDLAndStart(ctx context.Context, c *C, options ...Option) *ddl {
+	// init infoCache and a stub infoSchema
+	ic := infoschema.NewCache(2)
+	ic.Insert(infoschema.MockInfoSchemaWithSchemaVer(nil, 0), 0)
+	options = append(options, WithInfoCache(ic))
 	d := newDDL(ctx, options...)
 	err := d.Start(nil)
 	c.Assert(err, IsNil)
@@ -178,6 +188,17 @@ func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bo
 	}
 }
 
+func buildModifyColJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
+	newCol := table.ToColumn(tblInfo.Columns[0])
+	return &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionModifyColumn,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{&newCol, newCol.Name, ast.ColumnPosition{Tp: ast.ColumnPositionNone}, 0},
+	}
+}
+
 func testCreatePrimaryKey(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, colName string) *model.Job {
 	job := buildCreateIdxJob(dbInfo, tblInfo, true, "primary", colName)
 	job.Type = model.ActionAddPrimaryKey
@@ -258,4 +279,31 @@ func buildRebaseAutoIDJobJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, new
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{newBaseID},
 	}
+}
+
+func (s *testDDLSuite) TestGetIntervalFromPolicy(c *C) {
+	policy := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+	}
+	var (
+		val     time.Duration
+		changed bool
+	)
+
+	val, changed = getIntervalFromPolicy(policy, 0)
+	c.Assert(val, Equals, 1*time.Second)
+	c.Assert(changed, Equals, true)
+
+	val, changed = getIntervalFromPolicy(policy, 1)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, true)
+
+	val, changed = getIntervalFromPolicy(policy, 2)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, false)
+
+	val, changed = getIntervalFromPolicy(policy, 3)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, false)
 }

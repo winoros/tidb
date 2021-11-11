@@ -8,9 +8,11 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build ignore
 // +build ignore
 
 package main
@@ -18,8 +20,8 @@ package main
 import (
 	"bytes"
 	"go/format"
-	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"text/template"
 
@@ -36,6 +38,7 @@ const header = `// Copyright 2019 PingCAP, Inc.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -47,7 +50,7 @@ package expression
 const newLine = "\n"
 
 const builtinOtherImports = `import (
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
@@ -57,7 +60,7 @@ const builtinOtherImports = `import (
 
 var builtinInTmpl = template.Must(template.New("builtinInTmpl").Parse(`
 {{ define "BufAllocator" }}
-	buf0, err := b.bufAllocator.get(types.ET{{ .Input.ETName }}, n)
+	buf0, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -65,7 +68,7 @@ var builtinInTmpl = template.Must(template.New("builtinInTmpl").Parse(`
 	if err := b.args[0].VecEval{{ .Input.TypeName }}(b.ctx, input, buf0); err != nil {
 		return err
 	}
-	buf1, err := b.bufAllocator.get(types.ET{{ .Input.ETName }}, n)
+	buf1, err := b.bufAllocator.get()
 	if err != nil {
 		return err
 	}
@@ -120,6 +123,7 @@ var builtinInTmpl = template.Must(template.New("builtinInTmpl").Parse(`
 {{ $InputString := (eq .Input.TypeName "String") }}
 {{ $InputFixed := ( .Input.Fixed ) }}
 {{ $UseHashKey := ( or (eq .Input.TypeName "Decimal") (eq .Input.TypeName "JSON") )}}
+{{ $InputTime := (eq .Input.TypeName "Time") }}
 func (b *{{.SigName}}) vecEvalInt(input *chunk.Chunk, result *chunk.Column) error {
 	n := input.NumRows()
 	{{- template "BufAllocator" . }}
@@ -143,13 +147,12 @@ func (b *{{.SigName}}) vecEvalInt(input *chunk.Chunk, result *chunk.Column) erro
 		isUnsigned0 := mysql.HasUnsignedFlag(b.args[0].GetType().Flag)
 	{{- end }}
 	var compareResult int
-	args := b.args
+	args := b.args[1:]
 	{{- if not $InputJSON}}
 	if len(b.hashSet) != 0 {
 		{{- if $InputString }}
 			collator := collate.GetCollator(b.collation)
 		{{- end }}
-		args = b.nonConstArgs
 		for i := 0; i < n; i++ {
 			if buf0.IsNull(i) {
 				hasNull[i] = true
@@ -188,6 +191,11 @@ func (b *{{.SigName}}) vecEvalInt(input *chunk.Chunk, result *chunk.Column) erro
 						r64s[i] = 1
 						result.SetNull(i, false)
 					}
+				{{- else if $InputTime }}
+					if _, ok := b.hashSet[arg0.CoreTime()]; ok {
+						r64s[i] = 1
+						result.SetNull(i, false)
+					}
 				{{- else }}
 					if _, ok := b.hashSet[arg0]; ok {
 						r64s[i] = 1
@@ -196,10 +204,14 @@ func (b *{{.SigName}}) vecEvalInt(input *chunk.Chunk, result *chunk.Column) erro
 				{{- end }}
 			{{- end }}
 		}
+		args = make([]Expression, 0, len(b.nonConstArgsIdx))
+		for _, i := range b.nonConstArgsIdx {
+			args = append(args, b.args[i])
+		}
 	}
 	{{- end }}
 
-	for j := 1; j < len(args); j++ {
+	for j := 0; j < len(args); j++ {
 		if err := args[j].VecEval{{ .Input.TypeName }}(b.ctx, input, buf1); err != nil {
 			return err
 		}
@@ -256,6 +268,7 @@ var testFile = template.Must(template.New("").Parse(`// Copyright 2019 PingCAP, 
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -269,9 +282,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 )
@@ -389,12 +401,12 @@ var vecBuiltin{{ .Category }}GeneratedCases = map[string][]vecExprBenchCase {
 	},
 }
 
-func (s *testEvaluatorSuite) TestVectorizedBuiltin{{.Category}}EvalOneVecGenerated(c *C) {
-	testVectorizedEvalOneVec(c, vecBuiltin{{.Category}}GeneratedCases)
+func TestVectorizedBuiltin{{.Category}}EvalOneVecGenerated(t *testing.T) {
+	testVectorizedEvalOneVec(t, vecBuiltin{{.Category}}GeneratedCases)
 }
 
-func (s *testEvaluatorSuite) TestVectorizedBuiltin{{.Category}}FuncGenerated(c *C) {
-	testVectorizedBuiltinFunc(c, vecBuiltin{{.Category}}GeneratedCases)
+func TestVectorizedBuiltin{{.Category}}FuncGenerated(t *testing.T) {
+	testVectorizedBuiltinFunc(t, vecBuiltin{{.Category}}GeneratedCases)
 }
 
 func BenchmarkVectorizedBuiltin{{.Category}}EvalOneVecGenerated(b *testing.B) {
@@ -450,7 +462,7 @@ func generateDotGo(fileName string) error {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 func generateTestDotGo(fileName string) error {
@@ -464,7 +476,7 @@ func generateTestDotGo(fileName string) error {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 // generateOneFile generate one xxx.go file and the associated xxx_test.go file.

@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,10 +19,10 @@ import (
 	"sync"
 	"time"
 
-	us "github.com/ngaut/unistore/tikv"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/tidb/store/mockstore/cluster"
+	us "github.com/pingcap/tidb/store/mockstore/unistore/tikv"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/tikv/client-go/v2/testutils"
 )
 
 type delayKey struct {
@@ -29,7 +30,7 @@ type delayKey struct {
 	regionID uint64
 }
 
-var _ cluster.Cluster = new(Cluster)
+var _ testutils.Cluster = new(Cluster)
 
 // Cluster simulates a TiKV cluster. It focuses on management and the change of
 // meta data. A Cluster mainly includes following 3 kinds of meta data:
@@ -80,6 +81,11 @@ func (c *Cluster) handleDelay(startTS, regionID uint64) {
 func (c *Cluster) SplitRaw(regionID, newRegionID uint64, rawKey []byte, peerIDs []uint64, leaderPeerID uint64) *metapb.Region {
 	encodedKey := codec.EncodeBytes(nil, rawKey)
 	return c.MockRegionManager.SplitRaw(regionID, newRegionID, encodedKey, peerIDs, leaderPeerID)
+}
+
+// SplitKeys evenly splits the start, end key into "count" regions.
+func (c *Cluster) SplitKeys(start, end []byte, count int) {
+	c.MockRegionManager.SplitKeys(start, end, count)
 }
 
 // BootstrapWithSingleStore initializes a Cluster with 1 Region and 1 Store.

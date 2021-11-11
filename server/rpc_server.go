@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,6 +17,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/diagnosticspb"
@@ -27,14 +29,12 @@ import (
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/session"
-	"github.com/pingcap/tidb/store/mockstore/mocktikv"
-	"github.com/pingcap/tidb/store/mockstore/unistore"
-	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/memory"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 )
 
 // NewRPCServer creates a new rpc server.
@@ -51,13 +51,6 @@ func NewRPCServer(config *config.Config, dom *domain.Domain, sm util.SessionMana
 		DiagnosticsServer: sysutil.NewDiagnosticsServer(config.Log.File.Filename),
 		dom:               dom,
 		sm:                sm,
-	}
-	// For redirection the cop task.
-	mocktikv.GRPCClientFactory = func() mocktikv.Client {
-		return tikv.NewTestRPCClient(config.Security)
-	}
-	unistore.GRPCClientFactory = func() unistore.Client {
-		return tikv.NewTestRPCClient(config.Security)
 	}
 	diagnosticspb.RegisterDiagnosticsServer(s, rpcSrv)
 	tikvpb.RegisterTikvServer(s, rpcSrv)
@@ -184,6 +177,10 @@ func (s *rpcServer) handleCopRequest(ctx context.Context, req *coprocessor.Reque
 		return resp
 	}
 	defer se.Close()
+
+	if p, ok := peer.FromContext(ctx); ok {
+		se.GetSessionVars().SourceAddr = *p.Addr.(*net.TCPAddr)
+	}
 
 	h := executor.NewCoprocessorDAGHandler(se)
 	return h.HandleRequest(ctx, req)

@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,7 +18,7 @@ import (
 	"context"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser"
+	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/util/hint"
@@ -34,7 +35,7 @@ type testStatsSuite struct {
 
 func (s *testStatsSuite) SetUpSuite(c *C) {
 	s.Parser = parser.New()
-	s.Parser.EnableWindowFunc(true)
+	s.Parser.SetParserConfig(parser.ParserConfig{EnableWindowFunction: true, EnableStrictDoubleTypeCheck: true})
 
 	var err error
 	s.testData, err = testutil.LoadTestSuiteData("testdata", "stats_suite")
@@ -69,14 +70,16 @@ func (s *testStatsSuite) TestGroupNDVs(c *C) {
 		AggInput  string
 		JoinInput string
 	}
-	is := dom.InfoSchema()
 	s.testData.GetTestCases(c, &input, &output)
 	for i, tt := range input {
 		comment := Commentf("case:%v sql: %s", i, tt)
 		stmt, err := s.ParseOneStmt(tt, "", "")
 		c.Assert(err, IsNil, comment)
-		core.Preprocess(tk.Se, stmt, is)
-		builder := core.NewPlanBuilder(tk.Se, is, &hint.BlockHintProcessor{})
+		ret := &core.PreprocessorReturn{}
+		err = core.Preprocess(tk.Se, stmt, core.WithPreprocessorReturn(ret))
+		c.Assert(err, IsNil)
+		tk.Se.GetSessionVars().PlanColumnID = 0
+		builder, _ := core.NewPlanBuilder().Init(tk.Se, ret.InfoSchema, &hint.BlockHintProcessor{})
 		p, err := builder.Build(ctx, stmt)
 		c.Assert(err, IsNil, comment)
 		p, err = core.LogicalOptimize(ctx, builder.GetOptFlag(), p.(core.LogicalPlan))
@@ -134,5 +137,38 @@ func (s *testStatsSuite) TestGroupNDVs(c *C) {
 		})
 		c.Assert(aggInput, Equals, output[i].AggInput, comment)
 		c.Assert(joinInput, Equals, output[i].JoinInput, comment)
+	}
+}
+
+func (s *testStatsSuite) TestNDVGroupCols(c *C) {
+	store, dom, err := newStoreWithBootstrap()
+	c.Assert(err, IsNil)
+	defer func() {
+		dom.Close()
+		store.Close()
+	}()
+	tk := testkit.NewTestKit(c, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t1, t2")
+	tk.MustExec("create table t1(a int not null, b int not null, key(a,b))")
+	tk.MustExec("insert into t1 values(1,1),(1,2),(2,1),(2,2)")
+	tk.MustExec("create table t2(a int not null, b int not null, key(a,b))")
+	tk.MustExec("insert into t2 values(1,1),(1,2),(1,3),(2,1),(2,2),(2,3),(3,1),(3,2),(3,3)")
+	tk.MustExec("analyze table t1")
+	tk.MustExec("analyze table t2")
+
+	var input []string
+	var output []struct {
+		SQL  string
+		Plan []string
+	}
+	s.testData.GetTestCases(c, &input, &output)
+	for i, tt := range input {
+		s.testData.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Plan = s.testData.ConvertRowsToStrings(tk.MustQuery("explain format = 'brief' " + tt).Rows())
+		})
+		// The test point is the row count estimation for aggregations and joins.
+		tk.MustQuery("explain format = 'brief' " + tt).Check(testkit.Rows(output[i].Plan...))
 	}
 }

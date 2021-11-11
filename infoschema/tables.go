@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,7 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -26,22 +27,27 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/parser/charset"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/charset"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
+	"github.com/pingcap/tidb/util/stmtsummary"
+
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/ddl/placement"
 	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/session/txninfo"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/deadlockhistory"
 	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/pdapi"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 const (
@@ -66,8 +72,9 @@ const (
 	// TablePartitions is the string constant of infoschema table.
 	TablePartitions = "PARTITIONS"
 	// TableKeyColumn is the string constant of KEY_COLUMN_USAGE.
-	TableKeyColumn  = "KEY_COLUMN_USAGE"
-	tableReferConst = "REFERENTIAL_CONSTRAINTS"
+	TableKeyColumn = "KEY_COLUMN_USAGE"
+	// TableReferConst is the string constant of REFERENTIAL_CONSTRAINTS.
+	TableReferConst = "REFERENTIAL_CONSTRAINTS"
 	// TableSessionVar is the string constant of SESSION_VARIABLES.
 	TableSessionVar = "SESSION_VARIABLES"
 	tablePlugins    = "PLUGINS"
@@ -99,6 +106,8 @@ const (
 	TableTiDBIndexes = "TIDB_INDEXES"
 	// TableTiDBHotRegions is the string constant of infoschema table
 	TableTiDBHotRegions = "TIDB_HOT_REGIONS"
+	// TableTiDBHotRegionsHistory is the string constant of infoschema table
+	TableTiDBHotRegionsHistory = "TIDB_HOT_REGIONS_HISTORY"
 	// TableTiKVStoreStatus is the string constant of infoschema table
 	TableTiKVStoreStatus = "TIKV_STORE_STATUS"
 	// TableAnalyzeStatus is the string constant of Analyze Status
@@ -145,12 +154,45 @@ const (
 	TableStatementsSummary = "STATEMENTS_SUMMARY"
 	// TableStatementsSummaryHistory is the string constant of statements summary history table.
 	TableStatementsSummaryHistory = "STATEMENTS_SUMMARY_HISTORY"
+	// TableStatementsSummaryEvicted is the string constant of statements summary evicted table.
+	TableStatementsSummaryEvicted = "STATEMENTS_SUMMARY_EVICTED"
 	// TableStorageStats is a table that contains all tables disk usage
 	TableStorageStats = "TABLE_STORAGE_STATS"
 	// TableTiFlashTables is the string constant of tiflash tables table.
 	TableTiFlashTables = "TIFLASH_TABLES"
 	// TableTiFlashSegments is the string constant of tiflash segments table.
 	TableTiFlashSegments = "TIFLASH_SEGMENTS"
+	// TableClientErrorsSummaryGlobal is the string constant of client errors table.
+	TableClientErrorsSummaryGlobal = "CLIENT_ERRORS_SUMMARY_GLOBAL"
+	// TableClientErrorsSummaryByUser is the string constant of client errors table.
+	TableClientErrorsSummaryByUser = "CLIENT_ERRORS_SUMMARY_BY_USER"
+	// TableClientErrorsSummaryByHost is the string constant of client errors table.
+	TableClientErrorsSummaryByHost = "CLIENT_ERRORS_SUMMARY_BY_HOST"
+	// TableTiDBTrx is current running transaction status table.
+	TableTiDBTrx = "TIDB_TRX"
+	// TableDeadlocks is the string constant of deadlock table.
+	TableDeadlocks = "DEADLOCKS"
+	// TableDataLockWaits is current lock waiting status table.
+	TableDataLockWaits = "DATA_LOCK_WAITS"
+	// TableAttributes is the string constant of attributes table.
+	TableAttributes = "ATTRIBUTES"
+	// TablePlacementRules is the string constant of placement rules table.
+	TablePlacementRules = "PLACEMENT_RULES"
+)
+
+const (
+	// DataLockWaitsColumnKey is the name of the KEY column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnKey = "KEY"
+	// DataLockWaitsColumnKeyInfo is the name of the KEY_INFO column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnKeyInfo = "KEY_INFO"
+	// DataLockWaitsColumnTrxID is the name of the TRX_ID column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnTrxID = "TRX_ID"
+	// DataLockWaitsColumnCurrentHoldingTrxID is the name of the CURRENT_HOLDING_TRX_ID column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnCurrentHoldingTrxID = "CURRENT_HOLDING_TRX_ID"
+	// DataLockWaitsColumnSQLDigest is the name of the SQL_DIGEST column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnSQLDigest = "SQL_DIGEST"
+	// DataLockWaitsColumnSQLDigestText is the name of the SQL_DIGEST_TEXT column of the DATA_LOCK_WAITS table.
+	DataLockWaitsColumnSQLDigestText = "SQL_DIGEST_TEXT"
 )
 
 var tableIDMap = map[string]int64{
@@ -166,7 +208,7 @@ var tableIDMap = map[string]int64{
 	TableProfiling:                          autoid.InformationSchemaDBID + 10,
 	TablePartitions:                         autoid.InformationSchemaDBID + 11,
 	TableKeyColumn:                          autoid.InformationSchemaDBID + 12,
-	tableReferConst:                         autoid.InformationSchemaDBID + 13,
+	TableReferConst:                         autoid.InformationSchemaDBID + 13,
 	TableSessionVar:                         autoid.InformationSchemaDBID + 14,
 	tablePlugins:                            autoid.InformationSchemaDBID + 15,
 	TableConstraints:                        autoid.InformationSchemaDBID + 16,
@@ -219,22 +261,38 @@ var tableIDMap = map[string]int64{
 	TableStorageStats:                       autoid.InformationSchemaDBID + 63,
 	TableTiFlashTables:                      autoid.InformationSchemaDBID + 64,
 	TableTiFlashSegments:                    autoid.InformationSchemaDBID + 65,
+	// Removed, see https://github.com/pingcap/tidb/issues/28890
+	//TablePlacementPolicy:                    autoid.InformationSchemaDBID + 66,
+	TableClientErrorsSummaryGlobal:       autoid.InformationSchemaDBID + 67,
+	TableClientErrorsSummaryByUser:       autoid.InformationSchemaDBID + 68,
+	TableClientErrorsSummaryByHost:       autoid.InformationSchemaDBID + 69,
+	TableTiDBTrx:                         autoid.InformationSchemaDBID + 70,
+	ClusterTableTiDBTrx:                  autoid.InformationSchemaDBID + 71,
+	TableDeadlocks:                       autoid.InformationSchemaDBID + 72,
+	ClusterTableDeadlocks:                autoid.InformationSchemaDBID + 73,
+	TableDataLockWaits:                   autoid.InformationSchemaDBID + 74,
+	TableStatementsSummaryEvicted:        autoid.InformationSchemaDBID + 75,
+	ClusterTableStatementsSummaryEvicted: autoid.InformationSchemaDBID + 76,
+	TableAttributes:                      autoid.InformationSchemaDBID + 77,
+	TableTiDBHotRegionsHistory:           autoid.InformationSchemaDBID + 78,
+	TablePlacementRules:                  autoid.InformationSchemaDBID + 79,
 }
 
 type columnInfo struct {
-	name    string
-	tp      byte
-	size    int
-	decimal int
-	flag    uint
-	deflt   interface{}
-	comment string
+	name      string
+	tp        byte
+	size      int
+	decimal   int
+	flag      uint
+	deflt     interface{}
+	comment   string
+	enumElems []string
 }
 
 func buildColumnInfo(col columnInfo) *model.ColumnInfo {
 	mCharset := charset.CharsetBin
 	mCollation := charset.CharsetBin
-	if col.tp == mysql.TypeVarchar || col.tp == mysql.TypeBlob || col.tp == mysql.TypeLongBlob {
+	if col.tp == mysql.TypeVarchar || col.tp == mysql.TypeBlob || col.tp == mysql.TypeLongBlob || col.tp == mysql.TypeEnum {
 		mCharset = charset.CharsetUTF8MB4
 		mCollation = charset.CollationUTF8MB4
 	}
@@ -245,6 +303,7 @@ func buildColumnInfo(col columnInfo) *model.ColumnInfo {
 		Flen:    col.size,
 		Decimal: col.decimal,
 		Flag:    col.flag,
+		Elems:   col.enumElems,
 	}
 	return &model.ColumnInfo{
 		Name:         model.NewCIStr(col.name),
@@ -257,19 +316,41 @@ func buildColumnInfo(col columnInfo) *model.ColumnInfo {
 
 func buildTableMeta(tableName string, cs []columnInfo) *model.TableInfo {
 	cols := make([]*model.ColumnInfo, 0, len(cs))
-	for _, c := range cs {
+	primaryIndices := make([]*model.IndexInfo, 0, 1)
+	tblInfo := &model.TableInfo{
+		Name:    model.NewCIStr(tableName),
+		State:   model.StatePublic,
+		Charset: mysql.DefaultCharset,
+		Collate: mysql.DefaultCollationName,
+	}
+	for offset, c := range cs {
+		if tblInfo.Name.O == ClusterTableSlowLog && mysql.HasPriKeyFlag(c.flag) {
+			switch c.tp {
+			case mysql.TypeLong, mysql.TypeLonglong,
+				mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24:
+				tblInfo.PKIsHandle = true
+			default:
+				tblInfo.IsCommonHandle = true
+				tblInfo.CommonHandleVersion = 1
+				index := &model.IndexInfo{
+					Name:    model.NewCIStr("primary"),
+					State:   model.StatePublic,
+					Primary: true,
+					Unique:  true,
+					Columns: []*model.IndexColumn{
+						{Name: model.NewCIStr(c.name), Offset: offset, Length: types.UnspecifiedLength}},
+				}
+				primaryIndices = append(primaryIndices, index)
+				tblInfo.Indices = primaryIndices
+			}
+		}
 		cols = append(cols, buildColumnInfo(c))
 	}
 	for i, col := range cols {
 		col.Offset = i
 	}
-	return &model.TableInfo{
-		Name:    model.NewCIStr(tableName),
-		Columns: cols,
-		State:   model.StatePublic,
-		Charset: mysql.DefaultCharset,
-		Collate: mysql.DefaultCollationName,
-	}
+	tblInfo.Columns = cols
+	return tblInfo
 }
 
 var schemataCols = []columnInfo{
@@ -298,13 +379,15 @@ var tablesCols = []columnInfo{
 	{name: "CREATE_TIME", tp: mysql.TypeDatetime, size: 19},
 	{name: "UPDATE_TIME", tp: mysql.TypeDatetime, size: 19},
 	{name: "CHECK_TIME", tp: mysql.TypeDatetime, size: 19},
-	{name: "TABLE_COLLATION", tp: mysql.TypeVarchar, size: 32, flag: mysql.NotNullFlag, deflt: "utf8_bin"},
+	{name: "TABLE_COLLATION", tp: mysql.TypeVarchar, size: 32, deflt: mysql.DefaultCollationName},
 	{name: "CHECKSUM", tp: mysql.TypeLonglong, size: 21},
 	{name: "CREATE_OPTIONS", tp: mysql.TypeVarchar, size: 255},
 	{name: "TABLE_COMMENT", tp: mysql.TypeVarchar, size: 2048},
 	{name: "TIDB_TABLE_ID", tp: mysql.TypeLonglong, size: 21},
 	{name: "TIDB_ROW_ID_SHARDING_INFO", tp: mysql.TypeVarchar, size: 255},
 	{name: "TIDB_PK_TYPE", tp: mysql.TypeVarchar, size: 64},
+	{name: "TIDB_PLACEMENT_POLICY_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TIDB_DIRECT_PLACEMENT", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},
 }
 
 // See: http://dev.mysql.com/doc/refman/5.7/en/columns-table.html
@@ -475,6 +558,9 @@ var partitionsCols = []columnInfo{
 	{name: "PARTITION_COMMENT", tp: mysql.TypeVarchar, size: 80},
 	{name: "NODEGROUP", tp: mysql.TypeVarchar, size: 12},
 	{name: "TABLESPACE_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TIDB_PARTITION_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "TIDB_PLACEMENT_POLICY_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TIDB_DIRECT_PLACEMENT", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},
 }
 
 var tableConstraintsCols = []columnInfo{
@@ -695,7 +781,9 @@ var tableProcesslistCols = []columnInfo{
 	{name: "TIME", tp: mysql.TypeLong, size: 7, flag: mysql.NotNullFlag, deflt: 0},
 	{name: "STATE", tp: mysql.TypeVarchar, size: 7},
 	{name: "INFO", tp: mysql.TypeLongBlob, size: types.UnspecifiedLength},
+	{name: "DIGEST", tp: mysql.TypeVarchar, size: 64, deflt: ""},
 	{name: "MEM", tp: mysql.TypeLonglong, size: 21, flag: mysql.UnsignedFlag},
+	{name: "DISK", tp: mysql.TypeLonglong, size: 21, flag: mysql.UnsignedFlag},
 	{name: "TxnStart", tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag, deflt: ""},
 }
 
@@ -711,10 +799,11 @@ var tableTiDBIndexesCols = []columnInfo{
 	{name: "Expression", tp: mysql.TypeVarchar, size: 64},
 	{name: "INDEX_ID", tp: mysql.TypeLonglong, size: 21},
 	{name: "IS_VISIBLE", tp: mysql.TypeVarchar, size: 64},
+	{name: "CLUSTERED", tp: mysql.TypeVarchar, size: 64},
 }
 
 var slowQueryCols = []columnInfo{
-	{name: variable.SlowLogTimeStr, tp: mysql.TypeTimestamp, size: 26, decimal: 6},
+	{name: variable.SlowLogTimeStr, tp: mysql.TypeTimestamp, size: 26, decimal: 6, flag: mysql.PriKeyFlag | mysql.NotNullFlag | mysql.BinaryFlag},
 	{name: variable.SlowLogTxnStartTSStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
 	{name: variable.SlowLogUserStr, tp: mysql.TypeVarchar, size: 64},
 	{name: variable.SlowLogHostStr, tp: mysql.TypeVarchar, size: 64},
@@ -749,6 +838,11 @@ var slowQueryCols = []columnInfo{
 	{name: execdetails.RequestCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
 	{name: execdetails.TotalKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
 	{name: execdetails.ProcessKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
+	{name: execdetails.RocksdbDeleteSkippedCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
+	{name: execdetails.RocksdbKeySkippedCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
+	{name: execdetails.RocksdbBlockCacheHitCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
+	{name: execdetails.RocksdbBlockReadCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
+	{name: execdetails.RocksdbBlockReadByteStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
 	{name: variable.SlowLogDBStr, tp: mysql.TypeVarchar, size: 64},
 	{name: variable.SlowLogIndexNamesStr, tp: mysql.TypeVarchar, size: 100},
 	{name: variable.SlowLogIsInternalStr, tp: mysql.TypeTiny, size: 1},
@@ -764,8 +858,17 @@ var slowQueryCols = []columnInfo{
 	{name: variable.SlowLogCopWaitAddr, tp: mysql.TypeVarchar, size: 64},
 	{name: variable.SlowLogMemMax, tp: mysql.TypeLonglong, size: 20},
 	{name: variable.SlowLogDiskMax, tp: mysql.TypeLonglong, size: 20},
+	{name: variable.SlowLogKVTotal, tp: mysql.TypeDouble, size: 22},
+	{name: variable.SlowLogPDTotal, tp: mysql.TypeDouble, size: 22},
+	{name: variable.SlowLogBackoffTotal, tp: mysql.TypeDouble, size: 22},
+	{name: variable.SlowLogWriteSQLRespTotal, tp: mysql.TypeDouble, size: 22},
+	{name: variable.SlowLogResultRows, tp: mysql.TypeLonglong, size: 22},
+	{name: variable.SlowLogBackoffDetail, tp: mysql.TypeVarchar, size: 4096},
+	{name: variable.SlowLogPrepared, tp: mysql.TypeTiny, size: 1},
 	{name: variable.SlowLogSucc, tp: mysql.TypeTiny, size: 1},
+	{name: variable.SlowLogIsExplicitTxn, tp: mysql.TypeTiny, size: 1},
 	{name: variable.SlowLogPlanFromCache, tp: mysql.TypeTiny, size: 1},
+	{name: variable.SlowLogPlanFromBinding, tp: mysql.TypeTiny, size: 1},
 	{name: variable.SlowLogPlan, tp: mysql.TypeLongBlob, size: types.UnspecifiedLength},
 	{name: variable.SlowLogPlanDigest, tp: mysql.TypeVarchar, size: 128},
 	{name: variable.SlowLogPrevStmt, tp: mysql.TypeLongBlob, size: types.UnspecifiedLength},
@@ -784,6 +887,26 @@ var TableTiDBHotRegionsCols = []columnInfo{
 	{name: "MAX_HOT_DEGREE", tp: mysql.TypeLonglong, size: 21},
 	{name: "REGION_COUNT", tp: mysql.TypeLonglong, size: 21},
 	{name: "FLOW_BYTES", tp: mysql.TypeLonglong, size: 21},
+}
+
+// TableTiDBHotRegionsHistoryCols is TiDB hot region history mem table columns.
+var TableTiDBHotRegionsHistoryCols = []columnInfo{
+	{name: "UPDATE_TIME", tp: mysql.TypeTimestamp, size: 26, decimal: 6},
+	{name: "DB_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TABLE_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TABLE_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "INDEX_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "INDEX_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "REGION_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "STORE_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "PEER_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "IS_LEARNER", tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, deflt: 0},
+	{name: "IS_LEADER", tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, deflt: 0},
+	{name: "TYPE", tp: mysql.TypeVarchar, size: 64},
+	{name: "HOT_DEGREE", tp: mysql.TypeLonglong, size: 21},
+	{name: "FLOW_BYTES", tp: mysql.TypeDouble, size: 22},
+	{name: "KEY_RATE", tp: mysql.TypeDouble, size: 22},
+	{name: "QUERY_RATE", tp: mysql.TypeDouble, size: 22},
 }
 
 // TableTiKVStoreStatusCols is TiDB kv store status columns.
@@ -816,6 +939,7 @@ var tableAnalyzeStatusCols = []columnInfo{
 	{name: "JOB_INFO", tp: mysql.TypeVarchar, size: 64},
 	{name: "PROCESSED_ROWS", tp: mysql.TypeLonglong, size: 20, flag: mysql.UnsignedFlag},
 	{name: "START_TIME", tp: mysql.TypeDatetime},
+	{name: "END_TIME", tp: mysql.TypeDatetime},
 	{name: "STATE", tp: mysql.TypeVarchar, size: 64},
 }
 
@@ -954,6 +1078,7 @@ var tableClusterInfoCols = []columnInfo{
 	{name: "GIT_HASH", tp: mysql.TypeVarchar, size: 64},
 	{name: "START_TIME", tp: mysql.TypeVarchar, size: 32},
 	{name: "UPTIME", tp: mysql.TypeVarchar, size: 32},
+	{name: "SERVER_ID", tp: mysql.TypeLonglong, size: 21, comment: "invalid if the configuration item `enable-global-kill` is set to FALSE"},
 }
 
 var tableTableTiFlashReplicaCols = []columnInfo{
@@ -1056,78 +1181,97 @@ var tableSequencesCols = []columnInfo{
 }
 
 var tableStatementsSummaryCols = []columnInfo{
-	{name: "SUMMARY_BEGIN_TIME", tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "Begin time of this summary"},
-	{name: "SUMMARY_END_TIME", tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "End time of this summary"},
-	{name: "STMT_TYPE", tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag, comment: "Statement type"},
-	{name: "SCHEMA_NAME", tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag, comment: "Current schema"},
-	{name: "DIGEST", tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag},
-	{name: "DIGEST_TEXT", tp: mysql.TypeBlob, size: types.UnspecifiedLength, flag: mysql.NotNullFlag, comment: "Normalized statement"},
-	{name: "TABLE_NAMES", tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Involved tables"},
-	{name: "INDEX_NAMES", tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Used indices"},
-	{name: "SAMPLE_USER", tp: mysql.TypeVarchar, size: 64, comment: "Sampled user who executed these statements"},
-	{name: "EXEC_COUNT", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Count of executions"},
-	{name: "SUM_ERRORS", tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of errors"},
-	{name: "SUM_WARNINGS", tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of warnings"},
-	{name: "SUM_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum latency of these statements"},
-	{name: "MAX_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of these statements"},
-	{name: "MIN_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Min latency of these statements"},
-	{name: "AVG_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of these statements"},
-	{name: "AVG_PARSE_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of parsing"},
-	{name: "MAX_PARSE_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of parsing"},
-	{name: "AVG_COMPILE_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of compiling"},
-	{name: "MAX_COMPILE_LATENCY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of compiling"},
-	{name: "SUM_COP_TASK_NUM", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Total number of CopTasks"},
-	{name: "MAX_COP_PROCESS_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max processing time of CopTasks"},
-	{name: "MAX_COP_PROCESS_ADDRESS", tp: mysql.TypeVarchar, size: 256, comment: "Address of the CopTask with max processing time"},
-	{name: "MAX_COP_WAIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time of CopTasks"},
-	{name: "MAX_COP_WAIT_ADDRESS", tp: mysql.TypeVarchar, size: 256, comment: "Address of the CopTask with max waiting time"},
-	{name: "AVG_PROCESS_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average processing time in TiKV"},
-	{name: "MAX_PROCESS_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max processing time in TiKV"},
-	{name: "AVG_WAIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time in TiKV"},
-	{name: "MAX_WAIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time in TiKV"},
-	{name: "AVG_BACKOFF_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time before retry"},
-	{name: "MAX_BACKOFF_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time before retry"},
-	{name: "AVG_TOTAL_KEYS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of scanned keys"},
-	{name: "MAX_TOTAL_KEYS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of scanned keys"},
-	{name: "AVG_PROCESSED_KEYS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of processed keys"},
-	{name: "MAX_PROCESSED_KEYS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of processed keys"},
-	{name: "AVG_PREWRITE_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of prewrite phase"},
-	{name: "MAX_PREWRITE_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of prewrite phase"},
-	{name: "AVG_COMMIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of commit phase"},
-	{name: "MAX_COMMIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of commit phase"},
-	{name: "AVG_GET_COMMIT_TS_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of getting commit_ts"},
-	{name: "MAX_GET_COMMIT_TS_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of getting commit_ts"},
-	{name: "AVG_COMMIT_BACKOFF_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time before retry during commit phase"},
-	{name: "MAX_COMMIT_BACKOFF_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time before retry during commit phase"},
-	{name: "AVG_RESOLVE_LOCK_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time for resolving locks"},
-	{name: "MAX_RESOLVE_LOCK_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time for resolving locks"},
-	{name: "AVG_LOCAL_LATCH_WAIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time of local transaction"},
-	{name: "MAX_LOCAL_LATCH_WAIT_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time of local transaction"},
-	{name: "AVG_WRITE_KEYS", tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average count of written keys"},
-	{name: "MAX_WRITE_KEYS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max count of written keys"},
-	{name: "AVG_WRITE_SIZE", tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average amount of written bytes"},
-	{name: "MAX_WRITE_SIZE", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max amount of written bytes"},
-	{name: "AVG_PREWRITE_REGIONS", tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of involved regions in prewrite phase"},
-	{name: "MAX_PREWRITE_REGIONS", tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of involved regions in prewrite phase"},
-	{name: "AVG_TXN_RETRY", tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of transaction retries"},
-	{name: "MAX_TXN_RETRY", tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of transaction retries"},
-	{name: "SUM_EXEC_RETRY", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum number of execution retries in pessimistic transactions"},
-	{name: "SUM_EXEC_RETRY_TIME", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum time of execution retries in pessimistic transactions"},
-	{name: "SUM_BACKOFF_TIMES", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of retries"},
-	{name: "BACKOFF_TYPES", tp: mysql.TypeVarchar, size: 1024, comment: "Types of errors and the number of retries for each type"},
-	{name: "AVG_MEM", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average memory(byte) used"},
-	{name: "MAX_MEM", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max memory(byte) used"},
-	{name: "AVG_DISK", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average disk space(byte) used"},
-	{name: "MAX_DISK", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max disk space(byte) used"},
-	{name: "AVG_AFFECTED_ROWS", tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rows affected"},
-	{name: "FIRST_SEEN", tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "The time these statements are seen for the first time"},
-	{name: "LAST_SEEN", tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "The time these statements are seen for the last time"},
-	{name: "PLAN_IN_CACHE", tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, comment: "Whether the last statement hit plan cache"},
-	{name: "PLAN_CACHE_HITS", tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag, comment: "The number of times these statements hit plan cache"},
-	{name: "QUERY_SAMPLE_TEXT", tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Sampled original statement"},
-	{name: "PREV_SAMPLE_TEXT", tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "The previous statement before commit"},
-	{name: "PLAN_DIGEST", tp: mysql.TypeVarchar, size: 64, comment: "Digest of its execution plan"},
-	{name: "PLAN", tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Sampled execution plan"},
+	{name: stmtsummary.SummaryBeginTimeStr, tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "Begin time of this summary"},
+	{name: stmtsummary.SummaryEndTimeStr, tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "End time of this summary"},
+	{name: stmtsummary.StmtTypeStr, tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag, comment: "Statement type"},
+	{name: stmtsummary.SchemaNameStr, tp: mysql.TypeVarchar, size: 64, comment: "Current schema"},
+	{name: stmtsummary.DigestStr, tp: mysql.TypeVarchar, size: 64},
+	{name: stmtsummary.DigestTextStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, flag: mysql.NotNullFlag, comment: "Normalized statement"},
+	{name: stmtsummary.TableNamesStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Involved tables"},
+	{name: stmtsummary.IndexNamesStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Used indices"},
+	{name: stmtsummary.SampleUserStr, tp: mysql.TypeVarchar, size: 64, comment: "Sampled user who executed these statements"},
+	{name: stmtsummary.ExecCountStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Count of executions"},
+	{name: stmtsummary.SumErrorsStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of errors"},
+	{name: stmtsummary.SumWarningsStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of warnings"},
+	{name: stmtsummary.SumLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum latency of these statements"},
+	{name: stmtsummary.MaxLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of these statements"},
+	{name: stmtsummary.MinLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Min latency of these statements"},
+	{name: stmtsummary.AvgLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of these statements"},
+	{name: stmtsummary.AvgParseLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of parsing"},
+	{name: stmtsummary.MaxParseLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of parsing"},
+	{name: stmtsummary.AvgCompileLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average latency of compiling"},
+	{name: stmtsummary.MaxCompileLatencyStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max latency of compiling"},
+	{name: stmtsummary.SumCopTaskNumStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Total number of CopTasks"},
+	{name: stmtsummary.MaxCopProcessTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max processing time of CopTasks"},
+	{name: stmtsummary.MaxCopProcessAddressStr, tp: mysql.TypeVarchar, size: 256, comment: "Address of the CopTask with max processing time"},
+	{name: stmtsummary.MaxCopWaitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time of CopTasks"},
+	{name: stmtsummary.MaxCopWaitAddressStr, tp: mysql.TypeVarchar, size: 256, comment: "Address of the CopTask with max waiting time"},
+	{name: stmtsummary.AvgProcessTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average processing time in TiKV"},
+	{name: stmtsummary.MaxProcessTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max processing time in TiKV"},
+	{name: stmtsummary.AvgWaitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time in TiKV"},
+	{name: stmtsummary.MaxWaitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time in TiKV"},
+	{name: stmtsummary.AvgBackoffTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time before retry"},
+	{name: stmtsummary.MaxBackoffTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time before retry"},
+	{name: stmtsummary.AvgTotalKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of scanned keys"},
+	{name: stmtsummary.MaxTotalKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of scanned keys"},
+	{name: stmtsummary.AvgProcessedKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of processed keys"},
+	{name: stmtsummary.MaxProcessedKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of processed keys"},
+	{name: stmtsummary.AvgRocksdbDeleteSkippedCountStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rocksdb delete skipped count"},
+	{name: stmtsummary.MaxRocksdbDeleteSkippedCountStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of rocksdb delete skipped count"},
+	{name: stmtsummary.AvgRocksdbKeySkippedCountStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rocksdb key skipped count"},
+	{name: stmtsummary.MaxRocksdbKeySkippedCountStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of rocksdb key skipped count"},
+	{name: stmtsummary.AvgRocksdbBlockCacheHitCountStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rocksdb block cache hit count"},
+	{name: stmtsummary.MaxRocksdbBlockCacheHitCountStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of rocksdb block cache hit count"},
+	{name: stmtsummary.AvgRocksdbBlockReadCountStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rocksdb block read count"},
+	{name: stmtsummary.MaxRocksdbBlockReadCountStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of rocksdb block read count"},
+	{name: stmtsummary.AvgRocksdbBlockReadByteStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rocksdb block read byte"},
+	{name: stmtsummary.MaxRocksdbBlockReadByteStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of rocksdb block read byte"},
+	{name: stmtsummary.AvgPrewriteTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of prewrite phase"},
+	{name: stmtsummary.MaxPrewriteTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of prewrite phase"},
+	{name: stmtsummary.AvgCommitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of commit phase"},
+	{name: stmtsummary.MaxCommitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of commit phase"},
+	{name: stmtsummary.AvgGetCommitTsTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of getting commit_ts"},
+	{name: stmtsummary.MaxGetCommitTsTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time of getting commit_ts"},
+	{name: stmtsummary.AvgCommitBackoffTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time before retry during commit phase"},
+	{name: stmtsummary.MaxCommitBackoffTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time before retry during commit phase"},
+	{name: stmtsummary.AvgResolveLockTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time for resolving locks"},
+	{name: stmtsummary.MaxResolveLockTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max time for resolving locks"},
+	{name: stmtsummary.AvgLocalLatchWaitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average waiting time of local transaction"},
+	{name: stmtsummary.MaxLocalLatchWaitTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max waiting time of local transaction"},
+	{name: stmtsummary.AvgWriteKeysStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average count of written keys"},
+	{name: stmtsummary.MaxWriteKeysStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max count of written keys"},
+	{name: stmtsummary.AvgWriteSizeStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average amount of written bytes"},
+	{name: stmtsummary.MaxWriteSizeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max amount of written bytes"},
+	{name: stmtsummary.AvgPrewriteRegionsStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of involved regions in prewrite phase"},
+	{name: stmtsummary.MaxPrewriteRegionsStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of involved regions in prewrite phase"},
+	{name: stmtsummary.AvgTxnRetryStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of transaction retries"},
+	{name: stmtsummary.MaxTxnRetryStr, tp: mysql.TypeLong, size: 11, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max number of transaction retries"},
+	{name: stmtsummary.SumExecRetryStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum number of execution retries in pessimistic transactions"},
+	{name: stmtsummary.SumExecRetryTimeStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum time of execution retries in pessimistic transactions"},
+	{name: stmtsummary.SumBackoffTimesStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Sum of retries"},
+	{name: stmtsummary.BackoffTypesStr, tp: mysql.TypeVarchar, size: 1024, comment: "Types of errors and the number of retries for each type"},
+	{name: stmtsummary.AvgMemStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average memory(byte) used"},
+	{name: stmtsummary.MaxMemStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max memory(byte) used"},
+	{name: stmtsummary.AvgDiskStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average disk space(byte) used"},
+	{name: stmtsummary.MaxDiskStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Max disk space(byte) used"},
+	{name: stmtsummary.AvgKvTimeStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of TiKV used"},
+	{name: stmtsummary.AvgPdTimeStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of PD used"},
+	{name: stmtsummary.AvgBackoffTotalTimeStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of Backoff used"},
+	{name: stmtsummary.AvgWriteSQLRespTimeStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average time of write sql resp used"},
+	{name: stmtsummary.MaxResultRowsStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag, comment: "Max count of sql result rows"},
+	{name: stmtsummary.MinResultRowsStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag, comment: "Min count of sql result rows"},
+	{name: stmtsummary.AvgResultRowsStr, tp: mysql.TypeLonglong, size: 22, flag: mysql.NotNullFlag, comment: "Average count of sql result rows"},
+	{name: stmtsummary.PreparedStr, tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, comment: "Whether prepared"},
+	{name: stmtsummary.AvgAffectedRowsStr, tp: mysql.TypeDouble, size: 22, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Average number of rows affected"},
+	{name: stmtsummary.FirstSeenStr, tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "The time these statements are seen for the first time"},
+	{name: stmtsummary.LastSeenStr, tp: mysql.TypeTimestamp, size: 26, flag: mysql.NotNullFlag, comment: "The time these statements are seen for the last time"},
+	{name: stmtsummary.PlanInCacheStr, tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, comment: "Whether the last statement hit plan cache"},
+	{name: stmtsummary.PlanCacheHitsStr, tp: mysql.TypeLonglong, size: 20, flag: mysql.NotNullFlag, comment: "The number of times these statements hit plan cache"},
+	{name: stmtsummary.PlanInBindingStr, tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, comment: "Whether the last statement is matched with the hints in the binding"},
+	{name: stmtsummary.QuerySampleTextStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Sampled original statement"},
+	{name: stmtsummary.PrevSampleTextStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "The previous statement before commit"},
+	{name: stmtsummary.PlanDigestStr, tp: mysql.TypeVarchar, size: 64, comment: "Digest of its execution plan"},
+	{name: stmtsummary.PlanStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Sampled execution plan"},
 }
 
 var tableStorageStatsCols = []columnInfo{
@@ -1182,14 +1326,20 @@ var tableTableTiFlashTablesCols = []columnInfo{
 	{name: "AVG_PACK_ROWS_IN_STABLE", tp: mysql.TypeDouble, size: 64},
 	{name: "AVG_PACK_SIZE_IN_STABLE", tp: mysql.TypeDouble, size: 64},
 	{name: "STORAGE_STABLE_NUM_SNAPSHOTS", tp: mysql.TypeLonglong, size: 64},
+	{name: "STORAGE_STABLE_OLDEST_SNAPSHOT_LIFETIME", tp: mysql.TypeDouble, size: 64},
+	{name: "STORAGE_STABLE_OLDEST_SNAPSHOT_THREAD_ID", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_STABLE_NUM_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_STABLE_NUM_NORMAL_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_STABLE_MAX_PAGE_ID", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_DELTA_NUM_SNAPSHOTS", tp: mysql.TypeLonglong, size: 64},
+	{name: "STORAGE_DELTA_OLDEST_SNAPSHOT_LIFETIME", tp: mysql.TypeDouble, size: 64},
+	{name: "STORAGE_DELTA_OLDEST_SNAPSHOT_THREAD_ID", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_DELTA_NUM_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_DELTA_NUM_NORMAL_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_DELTA_MAX_PAGE_ID", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_META_NUM_SNAPSHOTS", tp: mysql.TypeLonglong, size: 64},
+	{name: "STORAGE_META_OLDEST_SNAPSHOT_LIFETIME", tp: mysql.TypeDouble, size: 64},
+	{name: "STORAGE_META_OLDEST_SNAPSHOT_THREAD_ID", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_META_NUM_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_META_NUM_NORMAL_PAGES", tp: mysql.TypeLonglong, size: 64},
 	{name: "STORAGE_META_MAX_PAGE_ID", tp: mysql.TypeLonglong, size: 64},
@@ -1218,6 +1368,102 @@ var tableTableTiFlashSegmentsCols = []columnInfo{
 	{name: "DELTA_CACHE_SIZE", tp: mysql.TypeLonglong, size: 64},
 	{name: "DELTA_INDEX_SIZE", tp: mysql.TypeLonglong, size: 64},
 	{name: "TIFLASH_INSTANCE", tp: mysql.TypeVarchar, size: 64},
+}
+
+var tableClientErrorsSummaryGlobalCols = []columnInfo{
+	{name: "ERROR_NUMBER", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "ERROR_MESSAGE", tp: mysql.TypeVarchar, size: 1024, flag: mysql.NotNullFlag},
+	{name: "ERROR_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "WARNING_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "FIRST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+	{name: "LAST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+}
+
+var tableClientErrorsSummaryByUserCols = []columnInfo{
+	{name: "USER", tp: mysql.TypeVarchar, size: 64, flag: mysql.NotNullFlag},
+	{name: "ERROR_NUMBER", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "ERROR_MESSAGE", tp: mysql.TypeVarchar, size: 1024, flag: mysql.NotNullFlag},
+	{name: "ERROR_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "WARNING_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "FIRST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+	{name: "LAST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+}
+
+var tableClientErrorsSummaryByHostCols = []columnInfo{
+	{name: "HOST", tp: mysql.TypeVarchar, size: 255, flag: mysql.NotNullFlag},
+	{name: "ERROR_NUMBER", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "ERROR_MESSAGE", tp: mysql.TypeVarchar, size: 1024, flag: mysql.NotNullFlag},
+	{name: "ERROR_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "WARNING_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "FIRST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+	{name: "LAST_SEEN", tp: mysql.TypeTimestamp, size: 26},
+}
+
+var tableTiDBTrxCols = []columnInfo{
+	{name: txninfo.IDStr, tp: mysql.TypeLonglong, size: 21, flag: mysql.PriKeyFlag | mysql.NotNullFlag | mysql.UnsignedFlag},
+	{name: txninfo.StartTimeStr, tp: mysql.TypeTimestamp, decimal: 6, size: 26, comment: "Start time of the transaction"},
+	{name: txninfo.CurrentSQLDigestStr, tp: mysql.TypeVarchar, size: 64, comment: "Digest of the sql the transaction are currently running"},
+	{name: txninfo.CurrentSQLDigestTextStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "The normalized sql the transaction are currently running"},
+	{name: txninfo.StateStr, tp: mysql.TypeEnum, enumElems: txninfo.TxnRunningStateStrs, comment: "Current running state of the transaction"},
+	{name: txninfo.WaitingStartTimeStr, tp: mysql.TypeTimestamp, decimal: 6, size: 26, comment: "Current lock waiting's start time"},
+	{name: txninfo.MemBufferKeysStr, tp: mysql.TypeLonglong, size: 64, comment: "How many entries are in MemDB"},
+	{name: txninfo.MemBufferBytesStr, tp: mysql.TypeLonglong, size: 64, comment: "MemDB used memory"},
+	{name: txninfo.SessionIDStr, tp: mysql.TypeLonglong, size: 21, flag: mysql.UnsignedFlag, comment: "Which session this transaction belongs to"},
+	{name: txninfo.UserStr, tp: mysql.TypeVarchar, size: 16, comment: "The user who open this session"},
+	{name: txninfo.DBStr, tp: mysql.TypeVarchar, size: 64, comment: "The schema this transaction works on"},
+	{name: txninfo.AllSQLDigestsStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "A list of the digests of SQL statements that the transaction has executed"},
+}
+
+var tableDeadlocksCols = []columnInfo{
+	{name: deadlockhistory.ColDeadlockIDStr, tp: mysql.TypeLonglong, size: 21, flag: mysql.NotNullFlag, comment: "The ID to distinguish different deadlock events"},
+	{name: deadlockhistory.ColOccurTimeStr, tp: mysql.TypeTimestamp, decimal: 6, size: 26, comment: "The physical time when the deadlock occurs"},
+	{name: deadlockhistory.ColRetryableStr, tp: mysql.TypeTiny, size: 1, flag: mysql.NotNullFlag, comment: "Whether the deadlock is retryable. Retryable deadlocks are usually not reported to the client"},
+	{name: deadlockhistory.ColTryLockTrxIDStr, tp: mysql.TypeLonglong, size: 21, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "The transaction ID (start ts) of the transaction that's trying to acquire the lock"},
+	{name: deadlockhistory.ColCurrentSQLDigestStr, tp: mysql.TypeVarchar, size: 64, comment: "The digest of the SQL that's being blocked"},
+	{name: deadlockhistory.ColCurrentSQLDigestTextStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "The normalized SQL that's being blocked"},
+	{name: deadlockhistory.ColKeyStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "The key on which a transaction is waiting for another"},
+	{name: deadlockhistory.ColKeyInfoStr, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Information of the key"},
+	{name: deadlockhistory.ColTrxHoldingLockStr, tp: mysql.TypeLonglong, size: 21, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "The transaction ID (start ts) of the transaction that's currently holding the lock"},
+}
+
+var tableDataLockWaitsCols = []columnInfo{
+	{name: DataLockWaitsColumnKey, tp: mysql.TypeBlob, size: types.UnspecifiedLength, flag: mysql.NotNullFlag, comment: "The key that's being waiting on"},
+	{name: DataLockWaitsColumnKeyInfo, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Information of the key"},
+	{name: DataLockWaitsColumnTrxID, tp: mysql.TypeLonglong, size: 21, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "Current transaction that's waiting for the lock"},
+	{name: DataLockWaitsColumnCurrentHoldingTrxID, tp: mysql.TypeLonglong, size: 21, flag: mysql.NotNullFlag | mysql.UnsignedFlag, comment: "The transaction that's holding the lock and blocks the current transaction"},
+	{name: DataLockWaitsColumnSQLDigest, tp: mysql.TypeVarchar, size: 64, comment: "Digest of the SQL that's trying to acquire the lock"},
+	{name: DataLockWaitsColumnSQLDigestText, tp: mysql.TypeBlob, size: types.UnspecifiedLength, comment: "Digest of the SQL that's trying to acquire the lock"},
+}
+
+var tableStatementsSummaryEvictedCols = []columnInfo{
+	{name: "BEGIN_TIME", tp: mysql.TypeTimestamp, size: 26},
+	{name: "END_TIME", tp: mysql.TypeTimestamp, size: 26},
+	{name: "EVICTED_COUNT", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+}
+
+var tableAttributesCols = []columnInfo{
+	{name: "ID", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "TYPE", tp: mysql.TypeVarchar, size: 16, flag: mysql.NotNullFlag},
+	{name: "ATTRIBUTES", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},
+	{name: "RANGES", tp: mysql.TypeBlob, size: types.UnspecifiedLength},
+}
+
+var tablePlacementRulesCols = []columnInfo{
+	{name: "POLICY_ID", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "CATALOG_NAME", tp: mysql.TypeVarchar, size: 512, flag: mysql.NotNullFlag},
+	{name: "POLICY_NAME", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},    // Catalog wide policy
+	{name: "SCHEMA_NAME", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},    // System policy does not have a schema
+	{name: "TABLE_NAME", tp: mysql.TypeVarchar, size: types.UnspecifiedLength},     // Schema level rules does not have a table
+	{name: "PARTITION_NAME", tp: mysql.TypeVarchar, size: types.UnspecifiedLength}, // Table level rules does not have a partition
+	{name: "PRIMARY_REGION", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "REGIONS", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "CONSTRAINTS", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "LEADER_CONSTRAINTS", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "FOLLOWER_CONSTRAINTS", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "LEARNER_CONSTRAINTS", tp: mysql.TypeVarchar, size: types.UnspecifiedLength, flag: mysql.NotNullFlag},
+	{name: "SCHEDULE", tp: mysql.TypeVarchar, size: 20, flag: mysql.NotNullFlag}, // EVEN or MAJORITY_IN_PRIMARY
+	{name: "FOLLOWERS", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
+	{name: "LEARNERS", tp: mysql.TypeLonglong, size: 64, flag: mysql.NotNullFlag},
 }
 
 // GetShardingInfo returns a nil or description string for the sharding information of given TableInfo.
@@ -1262,6 +1508,35 @@ type ServerInfo struct {
 	Version        string
 	GitHash        string
 	StartTimestamp int64
+	ServerID       uint64
+}
+
+func (s *ServerInfo) isLoopBackOrUnspecifiedAddr(addr string) bool {
+	tcpAddr, err := net.ResolveTCPAddr("", addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(tcpAddr.IP.String())
+	return ip != nil && (ip.IsUnspecified() || ip.IsLoopback())
+}
+
+// ResolveLoopBackAddr exports for testing.
+func (s *ServerInfo) ResolveLoopBackAddr() {
+	if s.isLoopBackOrUnspecifiedAddr(s.Address) && !s.isLoopBackOrUnspecifiedAddr(s.StatusAddr) {
+		addr, err1 := net.ResolveTCPAddr("", s.Address)
+		statusAddr, err2 := net.ResolveTCPAddr("", s.StatusAddr)
+		if err1 == nil && err2 == nil {
+			addr.IP = statusAddr.IP
+			s.Address = addr.String()
+		}
+	} else if !s.isLoopBackOrUnspecifiedAddr(s.Address) && s.isLoopBackOrUnspecifiedAddr(s.StatusAddr) {
+		addr, err1 := net.ResolveTCPAddr("", s.Address)
+		statusAddr, err2 := net.ResolveTCPAddr("", s.StatusAddr)
+		if err1 == nil && err2 == nil {
+			statusAddr.IP = addr.IP
+			s.StatusAddr = statusAddr.String()
+		}
+	}
 }
 
 // GetClusterServerInfo returns all components information of cluster
@@ -1273,12 +1548,17 @@ func GetClusterServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 			var servers []ServerInfo
 			for _, server := range strings.Split(s, ";") {
 				parts := strings.Split(server, ",")
+				serverID, err := strconv.ParseUint(parts[5], 10, 64)
+				if err != nil {
+					panic("convert parts[5] to uint64 failed")
+				}
 				servers = append(servers, ServerInfo{
 					ServerType: parts[0],
 					Address:    parts[1],
 					StatusAddr: parts[2],
 					Version:    parts[3],
 					GitHash:    parts[4],
+					ServerID:   serverID,
 				})
 			}
 			failpoint.Return(servers, nil)
@@ -1292,6 +1572,9 @@ func GetClusterServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 		if err != nil {
 			return nil, err
 		}
+		for i := range nodes {
+			nodes[i].ResolveLoopBackAddr()
+		}
 		servers = append(servers, nodes...)
 	}
 	return servers, nil
@@ -1304,27 +1587,28 @@ func GetTiDBServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	var servers []ServerInfo
 	var isDefaultVersion bool
 	if len(config.GetGlobalConfig().ServerVersion) == 0 {
 		isDefaultVersion = true
 	}
+	var servers = make([]ServerInfo, 0, len(tidbNodes))
 	for _, node := range tidbNodes {
 		servers = append(servers, ServerInfo{
 			ServerType:     "tidb",
 			Address:        fmt.Sprintf("%s:%d", node.IP, node.Port),
 			StatusAddr:     fmt.Sprintf("%s:%d", node.IP, node.StatusPort),
-			Version:        FormatVersion(node.Version, isDefaultVersion),
+			Version:        FormatTiDBVersion(node.Version, isDefaultVersion),
 			GitHash:        node.GitHash,
 			StartTimestamp: node.StartTimestamp,
+			ServerID:       node.ServerIDGetter(),
 		})
 	}
 	return servers, nil
 }
 
-// FormatVersion make TiDBVersion consistent to TiKV and PD.
+// FormatTiDBVersion make TiDBVersion consistent to TiKV and PD.
 // The default TiDBVersion is 5.7.25-TiDB-${TiDBReleaseVersion}.
-func FormatVersion(TiDBVersion string, isDefaultVersion bool) string {
+func FormatTiDBVersion(TiDBVersion string, isDefaultVersion bool) string {
 	var version, nodeVersion string
 
 	// The user hasn't set the config 'ServerVersion'.
@@ -1350,16 +1634,18 @@ func FormatVersion(TiDBVersion string, isDefaultVersion bool) string {
 func GetPDServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 	// Get PD servers info.
 	store := ctx.GetStore()
-	etcd, ok := store.(tikv.EtcdBackend)
+	etcd, ok := store.(kv.EtcdBackend)
 	if !ok {
 		return nil, errors.Errorf("%T not an etcd backend", store)
 	}
-	var servers []ServerInfo
-	for _, addr := range etcd.EtcdAddrs() {
-		addr = strings.TrimSpace(addr)
-
-		// Get PD version
-		url := fmt.Sprintf("%s://%s%s", util.InternalHTTPSchema(), addr, pdapi.ClusterVersion)
+	members, err := etcd.EtcdAddrs()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	var servers = make([]ServerInfo, 0, len(members))
+	for _, addr := range members {
+		// Get PD version, git_hash
+		url := fmt.Sprintf("%s://%s%s", util.InternalHTTPSchema(), addr, pdapi.Status)
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -1369,25 +1655,8 @@ func GetPDServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		pdVersion, err := ioutil.ReadAll(resp.Body)
-		terror.Log(resp.Body.Close())
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		version := strings.Trim(strings.Trim(string(pdVersion), "\n"), "\"")
-
-		// Get PD git_hash
-		url = fmt.Sprintf("%s://%s%s", util.InternalHTTPSchema(), addr, pdapi.Status)
-		req, err = http.NewRequest(http.MethodGet, url, nil)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		req.Header.Add("PD-Allow-follower-handle", "true")
-		resp, err = util.InternalHTTPClient().Do(req)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
 		var content = struct {
+			Version        string `json:"version"`
 			GitHash        string `json:"git_hash"`
 			StartTimestamp int64  `json:"start_timestamp"`
 		}{}
@@ -1396,12 +1665,15 @@ func GetPDServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		if len(content.Version) > 0 && content.Version[0] == 'v' {
+			content.Version = content.Version[1:]
+		}
 
 		servers = append(servers, ServerInfo{
 			ServerType:     "pd",
 			Address:        addr,
 			StatusAddr:     addr,
-			Version:        version,
+			Version:        content.Version,
 			GitHash:        content.GitHash,
 			StartTimestamp: content.StartTimestamp,
 		})
@@ -1409,14 +1681,12 @@ func GetPDServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 	return servers, nil
 }
 
-const tiflashLabel = "tiflash"
-
 // GetStoreServerInfo returns all store nodes(TiKV or TiFlash) cluster information
 func GetStoreServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 	isTiFlashStore := func(store *metapb.Store) bool {
 		isTiFlash := false
 		for _, label := range store.Labels {
-			if label.GetKey() == "engine" && label.GetValue() == tiflashLabel {
+			if label.GetKey() == placement.EngineLabelKey && label.GetValue() == placement.EngineLabelTiFlash {
 				isTiFlash = true
 			}
 		}
@@ -1450,20 +1720,29 @@ func GetStoreServerInfo(ctx sessionctx.Context) ([]ServerInfo, error) {
 		}
 		var tp string
 		if isTiFlashStore(store) {
-			tp = tiflashLabel
+			tp = kv.TiFlash.Name()
 		} else {
 			tp = tikv.GetStoreTypeByMeta(store).Name()
 		}
+
 		servers = append(servers, ServerInfo{
 			ServerType:     tp,
 			Address:        store.Address,
 			StatusAddr:     store.StatusAddress,
-			Version:        store.Version,
+			Version:        FormatStoreServerVersion(store.Version),
 			GitHash:        store.GitHash,
 			StartTimestamp: store.StartTimestamp,
 		})
 	}
 	return servers, nil
+}
+
+// FormatStoreServerVersion format version of store servers(Tikv or TiFlash)
+func FormatStoreServerVersion(version string) string {
+	if len(version) >= 1 && version[0] == 'v' {
+		version = version[1:]
+	}
+	return version
 }
 
 // GetTiFlashStoreCount returns the count of tiflash server.
@@ -1479,7 +1758,7 @@ func GetTiFlashStoreCount(ctx sessionctx.Context) (cnt uint64, err error) {
 		return cnt, err
 	}
 	for _, store := range stores {
-		if store.ServerType == tiflashLabel {
+		if store.ServerType == kv.TiFlash.Name() {
 			cnt++
 		}
 	}
@@ -1498,7 +1777,7 @@ var tableNameToColumns = map[string][]columnInfo{
 	TableProfiling:                          profilingCols,
 	TablePartitions:                         partitionsCols,
 	TableKeyColumn:                          keyColumnUsageCols,
-	tableReferConst:                         referConstCols,
+	TableReferConst:                         referConstCols,
 	TableSessionVar:                         sessionVarCols,
 	tablePlugins:                            pluginsCols,
 	TableConstraints:                        tableConstraintsCols,
@@ -1522,6 +1801,7 @@ var tableNameToColumns = map[string][]columnInfo{
 	TableTiDBIndexes:                        tableTiDBIndexesCols,
 	TableSlowQuery:                          slowQueryCols,
 	TableTiDBHotRegions:                     TableTiDBHotRegionsCols,
+	TableTiDBHotRegionsHistory:              TableTiDBHotRegionsHistoryCols,
 	TableTiKVStoreStatus:                    TableTiKVStoreStatusCols,
 	TableAnalyzeStatus:                      tableAnalyzeStatusCols,
 	TableTiKVRegionStatus:                   TableTiKVRegionStatusCols,
@@ -1544,9 +1824,18 @@ var tableNameToColumns = map[string][]columnInfo{
 	TableSequences:                          tableSequencesCols,
 	TableStatementsSummary:                  tableStatementsSummaryCols,
 	TableStatementsSummaryHistory:           tableStatementsSummaryCols,
+	TableStatementsSummaryEvicted:           tableStatementsSummaryEvictedCols,
 	TableStorageStats:                       tableStorageStatsCols,
 	TableTiFlashTables:                      tableTableTiFlashTablesCols,
 	TableTiFlashSegments:                    tableTableTiFlashSegmentsCols,
+	TableClientErrorsSummaryGlobal:          tableClientErrorsSummaryGlobalCols,
+	TableClientErrorsSummaryByUser:          tableClientErrorsSummaryByUserCols,
+	TableClientErrorsSummaryByHost:          tableClientErrorsSummaryByHostCols,
+	TableTiDBTrx:                            tableTiDBTrxCols,
+	TableDeadlocks:                          tableDeadlocksCols,
+	TableDataLockWaits:                      tableDataLockWaitsCols,
+	TableAttributes:                         tableAttributesCols,
+	TablePlacementRules:                     tablePlacementRulesCols,
 }
 
 func createInfoSchemaTable(_ autoid.Allocators, meta *model.TableInfo) (table.Table, error) {
@@ -1583,12 +1872,11 @@ func (s SchemasSorter) Less(i, j int) bool {
 }
 
 func (it *infoschemaTable) getRows(ctx sessionctx.Context, cols []*table.Column) (fullRows [][]types.Datum, err error) {
-	is := GetInfoSchema(ctx)
+	is := ctx.GetInfoSchema().(InfoSchema)
 	dbs := is.AllSchemas()
 	sort.Sort(SchemasSorter(dbs))
 	switch it.meta.Name.O {
 	case tableFiles:
-	case tableReferConst:
 	case tablePlugins, tableTriggers:
 	case tableRoutines:
 	// TODO: Fill the following tables.
@@ -1621,11 +1909,8 @@ func (it *infoschemaTable) getRows(ctx sessionctx.Context, cols []*table.Column)
 }
 
 // IterRecords implements table.Table IterRecords interface.
-func (it *infoschemaTable) IterRecords(ctx sessionctx.Context, startKey kv.Key, cols []*table.Column,
+func (it *infoschemaTable) IterRecords(ctx sessionctx.Context, cols []*table.Column,
 	fn table.RecordIterFunc) error {
-	if len(startKey) != 0 {
-		return table.ErrUnsupportedOp
-	}
 	rows, err := it.getRows(ctx, cols)
 	if err != nil {
 		return err
@@ -1640,16 +1925,6 @@ func (it *infoschemaTable) IterRecords(ctx sessionctx.Context, startKey kv.Key, 
 		}
 	}
 	return nil
-}
-
-// RowWithCols implements table.Table RowWithCols interface.
-func (it *infoschemaTable) RowWithCols(ctx sessionctx.Context, h kv.Handle, cols []*table.Column) ([]types.Datum, error) {
-	return nil, table.ErrUnsupportedOp
-}
-
-// Row implements table.Table Row interface.
-func (it *infoschemaTable) Row(ctx sessionctx.Context, h kv.Handle) ([]types.Datum, error) {
-	return nil, table.ErrUnsupportedOp
 }
 
 // Cols implements table.Table Cols interface.
@@ -1672,6 +1947,11 @@ func (it *infoschemaTable) WritableCols() []*table.Column {
 	return it.cols
 }
 
+// DeletableCols implements table.Table WritableCols interface.
+func (it *infoschemaTable) DeletableCols() []*table.Column {
+	return it.cols
+}
+
 // FullHiddenColsAndVisibleCols implements table FullHiddenColsAndVisibleCols interface.
 func (it *infoschemaTable) FullHiddenColsAndVisibleCols() []*table.Column {
 	return it.cols
@@ -1682,33 +1962,8 @@ func (it *infoschemaTable) Indices() []table.Index {
 	return nil
 }
 
-// WritableIndices implements table.Table WritableIndices interface.
-func (it *infoschemaTable) WritableIndices() []table.Index {
-	return nil
-}
-
-// DeletableIndices implements table.Table DeletableIndices interface.
-func (it *infoschemaTable) DeletableIndices() []table.Index {
-	return nil
-}
-
 // RecordPrefix implements table.Table RecordPrefix interface.
 func (it *infoschemaTable) RecordPrefix() kv.Key {
-	return nil
-}
-
-// IndexPrefix implements table.Table IndexPrefix interface.
-func (it *infoschemaTable) IndexPrefix() kv.Key {
-	return nil
-}
-
-// FirstKey implements table.Table FirstKey interface.
-func (it *infoschemaTable) FirstKey() kv.Key {
-	return nil
-}
-
-// RecordKey implements table.Table RecordKey interface.
-func (it *infoschemaTable) RecordKey(h kv.Handle) kv.Key {
 	return nil
 }
 
@@ -1732,11 +1987,6 @@ func (it *infoschemaTable) Allocators(_ sessionctx.Context) autoid.Allocators {
 	return nil
 }
 
-// RebaseAutoID implements table.Table RebaseAutoID interface.
-func (it *infoschemaTable) RebaseAutoID(ctx sessionctx.Context, newBase int64, isSetStep bool, tp autoid.AllocatorType) error {
-	return table.ErrUnsupportedOp
-}
-
 // Meta implements table.Table Meta interface.
 func (it *infoschemaTable) Meta() *model.TableInfo {
 	return it.meta
@@ -1747,11 +1997,6 @@ func (it *infoschemaTable) GetPhysicalID() int64 {
 	return it.meta.ID
 }
 
-// Seek implements table.Table Seek interface.
-func (it *infoschemaTable) Seek(ctx sessionctx.Context, h kv.Handle) (kv.Handle, bool, error) {
-	return nil, false, table.ErrUnsupportedOp
-}
-
 // Type implements table.Table Type interface.
 func (it *infoschemaTable) Type() table.Type {
 	return it.tp
@@ -1759,25 +2004,6 @@ func (it *infoschemaTable) Type() table.Type {
 
 // VirtualTable is a dummy table.Table implementation.
 type VirtualTable struct{}
-
-// IterRecords implements table.Table IterRecords interface.
-func (vt *VirtualTable) IterRecords(ctx sessionctx.Context, startKey kv.Key, cols []*table.Column,
-	_ table.RecordIterFunc) error {
-	if len(startKey) != 0 {
-		return table.ErrUnsupportedOp
-	}
-	return nil
-}
-
-// RowWithCols implements table.Table RowWithCols interface.
-func (vt *VirtualTable) RowWithCols(ctx sessionctx.Context, h kv.Handle, cols []*table.Column) ([]types.Datum, error) {
-	return nil, table.ErrUnsupportedOp
-}
-
-// Row implements table.Table Row interface.
-func (vt *VirtualTable) Row(ctx sessionctx.Context, h kv.Handle) ([]types.Datum, error) {
-	return nil, table.ErrUnsupportedOp
-}
 
 // Cols implements table.Table Cols interface.
 func (vt *VirtualTable) Cols() []*table.Column {
@@ -1799,6 +2025,11 @@ func (vt *VirtualTable) WritableCols() []*table.Column {
 	return nil
 }
 
+// DeletableCols implements table.Table WritableCols interface.
+func (vt *VirtualTable) DeletableCols() []*table.Column {
+	return nil
+}
+
 // FullHiddenColsAndVisibleCols implements table FullHiddenColsAndVisibleCols interface.
 func (vt *VirtualTable) FullHiddenColsAndVisibleCols() []*table.Column {
 	return nil
@@ -1809,33 +2040,8 @@ func (vt *VirtualTable) Indices() []table.Index {
 	return nil
 }
 
-// WritableIndices implements table.Table WritableIndices interface.
-func (vt *VirtualTable) WritableIndices() []table.Index {
-	return nil
-}
-
-// DeletableIndices implements table.Table DeletableIndices interface.
-func (vt *VirtualTable) DeletableIndices() []table.Index {
-	return nil
-}
-
 // RecordPrefix implements table.Table RecordPrefix interface.
 func (vt *VirtualTable) RecordPrefix() kv.Key {
-	return nil
-}
-
-// IndexPrefix implements table.Table IndexPrefix interface.
-func (vt *VirtualTable) IndexPrefix() kv.Key {
-	return nil
-}
-
-// FirstKey implements table.Table FirstKey interface.
-func (vt *VirtualTable) FirstKey() kv.Key {
-	return nil
-}
-
-// RecordKey implements table.Table RecordKey interface.
-func (vt *VirtualTable) RecordKey(h kv.Handle) kv.Key {
 	return nil
 }
 
@@ -1859,11 +2065,6 @@ func (vt *VirtualTable) Allocators(_ sessionctx.Context) autoid.Allocators {
 	return nil
 }
 
-// RebaseAutoID implements table.Table RebaseAutoID interface.
-func (vt *VirtualTable) RebaseAutoID(ctx sessionctx.Context, newBase int64, isSetStep bool, tp autoid.AllocatorType) error {
-	return table.ErrUnsupportedOp
-}
-
 // Meta implements table.Table Meta interface.
 func (vt *VirtualTable) Meta() *model.TableInfo {
 	return nil
@@ -1872,11 +2073,6 @@ func (vt *VirtualTable) Meta() *model.TableInfo {
 // GetPhysicalID implements table.Table GetPhysicalID interface.
 func (vt *VirtualTable) GetPhysicalID() int64 {
 	return 0
-}
-
-// Seek implements table.Table Seek interface.
-func (vt *VirtualTable) Seek(ctx sessionctx.Context, h kv.Handle) (kv.Handle, bool, error) {
-	return nil, false, table.ErrUnsupportedOp
 }
 
 // Type implements table.Table Type interface.

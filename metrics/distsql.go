@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -52,4 +53,12 @@ var (
 			Help:      "number of partial results for each query.",
 		},
 	)
+	DistSQLCoprCacheHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "tidb",
+			Subsystem: "distsql",
+			Name:      "copr_cache",
+			Help:      "coprocessor cache hit, evict and miss number",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 16),
+		}, []string{LblType})
 )

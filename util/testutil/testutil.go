@@ -8,9 +8,11 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !codes
 // +build !codes
 
 package testutil
@@ -18,9 +20,8 @@ package testutil
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,10 +32,10 @@ import (
 
 	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/testkit/testdata"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
@@ -86,6 +87,7 @@ type datumEqualsChecker struct {
 // the expected value.
 // For example:
 //     c.Assert(value, DatumEquals, NewDatum(42))
+// TODO: please use trequire.DatumEqual to replace this function to migrate to testify
 var DatumEquals check.Checker = &datumEqualsChecker{
 	&check.CheckerInfo{Name: "DatumEquals", Params: []string{"obtained", "expected"}},
 }
@@ -117,6 +119,7 @@ func (checker *datumEqualsChecker) Check(params []interface{}, names []string) (
 }
 
 // MustNewCommonHandle create a common handle with given values.
+// TODO: please use testkit.MustNewCommonHandle to replace this function to migrate to testify
 func MustNewCommonHandle(c *check.C, values ...interface{}) kv.Handle {
 	encoded, err := codec.EncodeKey(new(stmtctx.StatementContext), nil, types.MakeDatums(values...)...)
 	c.Assert(err, check.IsNil)
@@ -226,13 +229,6 @@ func RowsWithSep(sep string, args ...string) [][]interface{} {
 	return rows
 }
 
-// record is a flag used for generate test result.
-var record bool
-
-func init() {
-	flag.BoolVar(&record, "record", false, "to generate test result")
-}
-
 type testCases struct {
 	Name       string
 	Cases      *json.RawMessage // For delayed parse.
@@ -240,6 +236,7 @@ type testCases struct {
 }
 
 // TestData stores all the data of a test suite.
+// TODO: please use testkit.TestData to migrate to testify
 type TestData struct {
 	input          []testCases
 	output         []testCases
@@ -254,7 +251,7 @@ func LoadTestSuiteData(dir, suiteName string) (res TestData, err error) {
 	if err != nil {
 		return res, err
 	}
-	if record {
+	if testdata.Record() {
 		res.output = make([]testCases, len(res.input))
 		for i := range res.input {
 			res.output[i].Name = res.input[i].Name
@@ -288,7 +285,7 @@ func loadTestSuiteCases(filePath string) (res []testCases, err error) {
 			err = err1
 		}
 	}()
-	byteValue, err := ioutil.ReadAll(jsonFile)
+	byteValue, err := io.ReadAll(jsonFile)
 	if err != nil {
 		return res, err
 	}
@@ -304,7 +301,7 @@ func (t *TestData) GetTestCasesByName(caseName string, c *check.C, in interface{
 	c.Assert(ok, check.IsTrue, check.Commentf("Must get test %s", caseName))
 	err := json.Unmarshal(*t.input[casesIdx].Cases, in)
 	c.Assert(err, check.IsNil)
-	if !record {
+	if !testdata.Record() {
 		err = json.Unmarshal(*t.output[casesIdx].Cases, out)
 		c.Assert(err, check.IsNil)
 	} else {
@@ -331,7 +328,7 @@ func (t *TestData) GetTestCases(c *check.C, in interface{}, out interface{}) {
 	c.Assert(ok, check.IsTrue, check.Commentf("Must get test %s", funcName))
 	err := json.Unmarshal(*t.input[casesIdx].Cases, in)
 	c.Assert(err, check.IsNil)
-	if !record {
+	if !testdata.Record() {
 		err = json.Unmarshal(*t.output[casesIdx].Cases, out)
 		c.Assert(err, check.IsNil)
 	} else {
@@ -347,7 +344,7 @@ func (t *TestData) GetTestCases(c *check.C, in interface{}, out interface{}) {
 
 // OnRecord execute the function to update result.
 func (t *TestData) OnRecord(updateFunc func()) {
-	if record {
+	if testdata.Record() {
 		updateFunc()
 	}
 }
@@ -373,7 +370,7 @@ func (t *TestData) ConvertSQLWarnToStrings(warns []stmtctx.SQLWarn) (rs []string
 
 // GenerateOutputIfNeeded generate the output file.
 func (t *TestData) GenerateOutputIfNeeded() error {
-	if !record {
+	if !testdata.Record() {
 		return nil
 	}
 
@@ -409,35 +406,8 @@ func (t *TestData) GenerateOutputIfNeeded() error {
 	return err
 }
 
-// ConfigTestUtils contains a set of set-up/restore methods related to config used in tests.
-var ConfigTestUtils configTestUtils
-
-type configTestUtils struct {
-	autoRandom
-}
-
-type autoRandom struct {
-	originAllowAutoRandom bool
-	originAlterPrimaryKey bool
-}
-
-// SetupAutoRandomTestConfig set alter-primary-key to false and save its origin values.
-// This method should only be used for the tests in SerialSuite.
-func (a *autoRandom) SetupAutoRandomTestConfig() {
-	globalCfg := config.GetGlobalConfig()
-	a.originAlterPrimaryKey = globalCfg.AlterPrimaryKey
-	globalCfg.AlterPrimaryKey = false
-}
-
-// RestoreAutoRandomTestConfig restore the values had been saved in SetupTestConfig.
-// This method should only be used for the tests in SerialSuite.
-func (a *autoRandom) RestoreAutoRandomTestConfig() {
-	globalCfg := config.GetGlobalConfig()
-	globalCfg.AlterPrimaryKey = a.originAlterPrimaryKey
-}
-
 // MaskSortHandles sorts the handles by lowest (fieldTypeBits - 1 - shardBitsCount) bits.
-func (a *autoRandom) MaskSortHandles(handles []int64, shardBitsCount int, fieldType byte) []int64 {
+func MaskSortHandles(handles []int64, shardBitsCount int, fieldType byte) []int64 {
 	typeBitsLength := mysql.DefaultLengthOfMysqlTypes[fieldType] * 8
 	const signBitCount = 1
 	shiftBitsCount := 64 - typeBitsLength + shardBitsCount + signBitCount

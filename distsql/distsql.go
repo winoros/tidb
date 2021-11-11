@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -24,8 +25,40 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
+	"github.com/pingcap/tidb/util/trxevents"
 	"github.com/pingcap/tipb/go-tipb"
+	"go.uber.org/zap"
 )
+
+// DispatchMPPTasks dispatches all tasks and returns an iterator.
+func DispatchMPPTasks(ctx context.Context, sctx sessionctx.Context, tasks []*kv.MPPDispatchRequest, fieldTypes []*types.FieldType, planIDs []int, rootID int) (SelectResult, error) {
+	_, allowTiFlashFallback := sctx.GetSessionVars().AllowFallbackToTiKV[kv.TiFlash]
+	resp := sctx.GetMPPClient().DispatchMPPTasks(ctx, sctx.GetSessionVars().KVVars, tasks, allowTiFlashFallback)
+	if resp == nil {
+		return nil, errors.New("client returns nil response")
+	}
+
+	encodeType := tipb.EncodeType_TypeDefault
+	if canUseChunkRPC(sctx) {
+		encodeType = tipb.EncodeType_TypeChunk
+	}
+	// TODO: Add metric label and set open tracing.
+	return &selectResult{
+		label:      "mpp",
+		resp:       resp,
+		rowLen:     len(fieldTypes),
+		fieldTypes: fieldTypes,
+		ctx:        sctx,
+		feedback:   statistics.NewQueryFeedback(0, nil, 0, false),
+		encodeType: encodeType,
+		copPlanIDs: planIDs,
+		rootPlanID: rootID,
+		storeType:  kv.TiFlash,
+	}, nil
+
+}
 
 // Select sends a DAG request, returns SelectResult.
 // In kvReq, KeyRanges is required, Concurrency/KeepOrder/Desc/IsolationLevel/Priority are optional.
@@ -44,10 +77,20 @@ func Select(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request, fie
 	if !sctx.GetSessionVars().EnableStreaming {
 		kvReq.Streaming = false
 	}
-	resp := sctx.GetClient().Send(ctx, kvReq, sctx.GetSessionVars().KVVars)
+	enabledRateLimitAction := sctx.GetSessionVars().EnabledRateLimitAction
+	originalSQL := sctx.GetSessionVars().StmtCtx.OriginalSQL
+	eventCb := func(event trxevents.TransactionEvent) {
+		// Note: Do not assume this callback will be invoked within the same goroutine.
+		if copMeetLock := event.GetCopMeetLock(); copMeetLock != nil {
+			logutil.Logger(ctx).Debug("coprocessor encounters lock",
+				zap.Uint64("startTS", kvReq.StartTs),
+				zap.Stringer("lock", copMeetLock.LockInfo),
+				zap.String("stmt", originalSQL))
+		}
+	}
+	resp := sctx.GetClient().Send(ctx, kvReq, sctx.GetSessionVars().KVVars, sctx.GetSessionVars().StmtCtx.MemTracker, enabledRateLimitAction, eventCb)
 	if resp == nil {
-		err := errors.New("client returns nil response")
-		return nil, err
+		return nil, errors.New("client returns nil response")
 	}
 
 	label := metrics.LblGeneral
@@ -84,6 +127,7 @@ func Select(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request, fie
 		sqlType:    label,
 		memTracker: kvReq.MemTracker,
 		encodeType: encodetype,
+		storeType:  kvReq.StoreType,
 	}, nil
 }
 
@@ -93,19 +137,20 @@ func Select(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request, fie
 func SelectWithRuntimeStats(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request,
 	fieldTypes []*types.FieldType, fb *statistics.QueryFeedback, copPlanIDs []int, rootPlanID int) (SelectResult, error) {
 	sr, err := Select(ctx, sctx, kvReq, fieldTypes, fb)
-	if err == nil {
-		if selectResult, ok := sr.(*selectResult); ok {
-			selectResult.copPlanIDs = copPlanIDs
-			selectResult.rootPlanID = rootPlanID
-		}
+	if err != nil {
+		return nil, err
 	}
-	return sr, err
+	if selectResult, ok := sr.(*selectResult); ok {
+		selectResult.copPlanIDs = copPlanIDs
+		selectResult.rootPlanID = rootPlanID
+	}
+	return sr, nil
 }
 
 // Analyze do a analyze request.
-func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv.Variables,
-	isRestrict bool) (SelectResult, error) {
-	resp := client.Send(ctx, kvReq, vars)
+func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars interface{},
+	isRestrict bool, sessionMemTracker *memory.Tracker) (SelectResult, error) {
+	resp := client.Send(ctx, kvReq, vars, sessionMemTracker, false, nil)
 	if resp == nil {
 		return nil, errors.New("client returns nil response")
 	}
@@ -119,13 +164,16 @@ func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv.
 		feedback:   statistics.NewQueryFeedback(0, nil, 0, false),
 		sqlType:    label,
 		encodeType: tipb.EncodeType_TypeDefault,
+		storeType:  kvReq.StoreType,
 	}
 	return result, nil
 }
 
 // Checksum sends a checksum request.
-func Checksum(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv.Variables) (SelectResult, error) {
-	resp := client.Send(ctx, kvReq, vars)
+func Checksum(ctx context.Context, client kv.Client, kvReq *kv.Request, vars interface{}) (SelectResult, error) {
+	// FIXME: As BR have dependency of `Checksum` and TiDB also introduced BR as dependency, Currently we can't edit
+	// Checksum function signature. The two-way dependence should be removed in future.
+	resp := client.Send(ctx, kvReq, vars, nil, false, nil)
 	if resp == nil {
 		return nil, errors.New("client returns nil response")
 	}
@@ -135,6 +183,7 @@ func Checksum(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv
 		feedback:   statistics.NewQueryFeedback(0, nil, 0, false),
 		sqlType:    metrics.LblGeneral,
 		encodeType: tipb.EncodeType_TypeDefault,
+		storeType:  kvReq.StoreType,
 	}
 	return result, nil
 }

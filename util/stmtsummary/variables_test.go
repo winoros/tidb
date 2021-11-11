@@ -8,95 +8,115 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package stmtsummary
 
 import (
-	. "github.com/pingcap/check"
+	"testing"
+
 	"github.com/pingcap/tidb/config"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Suite(&testVariablesSuite{})
-
-type testVariablesSuite struct {
-}
-
-func (s *testVariablesSuite) TestSetInVariable(c *C) {
+func TestSetInVariable(t *testing.T) {
+	t.Parallel()
 	sv := newSysVars()
 	st := sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(config.GetGlobalConfig().StmtSummary.MaxStmtCount))
+	require.Equal(t, int64(config.GetGlobalConfig().StmtSummary.MaxStmtCount), st)
 
-	sv.setVariable(typeMaxStmtCount, "10", false)
+	err := sv.setVariable(typeMaxStmtCount, "10", false)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(10))
-	sv.setVariable(typeMaxStmtCount, "100", false)
+	require.Equal(t, int64(10), st)
+	err = sv.setVariable(typeMaxStmtCount, "100", false)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(100))
-	sv.setVariable(typeMaxStmtCount, "10", true)
+	require.Equal(t, int64(100), st)
+	err = sv.setVariable(typeMaxStmtCount, "10", true)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(10))
-	sv.setVariable(typeMaxStmtCount, "100", true)
+	require.Equal(t, int64(10), st)
+	err = sv.setVariable(typeMaxStmtCount, "100", true)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(100))
-	sv.setVariable(typeMaxStmtCount, "10", false)
+	require.Equal(t, int64(100), st)
+	err = sv.setVariable(typeMaxStmtCount, "10", false)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(100))
-	sv.setVariable(typeMaxStmtCount, "", true)
+	require.Equal(t, int64(100), st)
+	err = sv.setVariable(typeMaxStmtCount, "", true)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(10))
-	sv.setVariable(typeMaxStmtCount, "", false)
+	require.Equal(t, int64(10), st)
+	err = sv.setVariable(typeMaxStmtCount, "", false)
+	require.NoError(t, err)
 	st = sv.getVariable(typeMaxStmtCount)
-	c.Assert(st, Equals, int64(config.GetGlobalConfig().StmtSummary.MaxStmtCount))
+	require.Equal(t, int64(config.GetGlobalConfig().StmtSummary.MaxStmtCount), st)
 }
 
-func (s *testVariablesSuite) TestSetBoolVariable(c *C) {
+func TestSetBoolVariable(t *testing.T) {
+	t.Parallel()
 	sv := newSysVars()
 	en := sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, config.GetGlobalConfig().StmtSummary.Enable)
+	require.Equal(t, config.GetGlobalConfig().StmtSummary.Enable, en > 0)
 
-	sv.setVariable(typeEnable, "OFF", false)
+	err := sv.setVariable(typeEnable, "OFF", false)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, false)
-	sv.setVariable(typeEnable, "ON", false)
+	require.LessOrEqual(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "ON", false)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, true)
-	sv.setVariable(typeEnable, "OFF", true)
+	require.Greater(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "OFF", true)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, false)
-	sv.setVariable(typeEnable, "ON", true)
+	require.LessOrEqual(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "ON", true)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, true)
-	sv.setVariable(typeEnable, "OFF", false)
+	require.Greater(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "OFF", false)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, true)
-	sv.setVariable(typeEnable, "", true)
+	require.Greater(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "", true)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, false)
-	sv.setVariable(typeEnable, "ON", false)
+	require.LessOrEqual(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "ON", false)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, true)
-	sv.setVariable(typeEnable, "", false)
+	require.Greater(t, en, int64(0))
+	err = sv.setVariable(typeEnable, "", false)
+	require.NoError(t, err)
 	en = sv.getVariable(typeEnable)
-	c.Assert(en > 0, Equals, config.GetGlobalConfig().StmtSummary.Enable)
+	require.Equal(t, config.GetGlobalConfig().StmtSummary.Enable, en > 0)
 }
 
-func (s *testVariablesSuite) TestMinValue(c *C) {
+func TestMinValue(t *testing.T) {
+	t.Parallel()
 	sv := newSysVars()
-	sv.setVariable(typeMaxStmtCount, "0", false)
+	err := sv.setVariable(typeMaxStmtCount, "0", false)
+	require.NoError(t, err)
 	v := sv.getVariable(typeMaxStmtCount)
-	c.Assert(v, Greater, int64(0))
+	require.Greater(t, v, int64(0))
 
-	sv.setVariable(typeMaxSQLLength, "0", false)
+	err = sv.setVariable(typeMaxSQLLength, "0", false)
+	require.NoError(t, err)
 	v = sv.getVariable(typeMaxSQLLength)
-	c.Assert(v, Equals, int64(0))
+	require.Equal(t, int64(0), v)
 
-	sv.setVariable(typeHistorySize, "0", false)
+	err = sv.setVariable(typeHistorySize, "0", false)
+	require.NoError(t, err)
 	v = sv.getVariable(typeHistorySize)
-	c.Assert(v, Equals, int64(0))
+	require.Equal(t, int64(0), v)
 
-	sv.setVariable(typeRefreshInterval, "0", false)
+	err = sv.setVariable(typeRefreshInterval, "0", false)
+	require.NoError(t, err)
 	v = sv.getVariable(typeRefreshInterval)
-	c.Assert(v, Greater, int64(0))
+	require.Greater(t, v, int64(0))
 }

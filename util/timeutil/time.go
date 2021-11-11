@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,6 +16,7 @@ package timeutil
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,7 +24,7 @@ import (
 	"time"
 
 	"github.com/pingcap/tidb/util/logutil"
-	"github.com/uber-go/atomic"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -52,6 +54,22 @@ type locCache struct {
 	locMap map[string]*time.Location
 }
 
+// inferOneStepLinkForPath only read one step link for the path, not like filepath.EvalSymlinks, which gets the
+// recursive final linked file of the path.
+func inferOneStepLinkForPath(path string) (string, error) {
+	fileInfo, err := os.Lstat(path)
+	if err != nil {
+		return path, err
+	}
+	if fileInfo.Mode()&os.ModeSymlink != 0 {
+		path, err = os.Readlink(path)
+		if err != nil {
+			return path, err
+		}
+	}
+	return path, nil
+}
+
 // InferSystemTZ reads system timezone from `TZ`, the path of the soft link of `/etc/localtime`. If both of them are failed, system timezone will be set to `UTC`.
 // It is exported because we need to use it during bootstrap stage. And it should be only used at that stage.
 func InferSystemTZ() string {
@@ -64,6 +82,13 @@ func InferSystemTZ() string {
 	case !ok:
 		path, err1 := filepath.EvalSymlinks("/etc/localtime")
 		if err1 == nil {
+			if strings.Contains(path, "posixrules") {
+				path, err1 = inferOneStepLinkForPath("/etc/localtime")
+				if err1 != nil {
+					logutil.BgLogger().Error("locate timezone files failed", zap.Error(err1))
+					return ""
+				}
+			}
 			name, err2 := inferTZNameFromFileName(path)
 			if err2 == nil {
 				return name

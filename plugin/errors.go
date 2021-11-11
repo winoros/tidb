@@ -8,22 +8,22 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package plugin
 
 import (
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbterror"
 )
 
 var (
-	errInvalidPluginID         = terror.ClassPlugin.NewStd(errno.ErrInvalidPluginID)
-	errInvalidPluginManifest   = terror.ClassPlugin.NewStd(errno.ErrInvalidPluginManifest)
-	errInvalidPluginName       = terror.ClassPlugin.NewStd(errno.ErrInvalidPluginName)
-	errInvalidPluginVersion    = terror.ClassPlugin.NewStd(errno.ErrInvalidPluginVersion)
-	errDuplicatePlugin         = terror.ClassPlugin.NewStd(errno.ErrDuplicatePlugin)
-	errInvalidPluginSysVarName = terror.ClassPlugin.NewStd(errno.ErrInvalidPluginSysVarName)
-	errRequireVersionCheckFail = terror.ClassPlugin.NewStd(errno.ErrRequireVersionCheckFail)
+	errInvalidPluginID         = dbterror.ClassPlugin.NewStd(errno.ErrInvalidPluginID)
+	errInvalidPluginManifest   = dbterror.ClassPlugin.NewStd(errno.ErrInvalidPluginManifest)
+	errInvalidPluginName       = dbterror.ClassPlugin.NewStd(errno.ErrInvalidPluginName)
+	errInvalidPluginVersion    = dbterror.ClassPlugin.NewStd(errno.ErrInvalidPluginVersion)
+	errDuplicatePlugin         = dbterror.ClassPlugin.NewStd(errno.ErrDuplicatePlugin)
+	errRequireVersionCheckFail = dbterror.ClassPlugin.NewStd(errno.ErrRequireVersionCheckFail)
 )

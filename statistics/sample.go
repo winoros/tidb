@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -19,10 +20,10 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
@@ -98,6 +99,7 @@ type SampleCollector struct {
 	MaxSampleSize int64
 	FMSketch      *FMSketch
 	CMSketch      *CMSketch
+	TopN          *TopN
 	TotalSize     int64 // TotalSize is the total size of column.
 }
 
@@ -106,9 +108,9 @@ func (c *SampleCollector) MergeSampleCollector(sc *stmtctx.StatementContext, rc 
 	c.NullCount += rc.NullCount
 	c.Count += rc.Count
 	c.TotalSize += rc.TotalSize
-	c.FMSketch.mergeFMSketch(rc.FMSketch)
+	c.FMSketch.MergeFMSketch(rc.FMSketch)
 	if rc.CMSketch != nil {
-		err := c.CMSketch.MergeCMSketch(rc.CMSketch, 0)
+		err := c.CMSketch.MergeCMSketch(rc.CMSketch)
 		terror.Log(errors.Trace(err))
 	}
 	for _, item := range rc.Samples {
@@ -126,7 +128,7 @@ func SampleCollectorToProto(c *SampleCollector) *tipb.SampleCollector {
 		TotalSize: &c.TotalSize,
 	}
 	if c.CMSketch != nil {
-		collector.CmSketch = CMSketchToProto(c.CMSketch)
+		collector.CmSketch = CMSketchToProto(c.CMSketch, nil)
 	}
 	for _, item := range c.Samples {
 		collector.Samples = append(collector.Samples, item.Value.GetBytes())
@@ -146,7 +148,7 @@ func SampleCollectorFromProto(collector *tipb.SampleCollector) *SampleCollector 
 	if collector.TotalSize != nil {
 		s.TotalSize = *collector.TotalSize
 	}
-	s.CMSketch = CMSketchFromProto(collector.CmSketch)
+	s.CMSketch, s.TopN = CMSketchAndTopNFromProto(collector.CmSketch)
 	for _, val := range collector.Samples {
 		// When store the histogram bucket boundaries to kv, we need to limit the length of the value.
 		if len(val) <= maxSampleValueLength {
@@ -238,7 +240,7 @@ func (s SampleBuilder) CollectColumnStats() ([]*SampleCollector, *SortedBuilder,
 		}
 	}
 	ctx := context.TODO()
-	req := s.RecordSet.NewChunk()
+	req := s.RecordSet.NewChunk(nil)
 	it := chunk.NewIterator4Chunk(req)
 	for {
 		err := s.RecordSet.Next(ctx, req)
@@ -302,7 +304,7 @@ func (c *SampleCollector) ExtractTopN(numTop uint32, sc *stmtctx.StatementContex
 	}
 	helper := newTopNHelper(values, numTop)
 	cms := c.CMSketch
-	cms.topN = make(map[uint64][]*TopNMeta, helper.actualNumTop)
+	c.TopN = NewTopN(int(helper.actualNumTop))
 	// Process them decreasingly so we can handle most frequent values first and reduce the probability of hash collision
 	// by small values.
 	for i := uint32(0); i < helper.actualNumTop; i++ {
@@ -318,8 +320,9 @@ func (c *SampleCollector) ExtractTopN(numTop uint32, sc *stmtctx.StatementContex
 		if err != nil {
 			return err
 		}
-		cms.subValue(h1, h2, realCnt)
-		cms.topN[h1] = append(cms.topN[h1], &TopNMeta{h2, data, realCnt})
+		cms.SubValue(h1, h2, realCnt)
+		c.TopN.AppendTopN(data, realCnt)
 	}
+	c.TopN.Sort()
 	return nil
 }

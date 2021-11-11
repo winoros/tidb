@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,10 +18,10 @@ import (
 	"context"
 	"math"
 
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -189,13 +190,28 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 				resetNotNullFlag(apply.schema, outerPlan.Schema().Len(), apply.schema.Len())
 
 				for i, aggFunc := range agg.AggFuncs {
-					if idx := apply.schema.ColumnIndex(aggFunc.Args[0].(*expression.Column)); idx != -1 {
-						desc, err := aggregation.NewAggFuncDesc(agg.ctx, agg.AggFuncs[i].Name, []expression.Expression{apply.schema.Columns[idx]}, false)
-						if err != nil {
-							return nil, err
+					aggArgs := make([]expression.Expression, 0, len(aggFunc.Args))
+					for _, arg := range aggFunc.Args {
+						switch expr := arg.(type) {
+						case *expression.Column:
+							if idx := apply.schema.ColumnIndex(expr); idx != -1 {
+								aggArgs = append(aggArgs, apply.schema.Columns[idx])
+							} else {
+								aggArgs = append(aggArgs, expr)
+							}
+						case *expression.ScalarFunction:
+							expr.RetType = expr.RetType.Clone()
+							expr.RetType.Flag &= ^mysql.NotNullFlag
+							aggArgs = append(aggArgs, expr)
+						default:
+							aggArgs = append(aggArgs, expr)
 						}
-						newAggFuncs = append(newAggFuncs, desc)
 					}
+					desc, err := aggregation.NewAggFuncDesc(agg.ctx, agg.AggFuncs[i].Name, aggArgs, agg.AggFuncs[i].HasDistinct)
+					if err != nil {
+						return nil, err
+					}
+					newAggFuncs = append(newAggFuncs, desc)
 				}
 				agg.AggFuncs = newAggFuncs
 				np, err := s.optimize(ctx, p)
@@ -205,7 +221,6 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 				agg.SetChildren(np)
 				// TODO: Add a Projection if any argument of aggregate funcs or group by items are scalar functions.
 				// agg.buildProjectionIfNecessary()
-				agg.collectGroupByColumns()
 				return agg, nil
 			}
 			// We can pull up the equal conditions below the aggregation as the join key of the apply, if only
@@ -228,7 +243,7 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 					sel.Conditions = remainedExpr
 					apply.CorCols = extractCorColumnsBySchema4LogicalPlan(apply.children[1], apply.children[0].Schema())
 					// There's no other correlated column.
-					groupByCols := expression.NewSchema(agg.groupByCols...)
+					groupByCols := expression.NewSchema(agg.GetGroupByCols()...)
 					if len(apply.CorCols) == 0 {
 						join := &apply.LogicalJoin
 						join.EqualConditions = append(join.EqualConditions, eqCondWithCorCol...)
@@ -250,7 +265,6 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 								groupByCols.Append(clonedCol)
 							}
 						}
-						agg.collectGroupByColumns()
 						// The selection may be useless, check and remove it.
 						if len(sel.Conditions) == 0 {
 							agg.SetChildren(sel.children[0])

@@ -8,14 +8,22 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package aggfuncs
 
 import (
+	"unsafe"
+
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/chunk"
+)
+
+const (
+	// DefPartialResult4RowNumberSize is the size of partialResult4RowNumberSize
+	DefPartialResult4RowNumberSize = int64(unsafe.Sizeof(partialResult4RowNumber{}))
 )
 
 type rowNumber struct {
@@ -27,7 +35,7 @@ type partialResult4RowNumber struct {
 }
 
 func (rn *rowNumber) AllocPartialResult() (pr PartialResult, memDelta int64) {
-	return PartialResult(&partialResult4RowNumber{}), 0
+	return PartialResult(&partialResult4RowNumber{}), DefPartialResult4RowNumberSize
 }
 
 func (rn *rowNumber) ResetPartialResult(pr PartialResult) {
@@ -43,5 +51,11 @@ func (rn *rowNumber) AppendFinalResult2Chunk(sctx sessionctx.Context, pr Partial
 	p := (*partialResult4RowNumber)(pr)
 	p.curIdx++
 	chk.AppendInt64(rn.ordinal, p.curIdx)
+	return nil
+}
+
+var _ SlidingWindowAggFunc = &rowNumber{}
+
+func (rn *rowNumber) Slide(sctx sessionctx.Context, getRow func(uint64) chunk.Row, lastStart, lastEnd uint64, shiftStart, shiftEnd uint64, pr PartialResult) error {
 	return nil
 }

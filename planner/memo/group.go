@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -109,7 +110,7 @@ type Group struct {
 	// by a transformation rule batch in a certain round.
 	ExploreMark
 
-	//hasBuiltKeyInfo indicates whether this group has called `BuildKeyInfo`.
+	// hasBuiltKeyInfo indicates whether this group has called `BuildKeyInfo`.
 	// BuildKeyInfo is lazily called when a rule needs information of
 	// unique key or maxOneRow (in LogicalProp). For each Group, we only need
 	// to collect these information once.

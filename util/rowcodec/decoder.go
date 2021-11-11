@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,9 +19,9 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
@@ -120,10 +121,8 @@ func (decoder *DatumMapDecoder) decodeColDatum(col *ColInfo, colData []byte) (ty
 			return d, err
 		}
 		d.SetFloat64(fVal)
-	case mysql.TypeVarString, mysql.TypeVarchar, mysql.TypeString:
+	case mysql.TypeVarString, mysql.TypeVarchar, mysql.TypeString, mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
 		d.SetString(string(colData), col.Ft.Collate)
-	case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
-		d.SetBytes(colData)
 	case mysql.TypeNewDecimal:
 		_, dec, precision, frac, err := codec.DecodeDecimal(colData)
 		if err != nil {
@@ -222,6 +221,9 @@ func (decoder *ChunkDecoder) DecodeToChunk(rowData []byte, handle kv.Handle, chk
 			continue
 		}
 
+		// Only try to decode handle when there is no corresponding column in the value.
+		// This is because the information in handle may be incomplete in some cases.
+		// For example, prefixed clustered index like 'primary key(col1(1))' only store the leftmost 1 char in the handle.
 		if decoder.tryAppendHandleColumn(colIdx, col, handle, chk) {
 			continue
 		}
@@ -254,12 +256,12 @@ func (decoder *ChunkDecoder) tryAppendHandleColumn(colIdx int, col *ColInfo, han
 	}
 	for i, id := range decoder.handleColIDs {
 		if col.ID == id {
-			coder := codec.NewDecoder(chk, decoder.loc)
-			_, err := coder.DecodeOne(handle.EncodedCol(i), colIdx, col.Ft)
-			if err != nil {
+			if types.NeedRestoredData(col.Ft) {
 				return false
 			}
-			return true
+			coder := codec.NewDecoder(chk, decoder.loc)
+			_, err := coder.DecodeOne(handle.EncodedCol(i), colIdx, col.Ft)
+			return err == nil
 		}
 	}
 	return false
@@ -382,14 +384,17 @@ func (decoder *BytesDecoder) decodeToBytesInternal(outputOffset map[int64]int, h
 		tp := fieldType2Flag(col.Ft.Tp, col.Ft.Flag&mysql.UnsignedFlag == 0)
 		colID := col.ID
 		offset := outputOffset[colID]
-		if decoder.tryDecodeHandle(values, offset, col, handle, cacheBytes) {
-			continue
-		}
-
 		idx, isNil, notFound := r.findColID(colID)
 		if !notFound && !isNil {
 			val := r.getData(idx)
 			values[offset] = decoder.encodeOldDatum(tp, val)
+			continue
+		}
+
+		// Only try to decode handle when there is no corresponding column in the value.
+		// This is because the information in handle may be incomplete in some cases.
+		// For example, prefixed clustered index like 'primary key(col1(1))' only store the leftmost 1 char in the handle.
+		if decoder.tryDecodeHandle(values, offset, col, handle, cacheBytes) {
 			continue
 		}
 
@@ -417,6 +422,9 @@ func (decoder *BytesDecoder) decodeToBytesInternal(outputOffset map[int64]int, h
 func (decoder *BytesDecoder) tryDecodeHandle(values [][]byte, offset int, col *ColInfo,
 	handle kv.Handle, cacheBytes []byte) bool {
 	if handle == nil {
+		return false
+	}
+	if types.NeedRestoredData(col.Ft) {
 		return false
 	}
 	if col.IsPKHandle || col.ID == model.ExtraHandleID {

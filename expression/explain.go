@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 )
@@ -31,14 +33,27 @@ func (expr *ScalarFunction) ExplainInfo() string {
 func (expr *ScalarFunction) explainInfo(normalized bool) string {
 	var buffer bytes.Buffer
 	fmt.Fprintf(&buffer, "%s(", expr.FuncName.L)
-	for i, arg := range expr.GetArgs() {
-		if normalized {
-			buffer.WriteString(arg.ExplainNormalizedInfo())
-		} else {
-			buffer.WriteString(arg.ExplainInfo())
-		}
-		if i+1 < len(expr.GetArgs()) {
+	switch expr.FuncName.L {
+	case ast.Cast:
+		for _, arg := range expr.GetArgs() {
+			if normalized {
+				buffer.WriteString(arg.ExplainNormalizedInfo())
+			} else {
+				buffer.WriteString(arg.ExplainInfo())
+			}
 			buffer.WriteString(", ")
+			buffer.WriteString(expr.RetType.String())
+		}
+	default:
+		for i, arg := range expr.GetArgs() {
+			if normalized {
+				buffer.WriteString(arg.ExplainNormalizedInfo())
+			} else {
+				buffer.WriteString(arg.ExplainInfo())
+			}
+			if i+1 < len(expr.GetArgs()) {
+				buffer.WriteString(", ")
+			}
 		}
 	}
 	buffer.WriteString(")")
@@ -95,6 +110,16 @@ func ExplainExpressionList(exprs []Expression, schema *Schema) string {
 		switch expr.(type) {
 		case *Column, *CorrelatedColumn:
 			builder.WriteString(expr.String())
+		case *Constant:
+			v := expr.String()
+			length := 64
+			if len(v) < length {
+				builder.WriteString(v)
+			} else {
+				builder.WriteString(fmt.Sprintf("%s(len:%d)", v[:length], len(v)))
+			}
+			builder.WriteString("->")
+			builder.WriteString(schema.Columns[i].String())
 		default:
 			builder.WriteString(expr.String())
 			builder.WriteString("->")

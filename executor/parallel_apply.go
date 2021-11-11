@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -20,8 +21,9 @@ import (
 	"sync/atomic"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/execdetails"
@@ -45,12 +47,10 @@ type ParallelNestedLoopApplyExec struct {
 	baseExecutor
 
 	// outer-side fields
-	cursor        int
-	outerExec     Executor
-	outerFilter   expression.CNFExprs
-	outerList     *chunk.List
-	outerRowMutex sync.Mutex
-	outer         bool
+	outerExec   Executor
+	outerFilter expression.CNFExprs
+	outerList   *chunk.List
+	outer       bool
 
 	// inner-side fields
 	// use slices since the inner side is paralleled
@@ -69,6 +69,7 @@ type ParallelNestedLoopApplyExec struct {
 	// fields about concurrency control
 	concurrency int
 	started     uint32
+	drained     uint32 // drained == true indicates there is no more data
 	freeChkCh   chan *chunk.Chunk
 	resultChkCh chan result
 	outerRowCh  chan outerRow
@@ -81,7 +82,6 @@ type ParallelNestedLoopApplyExec struct {
 	useCache           bool
 	cacheHitCounter    int64
 	cacheAccessCounter int64
-	cacheLock          sync.RWMutex
 
 	memTracker *memory.Tracker // track memory usage.
 }
@@ -132,6 +132,11 @@ func (e *ParallelNestedLoopApplyExec) Open(ctx context.Context) error {
 
 // Next implements the Executor interface.
 func (e *ParallelNestedLoopApplyExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	if atomic.LoadUint32(&e.drained) == 1 {
+		req.Reset()
+		return nil
+	}
+
 	if atomic.CompareAndSwapUint32(&e.started, 0, 1) {
 		e.workerWg.Add(1)
 		go e.outerWorker(ctx)
@@ -149,6 +154,7 @@ func (e *ParallelNestedLoopApplyExec) Next(ctx context.Context, req *chunk.Chunk
 	}
 	if result.chk == nil { // no more data
 		req.Reset()
+		atomic.StoreUint32(&e.drained, 1)
 		return nil
 	}
 	req.SwapColumns(result.chk)
@@ -159,15 +165,17 @@ func (e *ParallelNestedLoopApplyExec) Next(ctx context.Context, req *chunk.Chunk
 // Close implements the Executor interface.
 func (e *ParallelNestedLoopApplyExec) Close() error {
 	e.memTracker = nil
-	err := e.outerExec.Close()
 	if atomic.LoadUint32(&e.started) == 1 {
 		close(e.exit)
 		e.notifyWg.Wait()
 		e.started = 0
 	}
+	// Wait all workers to finish before Close() is called.
+	// Otherwise we may got data race.
+	err := e.outerExec.Close()
 
 	if e.runtimeStats != nil {
-		runtimeStats := newJoinRuntimeStats(e.runtimeStats)
+		runtimeStats := newJoinRuntimeStats()
 		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id, runtimeStats)
 		if e.useCache {
 			var hitRatio float64
@@ -197,6 +205,7 @@ func (e *ParallelNestedLoopApplyExec) outerWorker(ctx context.Context) {
 	var selected []bool
 	var err error
 	for {
+		failpoint.Inject("parallelApplyOuterWorkerPanic", nil)
 		chk := newFirstChunk(e.outerExec)
 		if err := Next(ctx, e.outerExec, chk); err != nil {
 			e.putResult(nil, err)
@@ -234,6 +243,7 @@ func (e *ParallelNestedLoopApplyExec) innerWorker(ctx context.Context, id int) {
 		case <-e.exit:
 			return
 		}
+		failpoint.Inject("parallelApplyInnerWorkerPanic", nil)
 		err := e.fillInnerChunk(ctx, id, chk)
 		if err == nil && chk.NumRows() == 0 { // no more data, this goroutine can exit
 			return
@@ -277,9 +287,8 @@ func (e *ParallelNestedLoopApplyExec) fetchAllInners(ctx context.Context, id int
 	}
 	if e.useCache { // look up the cache
 		atomic.AddInt64(&e.cacheAccessCounter, 1)
-		e.cacheLock.RLock()
+		failpoint.Inject("parallelApplyGetCachePanic", nil)
 		value, err := e.cache.Get(key)
-		e.cacheLock.RUnlock()
 		if err != nil {
 			return err
 		}
@@ -325,8 +334,7 @@ func (e *ParallelNestedLoopApplyExec) fetchAllInners(ctx context.Context, id int
 	}
 
 	if e.useCache { // update the cache
-		e.cacheLock.Lock()
-		defer e.cacheLock.Unlock()
+		failpoint.Inject("parallelApplySetCachePanic", nil)
 		if _, err := e.cache.Set(key, e.innerList[id]); err != nil {
 			return err
 		}

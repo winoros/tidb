@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,8 +17,8 @@ package expression
 import (
 	"fmt"
 
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
@@ -28,17 +29,21 @@ import (
 
 // NewOne stands for a number 1.
 func NewOne() *Constant {
+	retT := types.NewFieldType(mysql.TypeTiny)
+	retT.Flag |= mysql.UnsignedFlag // shrink range to avoid integral promotion
 	return &Constant{
 		Value:   types.NewDatum(1),
-		RetType: types.NewFieldType(mysql.TypeTiny),
+		RetType: retT,
 	}
 }
 
 // NewZero stands for a number 0.
 func NewZero() *Constant {
+	retT := types.NewFieldType(mysql.TypeTiny)
+	retT.Flag |= mysql.UnsignedFlag // shrink range to avoid integral promotion
 	return &Constant{
 		Value:   types.NewDatum(0),
-		RetType: types.NewFieldType(mysql.TypeTiny),
+		RetType: retT,
 	}
 }
 
@@ -91,7 +96,7 @@ func (c *Constant) String() string {
 
 // MarshalJSON implements json.Marshaler interface.
 func (c *Constant) MarshalJSON() ([]byte, error) {
-	return []byte(fmt.Sprintf("\"%s\"", c)), nil
+	return []byte(fmt.Sprintf("%q", c)), nil
 }
 
 // Clone implements Expression interface.
@@ -273,6 +278,14 @@ func (c *Constant) EvalDecimal(ctx sessionctx.Context, row chunk.Row) (*types.My
 		return nil, true, nil
 	}
 	res, err := dt.ToDecimal(ctx.GetSessionVars().StmtCtx)
+	if err != nil {
+		return nil, false, err
+	}
+	// The decimal may be modified during plan building.
+	_, frac := res.PrecisionAndFrac()
+	if frac < c.GetType().Decimal {
+		err = res.Round(res, c.GetType().Decimal, types.ModeHalfEven)
+	}
 	return res, false, err
 }
 
@@ -359,6 +372,18 @@ func (c *Constant) HashCode(sc *stmtctx.StatementContext) []byte {
 	if len(c.hashcode) > 0 {
 		return c.hashcode
 	}
+
+	if c.DeferredExpr != nil {
+		c.hashcode = c.DeferredExpr.HashCode(sc)
+		return c.hashcode
+	}
+
+	if c.ParamMarker != nil {
+		c.hashcode = append(c.hashcode, parameterFlag)
+		c.hashcode = codec.EncodeInt(c.hashcode, int64(c.ParamMarker.order))
+		return c.hashcode
+	}
+
 	_, err := c.Eval(chunk.Row{})
 	if err != nil {
 		terror.Log(err)
@@ -378,6 +403,15 @@ func (c *Constant) ResolveIndices(_ *Schema) (Expression, error) {
 
 func (c *Constant) resolveIndices(_ *Schema) error {
 	return nil
+}
+
+// ResolveIndicesByVirtualExpr implements Expression interface.
+func (c *Constant) ResolveIndicesByVirtualExpr(_ *Schema) (Expression, bool) {
+	return c, true
+}
+
+func (c *Constant) resolveIndicesByVirtualExpr(_ *Schema) bool {
+	return true
 }
 
 // Vectorized returns if this expression supports vectorized evaluation.
@@ -403,10 +437,8 @@ func (c *Constant) ReverseEval(sc *stmtctx.StatementContext, res types.Datum, rT
 
 // Coercibility returns the coercibility value which is used to check collations.
 func (c *Constant) Coercibility() Coercibility {
-	if c.HasCoercibility() {
-		return c.collationInfo.Coercibility()
+	if !c.HasCoercibility() {
+		c.SetCoercibility(deriveCoercibilityForConstant(c))
 	}
-
-	c.SetCoercibility(deriveCoercibilityForConstant(c))
 	return c.collationInfo.Coercibility()
 }

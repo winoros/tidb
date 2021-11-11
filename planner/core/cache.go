@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,10 +19,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
@@ -32,11 +35,10 @@ import (
 
 var (
 	// preparedPlanCacheEnabledValue stores the global config "prepared-plan-cache-enabled".
-	// If the value of "prepared-plan-cache-enabled" is true, preparedPlanCacheEnabledValue's value is 1.
-	// Otherwise, preparedPlanCacheEnabledValue's value is 0.
-	preparedPlanCacheEnabledValue int32
+	// The value is false unless "prepared-plan-cache-enabled" is true in configuration.
+	preparedPlanCacheEnabledValue int32 = 0
 	// PreparedPlanCacheCapacity stores the global config "prepared-plan-cache-capacity".
-	PreparedPlanCacheCapacity uint = 100
+	PreparedPlanCacheCapacity uint = 1000
 	// PreparedPlanCacheMemoryGuardRatio stores the global config "prepared-plan-cache-memory-guard-ratio".
 	PreparedPlanCacheMemoryGuardRatio = 0.1
 	// PreparedPlanCacheMaxMemory stores the max memory size defined in the global config "performance-server-memory-quota".
@@ -67,7 +69,6 @@ type pstmtPlanCacheKey struct {
 	database             string
 	connID               uint64
 	pstmtID              uint32
-	snapshot             uint64
 	schemaVersion        int64
 	sqlMode              mysql.SQLMode
 	timezoneOffset       int
@@ -90,7 +91,6 @@ func (key *pstmtPlanCacheKey) Hash() []byte {
 		key.hash = append(key.hash, dbBytes...)
 		key.hash = codec.EncodeInt(key.hash, int64(key.connID))
 		key.hash = codec.EncodeInt(key.hash, int64(key.pstmtID))
-		key.hash = codec.EncodeInt(key.hash, int64(key.snapshot))
 		key.hash = codec.EncodeInt(key.hash, key.schemaVersion)
 		key.hash = codec.EncodeInt(key.hash, int64(key.sqlMode))
 		key.hash = codec.EncodeInt(key.hash, int64(key.timezoneOffset))
@@ -134,7 +134,6 @@ func NewPSTMTPlanCacheKey(sessionVars *variable.SessionVars, pstmtID uint32, sch
 		database:             sessionVars.CurrentDB,
 		connID:               sessionVars.ConnectionID,
 		pstmtID:              pstmtID,
-		snapshot:             sessionVars.SnapshotTS,
 		schemaVersion:        schemaVersion,
 		sqlMode:              sessionVars.SQLMode,
 		timezoneOffset:       timezoneOffset,
@@ -147,34 +146,67 @@ func NewPSTMTPlanCacheKey(sessionVars *variable.SessionVars, pstmtID uint32, sch
 	return key
 }
 
+// FieldSlice is the slice of the types.FieldType
+type FieldSlice []types.FieldType
+
+// Equal compares FieldSlice with []*types.FieldType
+// Currently this is only used in plan cache to invalidate cache when types of variables are different.
+func (s FieldSlice) Equal(tps []*types.FieldType) bool {
+	if len(s) != len(tps) {
+		return false
+	}
+	for i := range tps {
+		// We only use part of logic of `func (ft *FieldType) Equal(other *FieldType)` here because (1) only numeric and
+		// string types will show up here, and (2) we don't need flen and decimal to be matched exactly to use plan cache
+		tpEqual := (s[i].Tp == tps[i].Tp) ||
+			(s[i].Tp == mysql.TypeVarchar && tps[i].Tp == mysql.TypeVarString) ||
+			(s[i].Tp == mysql.TypeVarString && tps[i].Tp == mysql.TypeVarchar) ||
+			// TypeNull should be considered the same as other types.
+			(s[i].Tp == mysql.TypeNull || tps[i].Tp == mysql.TypeNull)
+		if !tpEqual || s[i].Charset != tps[i].Charset || s[i].Collate != tps[i].Collate ||
+			(s[i].EvalType() == types.ETInt && mysql.HasUnsignedFlag(s[i].Flag) != mysql.HasUnsignedFlag(tps[i].Flag)) {
+			return false
+		}
+	}
+	return true
+}
+
 // PSTMTPlanCacheValue stores the cached Statement and StmtNode.
 type PSTMTPlanCacheValue struct {
 	Plan              Plan
 	OutPutNames       []*types.FieldName
 	TblInfo2UnionScan map[*model.TableInfo]bool
+	UserVarTypes      FieldSlice
 }
 
 // NewPSTMTPlanCacheValue creates a SQLCacheValue.
-func NewPSTMTPlanCacheValue(plan Plan, names []*types.FieldName, srcMap map[*model.TableInfo]bool) *PSTMTPlanCacheValue {
+func NewPSTMTPlanCacheValue(plan Plan, names []*types.FieldName, srcMap map[*model.TableInfo]bool, userVarTps []*types.FieldType) *PSTMTPlanCacheValue {
 	dstMap := make(map[*model.TableInfo]bool)
 	for k, v := range srcMap {
 		dstMap[k] = v
+	}
+	userVarTypes := make([]types.FieldType, len(userVarTps))
+	for i, tp := range userVarTps {
+		userVarTypes[i] = *tp
 	}
 	return &PSTMTPlanCacheValue{
 		Plan:              plan,
 		OutPutNames:       names,
 		TblInfo2UnionScan: dstMap,
+		UserVarTypes:      userVarTypes,
 	}
 }
 
 // CachedPrepareStmt store prepared ast from PrepareExec and other related fields
 type CachedPrepareStmt struct {
-	PreparedAst    *ast.Prepared
-	VisitInfos     []visitInfo
-	ColumnInfos    interface{}
-	Executor       interface{}
-	NormalizedSQL  string
-	NormalizedPlan string
-	SQLDigest      string
-	PlanDigest     string
+	PreparedAst         *ast.Prepared
+	VisitInfos          []visitInfo
+	ColumnInfos         interface{}
+	Executor            interface{}
+	NormalizedSQL       string
+	NormalizedPlan      string
+	SQLDigest           *parser.Digest
+	PlanDigest          *parser.Digest
+	ForUpdateRead       bool
+	SnapshotTSEvaluator func(sessionctx.Context) (uint64, error)
 }

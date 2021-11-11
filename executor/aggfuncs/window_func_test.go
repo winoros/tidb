@@ -8,23 +8,28 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package aggfuncs_test
 
 import (
+	"testing"
 	"time"
 
-	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
+
 	"github.com/pingcap/tidb/executor/aggfuncs"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/mock"
+
+	"github.com/stretchr/testify/require"
 )
 
 type windowTest struct {
@@ -36,37 +41,72 @@ type windowTest struct {
 	results     []types.Datum
 }
 
-func (s *testSuite) testWindowFunc(c *C, p windowTest) {
+func (p *windowTest) genSrcChk() *chunk.Chunk {
 	srcChk := chunk.NewChunkWithCapacity([]*types.FieldType{p.dataType}, p.numRows)
 	dataGen := getDataGenFunc(p.dataType)
 	for i := 0; i < p.numRows; i++ {
 		dt := dataGen(i)
 		srcChk.AppendDatum(0, &dt)
 	}
+	return srcChk
+}
 
-	desc, err := aggregation.NewAggFuncDesc(s.ctx, p.funcName, p.args, false)
-	c.Assert(err, IsNil)
-	finalFunc := aggfuncs.BuildWindowFunctions(s.ctx, desc, 0, p.orderByCols)
+type windowMemTest struct {
+	windowTest         windowTest
+	allocMemDelta      int64
+	updateMemDeltaGens updateMemDeltaGens
+}
+
+func testWindowFunc(t *testing.T, p windowTest) {
+	srcChk := p.genSrcChk()
+	ctx := mock.NewContext()
+
+	desc, err := aggregation.NewAggFuncDesc(ctx, p.funcName, p.args, false)
+	require.NoError(t, err)
+	finalFunc := aggfuncs.BuildWindowFunctions(ctx, desc, 0, p.orderByCols)
 	finalPr, _ := finalFunc.AllocPartialResult()
 	resultChk := chunk.NewChunkWithCapacity([]*types.FieldType{desc.RetTp}, 1)
 
 	iter := chunk.NewIterator4Chunk(srcChk)
 	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
-		_, err = finalFunc.UpdatePartialResult(s.ctx, []chunk.Row{row}, finalPr)
-		c.Assert(err, IsNil)
+		_, err = finalFunc.UpdatePartialResult(ctx, []chunk.Row{row}, finalPr)
+		require.NoError(t, err)
 	}
 
-	c.Assert(p.numRows, Equals, len(p.results))
+	require.Len(t, p.results, p.numRows)
 	for i := 0; i < p.numRows; i++ {
-		err = finalFunc.AppendFinalResult2Chunk(s.ctx, finalPr, resultChk)
-		c.Assert(err, IsNil)
+		err = finalFunc.AppendFinalResult2Chunk(ctx, finalPr, resultChk)
+		require.NoError(t, err)
 		dt := resultChk.GetRow(0).GetDatum(0, desc.RetTp)
-		result, err := dt.CompareDatum(s.ctx.GetSessionVars().StmtCtx, &p.results[i])
-		c.Assert(err, IsNil)
-		c.Assert(result, Equals, 0)
+		result, err := dt.CompareDatum(ctx.GetSessionVars().StmtCtx, &p.results[i])
+		require.NoError(t, err)
+		require.Equal(t, 0, result)
 		resultChk.Reset()
 	}
 	finalFunc.ResetPartialResult(finalPr)
+}
+
+func testWindowAggMemFunc(t *testing.T, p windowMemTest) {
+	srcChk := p.windowTest.genSrcChk()
+	ctx := mock.NewContext()
+
+	desc, err := aggregation.NewAggFuncDesc(ctx, p.windowTest.funcName, p.windowTest.args, false)
+	require.NoError(t, err)
+	finalFunc := aggfuncs.BuildWindowFunctions(ctx, desc, 0, p.windowTest.orderByCols)
+	finalPr, memDelta := finalFunc.AllocPartialResult()
+	require.Equal(t, p.allocMemDelta, memDelta)
+
+	updateMemDeltas, err := p.updateMemDeltaGens(srcChk, p.windowTest.dataType)
+	require.NoError(t, err)
+
+	i := 0
+	iter := chunk.NewIterator4Chunk(srcChk)
+	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+		memDelta, err = finalFunc.UpdatePartialResult(ctx, []chunk.Row{row}, finalPr)
+		require.NoError(t, err)
+		require.Equal(t, updateMemDeltas[i], memDelta)
+		i++
+	}
 }
 
 func buildWindowTesterWithArgs(funcName string, tp byte, args []expression.Expression, orderByCols int, numRows int, results ...interface{}) windowTest {
@@ -111,7 +151,29 @@ func buildWindowTester(funcName string, tp byte, constantArg uint64, orderByCols
 	return pt
 }
 
-func (s *testSuite) TestWindowFunctions(c *C) {
+func buildWindowMemTester(funcName string, tp byte, constantArg uint64, numRows int, orderByCols int, allocMemDelta int64, updateMemDeltaGens updateMemDeltaGens) windowMemTest {
+	windowTest := buildWindowTester(funcName, tp, constantArg, orderByCols, numRows)
+	pt := windowMemTest{
+		windowTest:         windowTest,
+		allocMemDelta:      allocMemDelta,
+		updateMemDeltaGens: updateMemDeltaGens,
+	}
+	return pt
+}
+
+func buildWindowMemTesterWithArgs(funcName string, tp byte, args []expression.Expression, orderByCols int, numRows int, allocMemDelta int64, updateMemDeltaGens updateMemDeltaGens) windowMemTest {
+	windowTest := buildWindowTesterWithArgs(funcName, tp, args, orderByCols, numRows)
+	pt := windowMemTest{
+		windowTest:         windowTest,
+		allocMemDelta:      allocMemDelta,
+		updateMemDeltaGens: updateMemDeltaGens,
+	}
+	return pt
+}
+
+func TestWindowFunctions(t *testing.T) {
+	t.Parallel()
+
 	tests := []windowTest{
 		buildWindowTester(ast.WindowFuncCumeDist, mysql.TypeLonglong, 0, 1, 1, 1),
 		buildWindowTester(ast.WindowFuncCumeDist, mysql.TypeLonglong, 0, 0, 2, 1, 1),
@@ -148,6 +210,6 @@ func (s *testSuite) TestWindowFunctions(c *C) {
 		buildWindowTester(ast.WindowFuncRowNumber, mysql.TypeLonglong, 0, 0, 4, 1, 2, 3, 4),
 	}
 	for _, test := range tests {
-		s.testWindowFunc(c, test)
+		testWindowFunc(t, test)
 	}
 }

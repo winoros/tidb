@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,14 +19,16 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
@@ -56,25 +59,27 @@ func (s *testValidatorSuite) SetUpTest(c *C) {
 	s.is = infoschema.MockInfoSchema([]*model.TableInfo{core.MockSignedTable()})
 }
 
+func (s *testValidatorSuite) TearDownTest(c *C) {
+	s.dom.Close()
+	err := s.store.Close()
+	c.Assert(err, IsNil)
+	testleak.AfterTest(c)()
+}
+
 func (s *testValidatorSuite) runSQL(c *C, sql string, inPrepare bool, terr error) {
 	stmts, err1 := session.Parse(s.ctx, sql)
-	c.Assert(err1, IsNil)
+	c.Assert(err1, IsNil, Commentf("sql: %s", sql))
 	c.Assert(stmts, HasLen, 1)
 	stmt := stmts[0]
 	var opts []core.PreprocessOpt
 	if inPrepare {
 		opts = append(opts, core.InPrepare)
 	}
-	err := core.Preprocess(s.ctx, stmt, s.is, opts...)
+	err := core.Preprocess(s.ctx, stmt, append(opts, core.WithPreprocessorReturn(&core.PreprocessorReturn{InfoSchema: s.is}))...)
 	c.Assert(terror.ErrorEqual(err, terr), IsTrue, Commentf("sql: %s, err:%v", sql, err))
 }
 
 func (s *testValidatorSuite) TestValidator(c *C) {
-	defer testleak.AfterTest(c)()
-	defer func() {
-		s.dom.Close()
-		s.store.Close()
-	}()
 	tests := []struct {
 		sql       string
 		inPrepare bool
@@ -218,16 +223,27 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 
 		{"CREATE TABLE t (a float(255, 30))", true, nil},
 		{"CREATE TABLE t (a double(255, 30))", true, nil},
-		{"CREATE TABLE t (a float(256, 30))", false, types.ErrTooBigPrecision},
+		{"CREATE TABLE t (a float(256, 30))", false, types.ErrTooBigDisplayWidth},
 		{"CREATE TABLE t (a float(255, 31))", false, types.ErrTooBigScale},
-		{"CREATE TABLE t (a double(256, 30))", false, types.ErrTooBigPrecision},
+		{"CREATE TABLE t (a double(256, 30))", false, types.ErrTooBigDisplayWidth},
 		{"CREATE TABLE t (a double(255, 31))", false, types.ErrTooBigScale},
+
+		// issue 20447
+		{"CREATE TABLE t (a float(53))", true, nil},
+		{"CREATE TABLE t (a float(54))", false, types.ErrWrongFieldSpec},
+		{"CREATE TABLE t (a double)", true, nil},
 
 		// FIXME: temporary 'not implemented yet' test for 'CREATE TABLE ... SELECT' (issue 4754)
 		{"CREATE TABLE t SELECT * FROM u", false, errors.New("'CREATE TABLE ... SELECT' is not implemented yet")},
 		{"CREATE TABLE t (m int) SELECT * FROM u", false, errors.New("'CREATE TABLE ... SELECT' is not implemented yet")},
 		{"CREATE TABLE t IGNORE SELECT * FROM u UNION SELECT * from v", false, errors.New("'CREATE TABLE ... SELECT' is not implemented yet")},
 		{"CREATE TABLE t (m int) REPLACE AS (SELECT * FROM u) UNION (SELECT * FROM v)", false, errors.New("'CREATE TABLE ... SELECT' is not implemented yet")},
+
+		// issue 24309
+		{"SELECT * FROM t INTO OUTFILE 'ttt' UNION SELECT * FROM u", false, core.ErrWrongUsage.GenWithStackByArgs("UNION", "INTO")},
+
+		// Error caused by "Table 'test.u' doesn't exist".
+		// {"(SELECT * FROM t INTO OUTFILE 'ttt') UNION SELECT * FROM u", false, core.ErrWrongUsage.GenWithStackByArgs("UNION", "INTO")},
 
 		{"select * from ( select 1 ) a, (select 2) a;", false, core.ErrNonUniqTable},
 		{"select * from ( select 1 ) a, (select 2) b, (select 3) a;", false, core.ErrNonUniqTable},
@@ -255,6 +271,37 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 		{"CREATE TABLE origin (a int primary key auto_increment, b int);", false, nil},
 		{"CREATE TABLE origin (a int unique auto_increment, b int);", false, nil},
 		{"CREATE TABLE origin (a int key auto_increment, b int);", false, nil},
+
+		// issue 18149
+		{"CREATE TABLE t (a int, index ``(a));", true, errors.New("[ddl:1280]Incorrect index name ''")},
+		{"CREATE TABLE t (a int, b int, index ``((a+1), (b+1)));", true, errors.New("[ddl:1280]Incorrect index name ''")},
+		{"CREATE TABLE t (a int, key ``(a));", true, errors.New("[ddl:1280]Incorrect index name ''")},
+		{"CREATE TABLE t (a int, b int, key ``((a+1), (b+1)));", true, errors.New("[ddl:1280]Incorrect index name ''")},
+		{"CREATE TABLE t (a int, index(a));", false, nil},
+		{"CREATE INDEX `` on t (a);", true, errors.New("[ddl:1280]Incorrect index name ''")},
+		{"CREATE INDEX `` on t ((lower(a)));", true, errors.New("[ddl:1280]Incorrect index name ''")},
+
+		// issue 21082
+		{"CREATE TABLE t (a int) ENGINE=Unknown;", false, ddl.ErrUnknownEngine},
+		{"CREATE TABLE t (a int) ENGINE=InnoDB;", false, nil},
+		{"CREATE TABLE t (a int);", false, nil},
+		{"ALTER TABLE t ENGINE=InnoDB;", false, nil},
+		{"ALTER TABLE t ENGINE=Unknown;", false, ddl.ErrUnknownEngine},
+
+		// issue 20295
+		// issue 11193
+		{"select cast(1.23 as decimal(65,65))", true, types.ErrTooBigScale.GenWithStackByArgs(65, "1.23", mysql.MaxDecimalScale)},
+		{"select CONVERT( 2, DECIMAL(62,60) )", true, types.ErrTooBigScale.GenWithStackByArgs(60, "2", mysql.MaxDecimalScale)},
+		{"select CONVERT( 2, DECIMAL(66,29) )", true, types.ErrTooBigPrecision.GenWithStackByArgs(66, "2", mysql.MaxDecimalWidth)},
+		{"select CONVERT( 2, DECIMAL(28,29) )", true, types.ErrMBiggerThanD.GenWithStackByArgs("2")},
+		{"select CONVERT( 2, DECIMAL(30,65) )", true, types.ErrMBiggerThanD.GenWithStackByArgs("2")},
+		{"select CONVERT( 2, DECIMAL(66,99) )", true, types.ErrMBiggerThanD.GenWithStackByArgs("2")},
+
+		// TABLESAMPLE
+		{"select * from t tablesample bernoulli();", false, expression.ErrInvalidTableSample},
+		{"select * from t tablesample bernoulli(10 rows);", false, expression.ErrInvalidTableSample},
+		{"select * from t tablesample bernoulli(23 percent) repeatable (23);", false, expression.ErrInvalidTableSample},
+		{"select * from t tablesample system() repeatable (10);", false, expression.ErrInvalidTableSample},
 	}
 
 	_, err := s.se.Execute(context.Background(), "use test")
@@ -266,12 +313,6 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 }
 
 func (s *testValidatorSuite) TestForeignKey(c *C) {
-	defer testleak.AfterTest(c)()
-	defer func() {
-		s.dom.Close()
-		s.store.Close()
-	}()
-
 	_, err := s.se.Execute(context.Background(), "create table test.t1(a int, b int, c int)")
 	c.Assert(err, IsNil)
 
@@ -294,4 +335,32 @@ func (s *testValidatorSuite) TestForeignKey(c *C) {
 	s.runSQL(c, "ALTER TABLE test.t1 ADD CONSTRAINT fk FOREIGN KEY (b) REFERENCES t2 (d)", false, nil)
 
 	s.runSQL(c, "ALTER TABLE test.t1 ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES test2.t (e)", false, nil)
+}
+
+func (s *testValidatorSuite) TestDropGlobalTempTable(c *C) {
+	ctx := context.Background()
+	execSQLList := []string{
+		"use test",
+		"create table tb(id int);",
+		"create global temporary table temp(id int) on commit delete rows;",
+		"create global temporary table temp1(id int) on commit delete rows;",
+		"create temporary table ltemp1(id int);",
+		"create database test2",
+		"create global temporary table test2.temp2(id int) on commit delete rows;",
+	}
+	for _, execSQL := range execSQLList {
+		_, err := s.se.Execute(ctx, execSQL)
+		c.Assert(err, IsNil)
+	}
+	s.is = s.se.GetInfoSchema().(infoschema.InfoSchema)
+	s.runSQL(c, "drop global temporary table tb;", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table temp", false, nil)
+	s.runSQL(c, "drop global temporary table test.tb;", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table test.temp1", false, nil)
+	s.runSQL(c, "drop global temporary table ltemp1", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table test.ltemp1", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table temp, temp1", false, nil)
+	s.runSQL(c, "drop global temporary table temp, tb", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table temp, ltemp1", false, core.ErrDropTableOnTemporaryTable)
+	s.runSQL(c, "drop global temporary table test2.temp2, temp1", false, nil)
 }

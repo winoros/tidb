@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,8 +16,9 @@ package aggfuncs_test
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/executor/aggfuncs"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 )
@@ -100,5 +102,51 @@ func (s *testSuite) TestJsonObjectagg(c *C) {
 
 	for _, test := range tests {
 		s.testMultiArgsAggFunc(c, test)
+	}
+}
+
+func (s *testSuite) TestMemJsonObjectagg(c *C) {
+	typeList := []byte{mysql.TypeLonglong, mysql.TypeDouble, mysql.TypeString, mysql.TypeJSON, mysql.TypeDuration, mysql.TypeNewDecimal, mysql.TypeDate}
+	var argCombines [][]byte
+	for i := 0; i < len(typeList); i++ {
+		for j := 0; j < len(typeList); j++ {
+			argTypes := []byte{typeList[i], typeList[j]}
+			argCombines = append(argCombines, argTypes)
+		}
+	}
+	numRows := 5
+	for k := 0; k < len(argCombines); k++ {
+		entries := make(map[string]interface{})
+
+		argTypes := argCombines[k]
+		fGenFunc := getDataGenFunc(types.NewFieldType(argTypes[0]))
+		sGenFunc := getDataGenFunc(types.NewFieldType(argTypes[1]))
+
+		for m := 0; m < numRows; m++ {
+			firstArg := fGenFunc(m)
+			secondArg := sGenFunc(m)
+			keyString, _ := firstArg.ToString()
+			entries[keyString] = secondArg.GetValue()
+		}
+
+		// appendBinary does not support some type such as uint8、types.time，so convert is needed here
+		for key, val := range entries {
+			switch x := val.(type) {
+			case *types.MyDecimal:
+				float64Val, _ := x.ToFloat64()
+				entries[key] = float64Val
+			case []uint8, types.Time, types.Duration:
+				strVal, _ := types.ToString(x)
+				entries[key] = strVal
+			}
+		}
+
+		tests := []multiArgsAggMemTest{
+			buildMultiArgsAggMemTester(ast.AggFuncJsonObjectAgg, argTypes, mysql.TypeJSON, numRows, aggfuncs.DefPartialResult4JsonObjectAgg+aggfuncs.DefMapStringInterfaceBucketSize, defaultMultiArgsMemDeltaGens, true),
+			buildMultiArgsAggMemTester(ast.AggFuncJsonObjectAgg, argTypes, mysql.TypeJSON, numRows, aggfuncs.DefPartialResult4JsonObjectAgg+aggfuncs.DefMapStringInterfaceBucketSize, defaultMultiArgsMemDeltaGens, false),
+		}
+		for _, test := range tests {
+			s.testMultiArgsAggMemFunc(c, test)
+		}
 	}
 }

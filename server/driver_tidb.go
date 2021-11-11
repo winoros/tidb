@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -18,13 +19,15 @@ import (
 	"crypto/tls"
 	"sync/atomic"
 
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/charset"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/charset"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
@@ -148,10 +151,23 @@ func (ts *TiDBStatement) Reset() {
 
 // Close implements PreparedStatement Close method.
 func (ts *TiDBStatement) Close() error {
-	//TODO close at tidb level
-	err := ts.ctx.DropPreparedStmt(ts.id)
-	if err != nil {
-		return err
+	// TODO close at tidb level
+	if ts.ctx.GetSessionVars().TxnCtx != nil && ts.ctx.GetSessionVars().TxnCtx.CouldRetry {
+		err := ts.ctx.DropPreparedStmt(ts.id)
+		if err != nil {
+			return err
+		}
+	} else {
+		if core.PreparedPlanCacheEnabled() {
+			preparedPointer := ts.ctx.GetSessionVars().PreparedStmts[ts.id]
+			preparedObj, ok := preparedPointer.(*core.CachedPrepareStmt)
+			if !ok {
+				return errors.Errorf("invalid CachedPrepareStmt type")
+			}
+			ts.ctx.PreparedPlanCache().Delete(core.NewPSTMTPlanCacheKey(
+				ts.ctx.GetSessionVars(), ts.id, preparedObj.PreparedAst.SchemaVersion))
+		}
+		ts.ctx.GetSessionVars().RemovePreparedStmt(ts.id)
 	}
 	delete(ts.ctx.stmts, int(ts.id))
 
@@ -183,6 +199,11 @@ func (qd *TiDBDriver) OpenCtx(connID uint64, capability uint32, collation uint8,
 	return tc, nil
 }
 
+// GetWarnings implements QueryCtx GetWarnings method.
+func (tc *TiDBContext) GetWarnings() []stmtctx.SQLWarn {
+	return tc.GetSessionVars().StmtCtx.GetWarnings()
+}
+
 // CurrentDB implements QueryCtx CurrentDB method.
 func (tc *TiDBContext) CurrentDB() string {
 	return tc.currentDB
@@ -197,6 +218,7 @@ func (tc *TiDBContext) WarningCount() uint16 {
 func (tc *TiDBContext) ExecuteStmt(ctx context.Context, stmt ast.StmtNode) (ResultSet, error) {
 	rs, err := tc.Session.ExecuteStmt(ctx, stmt)
 	if err != nil {
+		tc.Session.GetSessionVars().StmtCtx.AppendError(err)
 		return nil, err
 	}
 	if rs == nil {
@@ -276,8 +298,8 @@ type tidbResultSet struct {
 	preparedStmt *core.CachedPrepareStmt
 }
 
-func (trs *tidbResultSet) NewChunk() *chunk.Chunk {
-	return trs.recordSet.NewChunk()
+func (trs *tidbResultSet) NewChunk(alloc chunk.Allocator) *chunk.Chunk {
+	return trs.recordSet.NewChunk(alloc)
 }
 
 func (trs *tidbResultSet) Next(ctx context.Context, req *chunk.Chunk) error {
@@ -376,11 +398,11 @@ func convertColumnInfo(fld *ast.ResultField) (ci *ColumnInfo) {
 		// * utf8mb4, the multiple is 4
 		// We used to check non-string types to avoid the truncation problem in some MySQL
 		// client such as Navicat. Now we only allow string type enter this branch.
-		charsetDesc, err := charset.GetCharsetDesc(fld.Column.Charset)
+		charsetDesc, err := charset.GetCharsetInfo(fld.Column.Charset)
 		if err != nil {
-			ci.ColumnLength = ci.ColumnLength * 4
+			ci.ColumnLength *= 4
 		} else {
-			ci.ColumnLength = ci.ColumnLength * uint32(charsetDesc.Maxlen)
+			ci.ColumnLength *= uint32(charsetDesc.Maxlen)
 		}
 	}
 

@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -23,9 +24,9 @@ import (
 	"github.com/opentracing/basictracer-go"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
@@ -47,8 +48,6 @@ type TraceExec struct {
 	exhausted bool
 	// stmtNode is the real query ast tree and it is used for building real query's plan.
 	stmtNode ast.StmtNode
-	// rootTrace represents root span which is father of all other span.
-	rootTrace opentracing.Span
 
 	builder *executorBuilder
 	format  string
@@ -65,6 +64,12 @@ func (e *TraceExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		e.exhausted = true
 		return nil
 	}
+
+	// For audit log plugin to set the correct statement.
+	stmtCtx := e.ctx.GetSessionVars().StmtCtx
+	defer func() {
+		e.ctx.GetSessionVars().StmtCtx = stmtCtx
+	}()
 
 	switch e.format {
 	case core.TraceFormatLog:
@@ -132,28 +137,33 @@ func (e *TraceExec) nextRowJSON(ctx context.Context, se sqlexec.SQLExecutor, req
 }
 
 func (e *TraceExec) executeChild(ctx context.Context, se sqlexec.SQLExecutor) {
-	recordSets, err := se.Execute(ctx, e.stmtNode.Text())
-	if len(recordSets) == 0 {
-		if err != nil {
-			var errCode uint16
-			if te, ok := err.(*terror.Error); ok {
-				errCode = te.ToSQLError().Code
-			}
-			logutil.Eventf(ctx, "execute with error(%d): %s", errCode, err.Error())
-		} else {
-			logutil.Eventf(ctx, "execute done, modify row: %d", e.ctx.GetSessionVars().StmtCtx.AffectedRows())
+	// For audit log plugin to log the statement correctly.
+	// Should be logged as 'explain ...', instead of the executed SQL.
+	vars := e.ctx.GetSessionVars()
+	origin := vars.InRestrictedSQL
+	vars.InRestrictedSQL = true
+	defer func() {
+		vars.InRestrictedSQL = origin
+	}()
+	rs, err := se.ExecuteStmt(ctx, e.stmtNode)
+	if err != nil {
+		var errCode uint16
+		if te, ok := err.(*terror.Error); ok {
+			errCode = terror.ToSQLError(te).Code
 		}
+		logutil.Eventf(ctx, "execute with error(%d): %s", errCode, err.Error())
 	}
-	for _, rs := range recordSets {
+	if rs != nil {
 		drainRecordSet(ctx, e.ctx, rs)
 		if err = rs.Close(); err != nil {
 			logutil.Logger(ctx).Error("run trace close result with error", zap.Error(err))
 		}
 	}
+	logutil.Eventf(ctx, "execute done, modify row: %d", e.ctx.GetSessionVars().StmtCtx.AffectedRows())
 }
 
 func drainRecordSet(ctx context.Context, sctx sessionctx.Context, rs sqlexec.RecordSet) {
-	req := rs.NewChunk()
+	req := rs.NewChunk(nil)
 	var rowCount int
 	for {
 		err := rs.Next(ctx, req)
@@ -161,7 +171,7 @@ func drainRecordSet(ctx context.Context, sctx sessionctx.Context, rs sqlexec.Rec
 			if err != nil {
 				var errCode uint16
 				if te, ok := err.(*terror.Error); ok {
-					errCode = te.ToSQLError().Code
+					errCode = terror.ToSQLError(te).Code
 				}
 				logutil.Eventf(ctx, "execute with error(%d): %s", errCode, err.Error())
 			} else {
@@ -176,7 +186,7 @@ func drainRecordSet(ctx context.Context, sctx sessionctx.Context, rs sqlexec.Rec
 
 func dfsTree(t *appdash.Trace, prefix string, isLast bool, chk *chunk.Chunk) {
 	var newPrefix, suffix string
-	if len(prefix) == 0 {
+	if prefix == "" {
 		newPrefix = prefix + "  "
 	} else {
 		if !isLast {

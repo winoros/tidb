@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -21,12 +22,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/memory"
+	"github.com/pingcap/tidb/util/resourcegrouptag"
+	"github.com/tikv/client-go/v2/util"
+	atomic2 "go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -60,26 +64,33 @@ type StatementContext struct {
 
 	// IsDDLJobInQueue is used to mark whether the DDL job is put into the queue.
 	// If IsDDLJobInQueue is true, it means the DDL job is in the queue of storage, and it can be handled by the DDL worker.
-	IsDDLJobInQueue        bool
-	InInsertStmt           bool
-	InUpdateStmt           bool
-	InDeleteStmt           bool
-	InSelectStmt           bool
-	InLoadDataStmt         bool
-	InExplainStmt          bool
-	IgnoreTruncate         bool
-	IgnoreZeroInDate       bool
-	DupKeyAsWarning        bool
-	BadNullAsWarning       bool
-	DividedByZeroAsWarning bool
-	TruncateAsWarning      bool
-	OverflowAsWarning      bool
-	InShowWarning          bool
-	UseCache               bool
-	BatchCheck             bool
-	InNullRejectCheck      bool
-	AllowInvalidDate       bool
-
+	IsDDLJobInQueue              bool
+	InInsertStmt                 bool
+	InUpdateStmt                 bool
+	InDeleteStmt                 bool
+	InSelectStmt                 bool
+	InLoadDataStmt               bool
+	InExplainStmt                bool
+	InCreateOrAlterStmt          bool
+	IgnoreTruncate               bool
+	IgnoreZeroInDate             bool
+	DupKeyAsWarning              bool
+	BadNullAsWarning             bool
+	DividedByZeroAsWarning       bool
+	TruncateAsWarning            bool
+	OverflowAsWarning            bool
+	InShowWarning                bool
+	UseCache                     bool
+	BatchCheck                   bool
+	InNullRejectCheck            bool
+	AllowInvalidDate             bool
+	IgnoreNoPartition            bool
+	MaybeOverOptimized4PlanCache bool
+	IgnoreExplainIDSuffix        bool
+	// If the select statement was like 'select * from t as of timestamp ...' or in a stale read transaction
+	// or is affected by the tidb_read_staleness session variable, then the statement will be makred as isStaleness
+	// in stmtCtx
+	IsStaleness bool
 	// mu struct holds variables that change during execution.
 	mu struct {
 		sync.Mutex
@@ -105,12 +116,11 @@ type StatementContext struct {
 		copied  uint64
 		touched uint64
 
-		message           string
-		warnings          []SQLWarn
-		errorCount        uint16
-		histogramsNotLoad bool
-		execDetails       execdetails.ExecDetails
-		allExecDetails    []*execdetails.ExecDetails
+		message        string
+		warnings       []SQLWarn
+		errorCount     uint16
+		execDetails    execdetails.ExecDetails
+		allExecDetails []*execdetails.ExecDetails
 	}
 	// PrevAffectedRows is the affected-rows value(DDL is 0, DML is the number of affected rows).
 	PrevAffectedRows int64
@@ -130,30 +140,59 @@ type StatementContext struct {
 	NotFillCache     bool
 	MemTracker       *memory.Tracker
 	DiskTracker      *disk.Tracker
+	IsTiFlash        atomic2.Bool
 	RuntimeStatsColl *execdetails.RuntimeStatsColl
 	TableIDs         []int64
 	IndexNames       []string
-	nowTs            time.Time // use this variable for now/current_timestamp calculation/cache for one stmt
-	stmtTimeCached   bool
 	StmtType         string
 	OriginalSQL      string
 	digestMemo       struct {
 		sync.Once
 		normalized string
-		digest     string
+		digest     *parser.Digest
 	}
 	// planNormalized use for cache the normalized plan, avoid duplicate builds.
 	planNormalized        string
-	planDigest            string
+	planDigest            *parser.Digest
+	encodedPlan           string
+	planHint              string
+	planHintSet           bool
 	Tables                []TableEntry
 	PointExec             bool  // for point update cached execution, Constant expression need to set "paramMarker"
 	lockWaitStartTime     int64 // LockWaitStartTime stores the pessimistic lock wait start time
 	PessimisticLockWaited int32
 	LockKeysDuration      int64
 	LockKeysCount         int32
+	LockTableIDs          map[int64]struct{} // table IDs need to be locked, empty for lock all tables
 	TblInfo2UnionScan     map[*model.TableInfo]bool
 	TaskID                uint64 // unique ID for an execution of a statement
 	TaskMapBakTS          uint64 // counter for
+
+	// stmtCache is used to store some statement-related values.
+	stmtCache map[StmtCacheKey]interface{}
+	// resourceGroupTag cache for the current statement resource group tag.
+	resourceGroupTag atomic.Value
+	// Map to store all CTE storages of current SQL.
+	// Will clean up at the end of the execution.
+	CTEStorageMap interface{}
+	// cachedTables is used to store cache table id and a pointer to cache data when it satisfies the cache read condition
+	cachedTables []struct {
+		id        int64
+		memBuffer interface{} // is a point to cache.MemBuffer. in order to avoid import cycle
+	}
+
+	// cache is used to reduce object allocation.
+	cache struct {
+		execdetails.RuntimeStatsColl
+		MemTracker  memory.Tracker
+		DiskTracker disk.Tracker
+		LogOnExceed [2]memory.LogOnExceed
+	}
+
+	// OptimInfo maps Plan.ID() to optimization information when generating Plan.
+	OptimInfo map[int]string
+	// InVerboseExplain indicates the statement is "explain format='verbose' ...".
+	InVerboseExplain bool
 }
 
 // StmtHints are SessionVars related sql hints.
@@ -177,6 +216,7 @@ type StmtHints struct {
 	HasReplicaReadHint             bool
 	HasMaxExecutionTime            bool
 	HasEnableCascadesPlannerHint   bool
+	SetVars                        map[string]string
 }
 
 // TaskMapNeedBackUp indicates that whether we need to back up taskMap during physical optimizing.
@@ -184,24 +224,40 @@ func (sh *StmtHints) TaskMapNeedBackUp() bool {
 	return sh.ForceNthPlan != -1
 }
 
-// GetNowTsCached getter for nowTs, if not set get now time and cache it
-func (sc *StatementContext) GetNowTsCached() time.Time {
-	if !sc.stmtTimeCached {
-		now := time.Now()
-		sc.nowTs = now
-		sc.stmtTimeCached = true
+// StmtCacheKey represents the key type in the StmtCache.
+type StmtCacheKey int
+
+const (
+	// StmtNowTsCacheKey is a variable for now/current_timestamp calculation/cache of one stmt.
+	StmtNowTsCacheKey StmtCacheKey = iota
+	// StmtSafeTSCacheKey is a variable for safeTS calculation/cache of one stmt.
+	StmtSafeTSCacheKey
+)
+
+// GetOrStoreStmtCache gets the cached value of the given key if it exists, otherwise stores the value.
+func (sc *StatementContext) GetOrStoreStmtCache(key StmtCacheKey, value interface{}) interface{} {
+	if sc.stmtCache == nil {
+		sc.stmtCache = make(map[StmtCacheKey]interface{})
 	}
-	return sc.nowTs
+	if _, ok := sc.stmtCache[key]; !ok {
+		sc.stmtCache[key] = value
+	}
+	return sc.stmtCache[key]
 }
 
-// ResetNowTs resetter for nowTs, clear cached time flag
-func (sc *StatementContext) ResetNowTs() {
-	sc.stmtTimeCached = false
+// ResetInStmtCache resets the cache of given key.
+func (sc *StatementContext) ResetInStmtCache(key StmtCacheKey) {
+	delete(sc.stmtCache, key)
+}
+
+// ResetStmtCache resets all cached values.
+func (sc *StatementContext) ResetStmtCache() {
+	sc.stmtCache = make(map[StmtCacheKey]interface{})
 }
 
 // SQLDigest gets normalized and digest for provided sql.
 // it will cache result after first calling.
-func (sc *StatementContext) SQLDigest() (normalized, sqlDigest string) {
+func (sc *StatementContext) SQLDigest() (normalized string, sqlDigest *parser.Digest) {
 	sc.digestMemo.Do(func() {
 		sc.digestMemo.normalized, sc.digestMemo.digest = parser.NormalizeDigest(sc.OriginalSQL)
 	})
@@ -209,20 +265,99 @@ func (sc *StatementContext) SQLDigest() (normalized, sqlDigest string) {
 }
 
 // InitSQLDigest sets the normalized and digest for sql.
-func (sc *StatementContext) InitSQLDigest(normalized, digest string) {
+func (sc *StatementContext) InitSQLDigest(normalized string, digest *parser.Digest) {
 	sc.digestMemo.Do(func() {
 		sc.digestMemo.normalized, sc.digestMemo.digest = normalized, digest
 	})
 }
 
 // GetPlanDigest gets the normalized plan and plan digest.
-func (sc *StatementContext) GetPlanDigest() (normalized, planDigest string) {
+func (sc *StatementContext) GetPlanDigest() (normalized string, planDigest *parser.Digest) {
 	return sc.planNormalized, sc.planDigest
 }
 
+// GetResourceGroupTag gets the resource group of the statement.
+func (sc *StatementContext) GetResourceGroupTag() []byte {
+	tag, _ := sc.resourceGroupTag.Load().([]byte)
+	if len(tag) > 0 {
+		return tag
+	}
+	normalized, sqlDigest := sc.SQLDigest()
+	if len(normalized) == 0 {
+		return nil
+	}
+	tag = resourcegrouptag.EncodeResourceGroupTag(sqlDigest, sc.planDigest)
+	sc.resourceGroupTag.Store(tag)
+	return tag
+}
+
 // SetPlanDigest sets the normalized plan and plan digest.
-func (sc *StatementContext) SetPlanDigest(normalized, planDigest string) {
-	sc.planNormalized, sc.planDigest = normalized, planDigest
+func (sc *StatementContext) SetPlanDigest(normalized string, planDigest *parser.Digest) {
+	if planDigest != nil {
+		sc.planNormalized, sc.planDigest = normalized, planDigest
+	}
+}
+
+// GetEncodedPlan gets the encoded plan, it is used to avoid repeated encode.
+func (sc *StatementContext) GetEncodedPlan() string {
+	return sc.encodedPlan
+}
+
+// SetEncodedPlan sets the encoded plan, it is used to avoid repeated encode.
+func (sc *StatementContext) SetEncodedPlan(encodedPlan string) {
+	sc.encodedPlan = encodedPlan
+}
+
+// GetPlanHint gets the hint string generated from the plan.
+func (sc *StatementContext) GetPlanHint() (string, bool) {
+	return sc.planHint, sc.planHintSet
+}
+
+// InitDiskTracker initializes the sc.DiskTracker, use cache to avoid allocation.
+func (sc *StatementContext) InitDiskTracker(label int, bytesLimit int64) {
+	memory.InitTracker(&sc.cache.DiskTracker, label, bytesLimit, &sc.cache.LogOnExceed[0])
+	sc.DiskTracker = &sc.cache.DiskTracker
+}
+
+// InitMemTracker initializes the sc.MemTracker, use cache to avoid allocation.
+func (sc *StatementContext) InitMemTracker(label int, bytesLimit int64) {
+	memory.InitTracker(&sc.cache.MemTracker, label, bytesLimit, &sc.cache.LogOnExceed[1])
+	sc.MemTracker = &sc.cache.MemTracker
+}
+
+// SetPlanHint sets the hint for the plan.
+func (sc *StatementContext) SetPlanHint(hint string) {
+	sc.planHintSet = true
+	sc.planHint = hint
+}
+
+// StoreCacheTable stores the read condition and a point to cache data of the given key.
+func (sc *StatementContext) StoreCacheTable(tblID int64, buffer interface{}) {
+	for _, data := range sc.cachedTables {
+		if data.id == tblID {
+			data.memBuffer = buffer
+		}
+		return
+	}
+	sc.cachedTables = append(sc.cachedTables, struct {
+		id        int64
+		memBuffer interface{}
+	}{id: tblID, memBuffer: buffer})
+}
+
+// GetCacheTable gets the read condition and a point to cache data of the given key if it exists
+func (sc *StatementContext) GetCacheTable(tblID int64) (bool, interface{}) {
+	for _, data := range sc.cachedTables {
+		if data.id == tblID {
+			return true, data.memBuffer
+		}
+	}
+	return false, nil
+}
+
+// CacheTableUsed is used by test to check whether the last query use table cache.
+func (sc *StatementContext) CacheTableUsed() bool {
+	return len(sc.cachedTables) > 0
 }
 
 // TableEntry presents table in db.
@@ -234,118 +369,111 @@ type TableEntry struct {
 // AddAffectedRows adds affected rows.
 func (sc *StatementContext) AddAffectedRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.affectedRows += rows
-	sc.mu.Unlock()
 }
 
 // AffectedRows gets affected rows.
 func (sc *StatementContext) AffectedRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.affectedRows
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.affectedRows
 }
 
 // FoundRows gets found rows.
 func (sc *StatementContext) FoundRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.foundRows
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.foundRows
 }
 
 // AddFoundRows adds found rows.
 func (sc *StatementContext) AddFoundRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.foundRows += rows
-	sc.mu.Unlock()
 }
 
 // RecordRows is used to generate info message
 func (sc *StatementContext) RecordRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.records
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.records
 }
 
 // AddRecordRows adds record rows.
 func (sc *StatementContext) AddRecordRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.records += rows
-	sc.mu.Unlock()
 }
 
 // UpdatedRows is used to generate info message
 func (sc *StatementContext) UpdatedRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.updated
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.updated
 }
 
 // AddUpdatedRows adds updated rows.
 func (sc *StatementContext) AddUpdatedRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.updated += rows
-	sc.mu.Unlock()
 }
 
 // CopiedRows is used to generate info message
 func (sc *StatementContext) CopiedRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.copied
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.copied
 }
 
 // AddCopiedRows adds copied rows.
 func (sc *StatementContext) AddCopiedRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.copied += rows
-	sc.mu.Unlock()
 }
 
 // TouchedRows is used to generate info message
 func (sc *StatementContext) TouchedRows() uint64 {
 	sc.mu.Lock()
-	rows := sc.mu.touched
-	sc.mu.Unlock()
-	return rows
+	defer sc.mu.Unlock()
+	return sc.mu.touched
 }
 
 // AddTouchedRows adds touched rows.
 func (sc *StatementContext) AddTouchedRows(rows uint64) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.touched += rows
-	sc.mu.Unlock()
 }
 
 // GetMessage returns the extra message of the last executed command, if there is no message, it returns empty string
 func (sc *StatementContext) GetMessage() string {
 	sc.mu.Lock()
-	msg := sc.mu.message
-	sc.mu.Unlock()
-	return msg
+	defer sc.mu.Unlock()
+	return sc.mu.message
 }
 
 // SetMessage sets the info message generated by some commands
 func (sc *StatementContext) SetMessage(msg string) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.message = msg
-	sc.mu.Unlock()
 }
 
 // GetWarnings gets warnings.
 func (sc *StatementContext) GetWarnings() []SQLWarn {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	warns := make([]SQLWarn, len(sc.mu.warnings))
 	copy(warns, sc.mu.warnings)
-	sc.mu.Unlock()
 	return warns
 }
 
-// TruncateWarnings truncates wanrings begin from start and returns the truncated warnings.
+// TruncateWarnings truncates warnings begin from start and returns the truncated warnings.
 func (sc *StatementContext) TruncateWarnings(start int) []SQLWarn {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -365,74 +493,66 @@ func (sc *StatementContext) WarningCount() uint16 {
 		return 0
 	}
 	sc.mu.Lock()
-	wc := uint16(len(sc.mu.warnings))
-	sc.mu.Unlock()
-	return wc
+	defer sc.mu.Unlock()
+	return uint16(len(sc.mu.warnings))
 }
 
 // NumErrorWarnings gets warning and error count.
 func (sc *StatementContext) NumErrorWarnings() (ec uint16, wc int) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	ec = sc.mu.errorCount
 	wc = len(sc.mu.warnings)
-	sc.mu.Unlock()
 	return
 }
 
 // SetWarnings sets warnings.
 func (sc *StatementContext) SetWarnings(warns []SQLWarn) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.warnings = warns
 	for _, w := range warns {
 		if w.Level == WarnLevelError {
 			sc.mu.errorCount++
 		}
 	}
-	sc.mu.Unlock()
 }
 
 // AppendWarning appends a warning with level 'Warning'.
 func (sc *StatementContext) AppendWarning(warn error) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if len(sc.mu.warnings) < math.MaxUint16 {
 		sc.mu.warnings = append(sc.mu.warnings, SQLWarn{WarnLevelWarning, warn})
 	}
-	sc.mu.Unlock()
 }
 
 // AppendWarnings appends some warnings.
 func (sc *StatementContext) AppendWarnings(warns []SQLWarn) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if len(sc.mu.warnings) < math.MaxUint16 {
 		sc.mu.warnings = append(sc.mu.warnings, warns...)
 	}
-	sc.mu.Unlock()
 }
 
 // AppendNote appends a warning with level 'Note'.
 func (sc *StatementContext) AppendNote(warn error) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if len(sc.mu.warnings) < math.MaxUint16 {
 		sc.mu.warnings = append(sc.mu.warnings, SQLWarn{WarnLevelNote, warn})
 	}
-	sc.mu.Unlock()
 }
 
 // AppendError appends a warning with level 'Error'.
 func (sc *StatementContext) AppendError(warn error) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if len(sc.mu.warnings) < math.MaxUint16 {
 		sc.mu.warnings = append(sc.mu.warnings, SQLWarn{WarnLevelError, warn})
 		sc.mu.errorCount++
 	}
-	sc.mu.Unlock()
-}
-
-// SetHistogramsNotLoad sets histogramsNotLoad.
-func (sc *StatementContext) SetHistogramsNotLoad() {
-	sc.mu.Lock()
-	sc.mu.histogramsNotLoad = true
-	sc.mu.Unlock()
 }
 
 // HandleTruncate ignores or returns the error based on the StatementContext state.
@@ -465,9 +585,10 @@ func (sc *StatementContext) HandleOverflow(err error, warnErr error) error {
 	return err
 }
 
-// ResetForRetry resets the changed states during execution.
-func (sc *StatementContext) ResetForRetry() {
+// resetMuForRetry resets the changed states of sc.mu during execution.
+func (sc *StatementContext) resetMuForRetry() {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	sc.mu.affectedRows = 0
 	sc.mu.foundRows = 0
 	sc.mu.records = 0
@@ -479,7 +600,11 @@ func (sc *StatementContext) ResetForRetry() {
 	sc.mu.warnings = nil
 	sc.mu.execDetails = execdetails.ExecDetails{}
 	sc.mu.allExecDetails = make([]*execdetails.ExecDetails, 0, 4)
-	sc.mu.Unlock()
+}
+
+// ResetForRetry resets the changed states during execution.
+func (sc *StatementContext) ResetForRetry() {
+	sc.resetMuForRetry()
 	sc.MaxRowID = 0
 	sc.BaseRowID = 0
 	sc.TableIDs = sc.TableIDs[:0]
@@ -489,50 +614,70 @@ func (sc *StatementContext) ResetForRetry() {
 
 // MergeExecDetails merges a single region execution details into self, used to print
 // the information in slow query log.
-func (sc *StatementContext) MergeExecDetails(details *execdetails.ExecDetails, commitDetails *execdetails.CommitDetails) {
+func (sc *StatementContext) MergeExecDetails(details *execdetails.ExecDetails, commitDetails *util.CommitDetails) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if details != nil {
 		sc.mu.execDetails.CopTime += details.CopTime
-		sc.mu.execDetails.ProcessTime += details.ProcessTime
-		sc.mu.execDetails.WaitTime += details.WaitTime
 		sc.mu.execDetails.BackoffTime += details.BackoffTime
 		sc.mu.execDetails.RequestCount++
-		sc.mu.execDetails.TotalKeys += details.TotalKeys
-		sc.mu.execDetails.ProcessedKeys += details.ProcessedKeys
+		sc.MergeScanDetail(details.ScanDetail)
+		sc.MergeTimeDetail(details.TimeDetail)
 		sc.mu.allExecDetails = append(sc.mu.allExecDetails, details)
 	}
-	sc.mu.execDetails.CommitDetail = commitDetails
-	sc.mu.Unlock()
+	if commitDetails != nil {
+		if sc.mu.execDetails.CommitDetail == nil {
+			sc.mu.execDetails.CommitDetail = commitDetails
+		} else {
+			sc.mu.execDetails.CommitDetail.Merge(commitDetails)
+		}
+	}
+}
+
+// MergeScanDetail merges scan details into self.
+func (sc *StatementContext) MergeScanDetail(scanDetail *util.ScanDetail) {
+	// Currently TiFlash cop task does not fill scanDetail, so need to skip it if scanDetail is nil
+	if scanDetail == nil {
+		return
+	}
+	if sc.mu.execDetails.ScanDetail == nil {
+		sc.mu.execDetails.ScanDetail = &util.ScanDetail{}
+	}
+	sc.mu.execDetails.ScanDetail.Merge(scanDetail)
+}
+
+// MergeTimeDetail merges time details into self.
+func (sc *StatementContext) MergeTimeDetail(timeDetail util.TimeDetail) {
+	sc.mu.execDetails.TimeDetail.ProcessTime += timeDetail.ProcessTime
+	sc.mu.execDetails.TimeDetail.WaitTime += timeDetail.WaitTime
 }
 
 // MergeLockKeysExecDetails merges lock keys execution details into self.
-func (sc *StatementContext) MergeLockKeysExecDetails(lockKeys *execdetails.LockKeysDetails) {
+func (sc *StatementContext) MergeLockKeysExecDetails(lockKeys *util.LockKeysDetails) {
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if sc.mu.execDetails.LockKeysDetail == nil {
 		sc.mu.execDetails.LockKeysDetail = lockKeys
 	} else {
 		sc.mu.execDetails.LockKeysDetail.Merge(lockKeys)
 	}
-	sc.mu.Unlock()
 }
 
 // GetExecDetails gets the execution details for the statement.
 func (sc *StatementContext) GetExecDetails() execdetails.ExecDetails {
 	var details execdetails.ExecDetails
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	details = sc.mu.execDetails
 	details.LockKeysDuration = time.Duration(atomic.LoadInt64(&sc.LockKeysDuration))
-	sc.mu.Unlock()
 	return details
 }
 
 // ShouldClipToZero indicates whether values less than 0 should be clipped to 0 for unsigned integer types.
-// This is the case for `insert`, `update`, `alter table` and `load data infile` statements, when not in strict SQL mode.
+// This is the case for `insert`, `update`, `alter table`, `create table` and `load data infile` statements, when not in strict SQL mode.
 // see https://dev.mysql.com/doc/refman/5.7/en/out-of-range-and-overflow.html
 func (sc *StatementContext) ShouldClipToZero() bool {
-	// TODO: Currently altering column of integer to unsigned integer is not supported.
-	// If it is supported one day, that case should be added here.
-	return sc.InInsertStmt || sc.InLoadDataStmt
+	return sc.InInsertStmt || sc.InLoadDataStmt || sc.InUpdateStmt || sc.InCreateOrAlterStmt || sc.IsDDLJobInQueue
 }
 
 // ShouldIgnoreOverflowError indicates whether we should ignore the error when type conversion overflows,
@@ -591,21 +736,21 @@ func (sc *StatementContext) CopTasksDetails() *CopTasksDetails {
 	if n == 0 {
 		return d
 	}
-	d.AvgProcessTime = sc.mu.execDetails.ProcessTime / time.Duration(n)
-	d.AvgWaitTime = sc.mu.execDetails.WaitTime / time.Duration(n)
+	d.AvgProcessTime = sc.mu.execDetails.TimeDetail.ProcessTime / time.Duration(n)
+	d.AvgWaitTime = sc.mu.execDetails.TimeDetail.WaitTime / time.Duration(n)
 
 	sort.Slice(sc.mu.allExecDetails, func(i, j int) bool {
-		return sc.mu.allExecDetails[i].ProcessTime < sc.mu.allExecDetails[j].ProcessTime
+		return sc.mu.allExecDetails[i].TimeDetail.ProcessTime < sc.mu.allExecDetails[j].TimeDetail.ProcessTime
 	})
-	d.P90ProcessTime = sc.mu.allExecDetails[n*9/10].ProcessTime
-	d.MaxProcessTime = sc.mu.allExecDetails[n-1].ProcessTime
+	d.P90ProcessTime = sc.mu.allExecDetails[n*9/10].TimeDetail.ProcessTime
+	d.MaxProcessTime = sc.mu.allExecDetails[n-1].TimeDetail.ProcessTime
 	d.MaxProcessAddress = sc.mu.allExecDetails[n-1].CalleeAddress
 
 	sort.Slice(sc.mu.allExecDetails, func(i, j int) bool {
-		return sc.mu.allExecDetails[i].WaitTime < sc.mu.allExecDetails[j].WaitTime
+		return sc.mu.allExecDetails[i].TimeDetail.WaitTime < sc.mu.allExecDetails[j].TimeDetail.WaitTime
 	})
-	d.P90WaitTime = sc.mu.allExecDetails[n*9/10].WaitTime
-	d.MaxWaitTime = sc.mu.allExecDetails[n-1].WaitTime
+	d.P90WaitTime = sc.mu.allExecDetails[n*9/10].TimeDetail.WaitTime
+	d.MaxWaitTime = sc.mu.allExecDetails[n-1].TimeDetail.WaitTime
 	d.MaxWaitAddress = sc.mu.allExecDetails[n-1].CalleeAddress
 
 	// calculate backoff details
@@ -670,7 +815,7 @@ func (sc *StatementContext) GetLockWaitStartTime() time.Time {
 	return time.Unix(0, startTime)
 }
 
-//CopTasksDetails collects some useful information of cop-tasks during execution.
+// CopTasksDetails collects some useful information of cop-tasks during execution.
 type CopTasksDetails struct {
 	NumCopTasks int
 

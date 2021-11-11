@@ -8,17 +8,19 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package bindinfo
 
 import (
+	"strings"
 	"time"
 
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 )
@@ -51,6 +53,7 @@ func (h *SessionHandle) CreateBindRecord(sctx sessionctx.Context, record *BindRe
 	if err != nil {
 		return err
 	}
+	record.Db = strings.ToLower(record.Db)
 	now := types.NewTime(types.FromGoTime(time.Now().In(sctx.GetSessionVars().StmtCtx.TimeZone)), mysql.TypeTimestamp, 3)
 	for i := range record.Bindings {
 		record.Bindings[i].CreateTime = now
@@ -58,12 +61,13 @@ func (h *SessionHandle) CreateBindRecord(sctx sessionctx.Context, record *BindRe
 	}
 
 	// update the BindMeta to the cache.
-	h.appendBindRecord(parser.DigestNormalized(record.OriginalSQL), record)
+	h.appendBindRecord(parser.DigestNormalized(record.OriginalSQL).String(), record)
 	return nil
 }
 
 // DropBindRecord drops a BindRecord in the cache.
 func (h *SessionHandle) DropBindRecord(originalSQL, db string, binding *Binding) error {
+	db = strings.ToLower(db)
 	oldRecord := h.GetBindRecord(originalSQL, db)
 	var newRecord *BindRecord
 	record := &BindRecord{OriginalSQL: originalSQL, Db: db}
@@ -75,17 +79,17 @@ func (h *SessionHandle) DropBindRecord(originalSQL, db string, binding *Binding)
 	} else {
 		newRecord = record
 	}
-	h.ch.setBindRecord(parser.DigestNormalized(record.OriginalSQL), newRecord)
+	h.ch.setBindRecord(parser.DigestNormalized(record.OriginalSQL).String(), newRecord)
 	updateMetrics(metrics.ScopeSession, oldRecord, newRecord, false)
 	return nil
 }
 
 // GetBindRecord return the BindMeta of the (normdOrigSQL,db) if BindMeta exist.
 func (h *SessionHandle) GetBindRecord(normdOrigSQL, db string) *BindRecord {
-	hash := parser.DigestNormalized(normdOrigSQL)
+	hash := parser.DigestNormalized(normdOrigSQL).String()
 	bindRecords := h.ch[hash]
 	for _, bindRecord := range bindRecords {
-		if bindRecord.OriginalSQL == normdOrigSQL && bindRecord.Db == db {
+		if bindRecord.OriginalSQL == normdOrigSQL {
 			return bindRecord
 		}
 	}

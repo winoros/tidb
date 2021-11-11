@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -42,7 +43,7 @@ func CompareUint64(x, y uint64) int {
 	return 1
 }
 
-//VecCompareUU returns []int64 comparing the []uint64 x to []uint64 y
+// VecCompareUU returns []int64 comparing the []uint64 x to []uint64 y
 func VecCompareUU(x, y []uint64, res []int64) {
 	n := len(x)
 	for i := 0; i < n; i++ {
@@ -56,7 +57,7 @@ func VecCompareUU(x, y []uint64, res []int64) {
 	}
 }
 
-//VecCompareII returns []int64 comparing the []int64 x to []int64 y
+// VecCompareII returns []int64 comparing the []int64 x to []int64 y
 func VecCompareII(x, y, res []int64) {
 	n := len(x)
 	for i := 0; i < n; i++ {
@@ -70,7 +71,7 @@ func VecCompareII(x, y, res []int64) {
 	}
 }
 
-//VecCompareUI returns []int64 comparing the []uint64 x to []int64y
+// VecCompareUI returns []int64 comparing the []uint64 x to []int64y
 func VecCompareUI(x []uint64, y, res []int64) {
 	n := len(x)
 	for i := 0; i < n; i++ {
@@ -86,7 +87,7 @@ func VecCompareUI(x []uint64, y, res []int64) {
 	}
 }
 
-//VecCompareIU returns []int64 comparing the []int64 x to []uint64y
+// VecCompareIU returns []int64 comparing the []int64 x to []uint64y
 func VecCompareIU(x []int64, y []uint64, res []int64) {
 	n := len(x)
 	for i := 0; i < n; i++ {

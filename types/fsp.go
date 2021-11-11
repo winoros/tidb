@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -38,8 +39,10 @@ func CheckFsp(fsp int) (int8, error) {
 	if fsp == int(UnspecifiedFsp) {
 		return DefaultFsp, nil
 	}
-	if fsp < int(MinFsp) || fsp > int(MaxFsp) {
+	if fsp < int(MinFsp) {
 		return DefaultFsp, errors.Errorf("Invalid fsp %d", fsp)
+	} else if fsp > int(MaxFsp) {
+		return MaxFsp, nil
 	}
 	return int8(fsp), nil
 }

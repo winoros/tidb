@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -22,14 +23,16 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testutil"
@@ -45,15 +48,18 @@ type testColumnChangeSuite struct {
 func (s *testColumnChangeSuite) SetUpSuite(c *C) {
 	SetWaitTimeWhenErrorOccurred(1 * time.Microsecond)
 	s.store = testCreateStore(c, "test_column_change")
-	s.dbInfo = &model.DBInfo{
-		Name: model.NewCIStr("test_column_change"),
-		ID:   1,
-	}
-	err := kv.RunInNewTxn(s.store, true, func(txn kv.Transaction) error {
-		t := meta.NewMeta(txn)
-		return errors.Trace(t.CreateDatabase(s.dbInfo))
-	})
-	c.Check(err, IsNil)
+	d := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(s.store),
+		WithLease(testLease),
+	)
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
+	s.dbInfo = testSchemaInfo(c, d, "test_index_change")
+	testCreateSchema(c, testNewContext(d), d, s.dbInfo)
 }
 
 func (s *testColumnChangeSuite) TearDownSuite(c *C) {
@@ -67,7 +73,10 @@ func (s *testColumnChangeSuite) TestColumnChange(c *C) {
 		WithStore(s.store),
 		WithLease(testLease),
 	)
-	defer d.Stop()
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
 	// create table t (c1 int, c2 int);
 	tblInfo := testTableInfo(c, d, "t", 2)
 	ctx := testNewContext(d)
@@ -144,7 +153,7 @@ func (s *testColumnChangeSuite) TestColumnChange(c *C) {
 	d.SetHook(tc)
 	defaultValue := int64(3)
 	job := testCreateColumn(c, ctx, d, s.dbInfo, tblInfo, "c3", &ast.ColumnPosition{Tp: ast.ColumnPositionNone}, defaultValue)
-	c.Assert(errors.ErrorStack(checkErr), Equals, "")
+	c.Assert(checkErr, IsNil)
 	testCheckJobDone(c, d, job, true)
 	mu.Lock()
 	tb := publicTable
@@ -160,7 +169,10 @@ func (s *testColumnChangeSuite) TestModifyAutoRandColumnWithMetaKeyChanged(c *C)
 		WithStore(s.store),
 		WithLease(testLease),
 	)
-	defer d.Stop()
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
 
 	ids, err := d.genGlobalIDs(1)
 	tableID := ids[0]
@@ -187,9 +199,9 @@ func (s *testColumnChangeSuite) TestModifyAutoRandColumnWithMetaKeyChanged(c *C)
 	tc.onJobRunBefore = func(job *model.Job) {
 		if atomic.LoadInt32(&errCount) > 0 && job.Type == model.ActionModifyColumn {
 			atomic.AddInt32(&errCount, -1)
-			genAutoRandErr = kv.RunInNewTxn(s.store, false, func(txn kv.Transaction) error {
+			genAutoRandErr = kv.RunInNewTxn(context.Background(), s.store, false, func(ctx context.Context, txn kv.Transaction) error {
 				t := meta.NewMeta(txn)
-				_, err1 := t.GenAutoRandomID(s.dbInfo.ID, tableID, 1)
+				_, err1 := t.GetAutoIDAccessors(s.dbInfo.ID, tableID).RandomID().Inc(1)
 				return err1
 			})
 		}
@@ -210,7 +222,7 @@ func (s *testColumnChangeSuite) TestModifyAutoRandColumnWithMetaKeyChanged(c *C)
 	c.Assert(genAutoRandErr, IsNil)
 	testCheckJobDone(c, d, job, true)
 	var newTbInfo *model.TableInfo
-	err = kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+	err = kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err error
 		newTbInfo, err = t.GetTable(s.dbInfo.ID, tableID)
@@ -267,7 +279,7 @@ func (s *testColumnChangeSuite) testAddColumnNoDefault(c *C, ctx sessionctx.Cont
 	}
 	d.SetHook(tc)
 	job := testCreateColumn(c, ctx, d, s.dbInfo, tblInfo, "c3", &ast.ColumnPosition{Tp: ast.ColumnPositionNone}, nil)
-	c.Assert(errors.ErrorStack(checkErr), Equals, "")
+	c.Assert(checkErr, IsNil)
 	testCheckJobDone(c, d, job, true)
 }
 
@@ -293,8 +305,30 @@ func (s *testColumnChangeSuite) testColumnDrop(c *C, ctx sessionctx.Context, d *
 		}
 	}
 	d.SetHook(tc)
-	c.Assert(errors.ErrorStack(checkErr), Equals, "")
+	c.Assert(checkErr, IsNil)
 	testDropColumn(c, ctx, d, s.dbInfo, tbl.Meta(), dropCol.Name.L, false)
+}
+
+func seek(t table.PhysicalTable, ctx sessionctx.Context, h kv.Handle) (kv.Handle, bool, error) {
+	txn, err := ctx.Txn(true)
+	if err != nil {
+		return nil, false, err
+	}
+	recordPrefix := t.RecordPrefix()
+	seekKey := tablecodec.EncodeRowKeyWithHandle(t.GetPhysicalID(), h)
+	iter, err := txn.Iter(seekKey, recordPrefix.PrefixNext())
+	if err != nil {
+		return nil, false, err
+	}
+	if !iter.Valid() || !iter.Key().HasPrefix(recordPrefix) {
+		// No more records in the table, skip to the end.
+		return nil, false, nil
+	}
+	handle, err := tablecodec.DecodeRowKey(iter.Key())
+	if err != nil {
+		return nil, false, err
+	}
+	return handle, true, nil
 }
 
 func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl, deleteOnlyTable, writeOnlyTable table.Table, h kv.Handle) error {
@@ -317,7 +351,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl
 		return errors.Trace(err)
 	}
 	// This test is for RowWithCols when column state is StateWriteOnly.
-	row, err := writeOnlyTable.RowWithCols(ctx, h, writeOnlyTable.WritableCols())
+	row, err := tables.RowWithCols(writeOnlyTable, ctx, h, writeOnlyTable.WritableCols())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -332,7 +366,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl
 		return errors.Trace(err)
 	}
 	// WriteOnlyTable: update t set c1 = 2 where c1 = 1
-	h, _, err = writeOnlyTable.Seek(ctx, kv.IntHandle(0))
+	h, _, err = seek(writeOnlyTable.(table.PhysicalTable), ctx, kv.IntHandle(0))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -387,7 +421,7 @@ func (s *testColumnChangeSuite) checkAddPublic(sctx sessionctx.Context, d *ddl, 
 		return errors.Trace(err)
 	}
 	// writeOnlyTable update t set c1 = 3 where c1 = 4
-	oldRow, err := writeOnlyTable.RowWithCols(sctx, h, writeOnlyTable.WritableCols())
+	oldRow, err := tables.RowWithCols(writeOnlyTable, sctx, h, writeOnlyTable.WritableCols())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -413,7 +447,7 @@ func (s *testColumnChangeSuite) checkAddPublic(sctx sessionctx.Context, d *ddl, 
 
 func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 	var tblInfo *model.TableInfo
-	err := kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+	err := kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err error
 		tblInfo, err = t.GetTable(schemaID, tableID)
@@ -425,7 +459,7 @@ func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	alloc := autoid.NewAllocator(d.store, schemaID, false, autoid.RowIDAllocType)
+	alloc := autoid.NewAllocator(d.store, schemaID, tblInfo.ID, false, autoid.RowIDAllocType)
 	tbl, err := table.TableFromMeta(autoid.NewAllocators(alloc), tblInfo)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -435,7 +469,7 @@ func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 
 func checkResult(ctx sessionctx.Context, t table.Table, cols []*table.Column, rows [][]interface{}) error {
 	var gotRows [][]interface{}
-	err := t.IterRecords(ctx, t.FirstKey(), cols, func(_ kv.Handle, data []types.Datum, cols []*table.Column) (bool, error) {
+	err := tables.IterRecords(t, ctx, cols, func(_ kv.Handle, data []types.Datum, cols []*table.Column) (bool, error) {
 		gotRows = append(gotRows, datumsToInterfaces(data))
 		return true, nil
 	})

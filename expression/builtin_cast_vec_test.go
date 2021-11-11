@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,16 +17,17 @@ package expression
 import (
 	"math"
 	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 
-	. "github.com/pingcap/check"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/stretchr/testify/require"
 )
 
 var vecBuiltinCastCases = map[string][]vecExprBenchCase{
@@ -37,7 +39,7 @@ var vecBuiltinCastCases = map[string][]vecExprBenchCase{
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETInt}},
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETReal}},
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETDecimal}},
-		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETJson}},
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETJson}, geners: []dataGenerator{&constJSONGener{strconv.Itoa(rand.Int())}}},
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETDatetime}},
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETDuration}},
 		{
@@ -55,7 +57,7 @@ var vecBuiltinCastCases = map[string][]vecExprBenchCase{
 		{retEvalType: types.ETDuration, childrenTypes: []types.EvalType{types.ETReal}, geners: []dataGenerator{newRandDurReal()}},
 		{retEvalType: types.ETDuration, childrenTypes: []types.EvalType{types.ETDecimal}, geners: []dataGenerator{newRandDurDecimal()}},
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETReal}},
-		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETJson}},
+		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETJson}, geners: []dataGenerator{newDecimalJSONGener(0)}},
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETDecimal}},
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETString}, geners: []dataGenerator{newRealStringGener()}},
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETDatetime}},
@@ -147,15 +149,17 @@ func (g *datetimeJSONGener) gen() interface{} {
 	return json.CreateBinary(d.String())
 }
 
-func (s *testEvaluatorSuite) TestVectorizedBuiltinCastEvalOneVec(c *C) {
-	testVectorizedEvalOneVec(c, vecBuiltinCastCases)
+func TestVectorizedBuiltinCastEvalOneVec(t *testing.T) {
+	testVectorizedEvalOneVec(t, vecBuiltinCastCases)
 }
 
-func (s *testEvaluatorSuite) TestVectorizedBuiltinCastFunc(c *C) {
-	testVectorizedBuiltinFunc(c, vecBuiltinCastCases)
+func TestVectorizedBuiltinCastFunc(t *testing.T) {
+	testVectorizedBuiltinFunc(t, vecBuiltinCastCases)
 }
 
-func (s *testEvaluatorSuite) TestVectorizedCastRealAsTime(c *C) {
+func TestVectorizedCastRealAsTime(t *testing.T) {
+	t.Parallel()
+
 	col := &Column{RetType: types.NewFieldType(mysql.TypeDouble), Index: 0}
 	baseFunc, err := newBaseBuiltinFunc(mock.NewContext(), "", []Expression{col}, 0)
 	if err != nil {
@@ -169,16 +173,16 @@ func (s *testEvaluatorSuite) TestVectorizedCastRealAsTime(c *C) {
 
 	for _, input := range inputs {
 		result := chunk.NewColumn(types.NewFieldType(mysql.TypeDatetime), input.NumRows())
-		c.Assert(cast.vecEvalTime(input, result), IsNil)
+		require.NoError(t, cast.vecEvalTime(input, result))
 		for i := 0; i < input.NumRows(); i++ {
 			res, isNull, err := cast.evalTime(input.GetRow(i))
-			c.Assert(err, IsNil)
+			require.NoError(t, err)
 			if isNull {
-				c.Assert(result.IsNull(i), IsTrue)
+				require.True(t, result.IsNull(i))
 				continue
 			}
-			c.Assert(result.IsNull(i), IsFalse)
-			c.Assert(result.GetTime(i).Compare(res), Equals, 0)
+			require.False(t, result.IsNull(i))
+			require.Zero(t, result.GetTime(i).Compare(res))
 		}
 	}
 }
@@ -197,7 +201,9 @@ func genCastRealAsTime() *chunk.Chunk {
 }
 
 // for issue https://github.com/pingcap/tidb/issues/16825
-func (s *testEvaluatorSuite) TestVectorizedCastStringAsDecimalWithUnsignedFlagInUnion(c *C) {
+func TestVectorizedCastStringAsDecimalWithUnsignedFlagInUnion(t *testing.T) {
+	t.Parallel()
+
 	col := &Column{RetType: types.NewFieldType(mysql.TypeString), Index: 0}
 	baseFunc, err := newBaseBuiltinFunc(mock.NewContext(), "", []Expression{col}, 0)
 	if err != nil {
@@ -217,12 +223,12 @@ func (s *testEvaluatorSuite) TestVectorizedCastStringAsDecimalWithUnsignedFlagIn
 
 	for _, input := range inputs {
 		result := chunk.NewColumn(types.NewFieldType(mysql.TypeNewDecimal), input.NumRows())
-		c.Assert(cast.vecEvalDecimal(input, result), IsNil)
+		require.NoError(t, cast.vecEvalDecimal(input, result))
 		for i := 0; i < input.NumRows(); i++ {
 			res, isNull, err := cast.evalDecimal(input.GetRow(i))
-			c.Assert(isNull, IsFalse)
-			c.Assert(err, IsNil)
-			c.Assert(result.GetDecimal(i).Compare(res), Equals, 0)
+			require.False(t, isNull)
+			require.NoError(t, err)
+			require.Zero(t, result.GetDecimal(i).Compare(res))
 		}
 	}
 }

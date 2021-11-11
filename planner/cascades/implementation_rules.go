@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -95,10 +96,7 @@ type ImplTableDual struct {
 
 // Match implements ImplementationRule Match interface.
 func (r *ImplTableDual) Match(expr *memo.GroupExpr, prop *property.PhysicalProperty) (matched bool) {
-	if !prop.IsEmpty() {
-		return false
-	}
-	return true
+	return prop.IsEmpty()
 }
 
 // OnImplement implements ImplementationRule OnImplement interface.
@@ -116,10 +114,7 @@ type ImplMemTableScan struct {
 
 // Match implements ImplementationRule Match interface.
 func (r *ImplMemTableScan) Match(expr *memo.GroupExpr, prop *property.PhysicalProperty) (matched bool) {
-	if !prop.IsEmpty() {
-		return false
-	}
-	return true
+	return prop.IsEmpty()
 }
 
 // OnImplement implements ImplementationRule OnImplement interface.
@@ -181,10 +176,10 @@ func (r *ImplTiKVSingleReadGather) OnImplement(expr *memo.GroupExpr, reqProp *pr
 	sg := expr.ExprNode.(*plannercore.TiKVSingleGather)
 	if sg.IsIndexGather {
 		reader := sg.GetPhysicalIndexReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
-		return []memo.Implementation{impl.NewIndexReaderImpl(reader, sg.Source.TblColHists)}, nil
+		return []memo.Implementation{impl.NewIndexReaderImpl(reader, sg.Source)}, nil
 	}
 	reader := sg.GetPhysicalTableReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
-	return []memo.Implementation{impl.NewTableReaderImpl(reader, sg.Source.TblColHists)}, nil
+	return []memo.Implementation{impl.NewTableReaderImpl(reader, sg.Source)}, nil
 }
 
 // ImplTableScan implements TableScan as PhysicalTableScan.
@@ -194,7 +189,7 @@ type ImplTableScan struct {
 // Match implements ImplementationRule Match interface.
 func (r *ImplTableScan) Match(expr *memo.GroupExpr, prop *property.PhysicalProperty) (matched bool) {
 	ts := expr.ExprNode.(*plannercore.LogicalTableScan)
-	return prop.IsEmpty() || (len(prop.Items) == 1 && ts.HandleCols != nil && prop.Items[0].Col.Equal(nil, ts.HandleCols.GetCol(0)))
+	return prop.IsEmpty() || (len(prop.SortItems) == 1 && ts.HandleCols != nil && prop.SortItems[0].Col.Equal(nil, ts.HandleCols.GetCol(0)))
 }
 
 // OnImplement implements ImplementationRule OnImplement interface.
@@ -204,7 +199,7 @@ func (r *ImplTableScan) OnImplement(expr *memo.GroupExpr, reqProp *property.Phys
 	ts := logicalScan.GetPhysicalScan(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt))
 	if !reqProp.IsEmpty() {
 		ts.KeepOrder = true
-		ts.Desc = reqProp.Items[0].Desc
+		ts.Desc = reqProp.SortItems[0].Desc
 	}
 	tblCols, tblColHists := logicalScan.Source.TblCols, logicalScan.Source.TblColHists
 	return []memo.Implementation{impl.NewTableScanImpl(ts, tblCols, tblColHists)}, nil
@@ -226,7 +221,7 @@ func (r *ImplIndexScan) OnImplement(expr *memo.GroupExpr, reqProp *property.Phys
 	is := logicalScan.GetPhysicalIndexScan(expr.Group.Prop.Schema, expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt))
 	if !reqProp.IsEmpty() {
 		is.KeepOrder = true
-		if reqProp.Items[0].Desc {
+		if reqProp.SortItems[0].Desc {
 			is.Desc = true
 		}
 	}
@@ -272,7 +267,7 @@ func (r *ImplSelection) OnImplement(expr *memo.GroupExpr, reqProp *property.Phys
 	logicalSel := expr.ExprNode.(*plannercore.LogicalSelection)
 	physicalSel := plannercore.PhysicalSelection{
 		Conditions: logicalSel.Conditions,
-	}.Init(logicalSel.SCtx(), expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), logicalSel.SelectBlockOffset(), reqProp.Clone())
+	}.Init(logicalSel.SCtx(), expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), logicalSel.SelectBlockOffset(), reqProp.CloneEssentialFields())
 	switch expr.Group.EngineType {
 	case memo.EngineTiDB:
 		return []memo.Implementation{impl.NewTiDBSelectionImpl(physicalSel)}, nil
@@ -414,10 +409,10 @@ func (r *ImplTopNAsLimit) Match(expr *memo.GroupExpr, prop *property.PhysicalPro
 func (r *ImplTopNAsLimit) OnImplement(expr *memo.GroupExpr, reqProp *property.PhysicalProperty) ([]memo.Implementation, error) {
 	lt := expr.ExprNode.(*plannercore.LogicalTopN)
 	newProp := &property.PhysicalProperty{ExpectedCnt: float64(lt.Count + lt.Offset)}
-	newProp.Items = make([]property.Item, len(lt.ByItems))
+	newProp.SortItems = make([]property.SortItem, len(lt.ByItems))
 	for i, item := range lt.ByItems {
-		newProp.Items[i].Col = item.Expr.(*expression.Column)
-		newProp.Items[i].Desc = item.Desc
+		newProp.SortItems[i].Col = item.Expr.(*expression.Column)
+		newProp.SortItems[i].Desc = item.Desc
 	}
 	physicalLimit := plannercore.PhysicalLimit{
 		Offset: lt.Offset,
@@ -563,7 +558,7 @@ func (r *ImplApply) OnImplement(expr *memo.GroupExpr, reqProp *property.Physical
 		la.SCtx(),
 		expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt),
 		la.SelectBlockOffset(),
-		&property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, Items: reqProp.Items},
+		&property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, SortItems: reqProp.SortItems},
 		&property.PhysicalProperty{ExpectedCnt: math.MaxFloat64})
 	physicalApply.SetSchema(expr.Group.Prop.Schema)
 	return []memo.Implementation{impl.NewApplyImpl(physicalApply)}, nil
@@ -596,17 +591,17 @@ type ImplWindow struct {
 // Match implements ImplementationRule Match interface.
 func (w *ImplWindow) Match(expr *memo.GroupExpr, prop *property.PhysicalProperty) (matched bool) {
 	lw := expr.ExprNode.(*plannercore.LogicalWindow)
-	var byItems []property.Item
+	var byItems []property.SortItem
 	byItems = append(byItems, lw.PartitionBy...)
 	byItems = append(byItems, lw.OrderBy...)
-	childProperty := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, Items: byItems}
+	childProperty := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, SortItems: byItems}
 	return prop.IsPrefix(childProperty)
 }
 
 // OnImplement implements ImplementationRule OnImplement interface.
 func (w *ImplWindow) OnImplement(expr *memo.GroupExpr, reqProp *property.PhysicalProperty) ([]memo.Implementation, error) {
 	lw := expr.ExprNode.(*plannercore.LogicalWindow)
-	var byItems []property.Item
+	var byItems []property.SortItem
 	byItems = append(byItems, lw.PartitionBy...)
 	byItems = append(byItems, lw.OrderBy...)
 	physicalWindow := plannercore.PhysicalWindow{
@@ -618,7 +613,7 @@ func (w *ImplWindow) OnImplement(expr *memo.GroupExpr, reqProp *property.Physica
 		lw.SCtx(),
 		expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt),
 		lw.SelectBlockOffset(),
-		&property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, Items: byItems},
+		&property.PhysicalProperty{ExpectedCnt: math.MaxFloat64, SortItems: byItems},
 	)
 	physicalWindow.SetSchema(expr.Group.Prop.Schema)
 	return []memo.Implementation{impl.NewWindowImpl(physicalWindow)}, nil

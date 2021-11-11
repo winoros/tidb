@@ -8,21 +8,21 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package disk
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/danjacques/gofslock/fslock"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/parser/terror"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -30,6 +30,11 @@ import (
 var (
 	tempDirLock fslock.Handle
 	sf          singleflight.Group
+)
+
+const (
+	lockFile  = "_dir.lock"
+	recordDir = "record"
 )
 
 // CheckAndInitTempDir check whether the temp directory is existed.
@@ -64,7 +69,6 @@ func InitializeTempDir() error {
 			return err
 		}
 	}
-	lockFile := "_dir.lock"
 	tempDirLock, err = fslock.Lock(filepath.Join(tempDir, lockFile))
 	if err != nil {
 		switch err {
@@ -77,17 +81,18 @@ func InitializeTempDir() error {
 		return err
 	}
 
-	subDirs, err := ioutil.ReadDir(tempDir)
+	subDirs, err := os.ReadDir(tempDir)
 	if err != nil {
 		return err
 	}
 
 	// If it exists others files except lock file, creates another goroutine to clean them.
-	if len(subDirs) > 1 {
+	if len(subDirs) > 2 {
 		go func() {
 			for _, subDir := range subDirs {
 				// Do not remove the lock file.
-				if subDir.Name() == lockFile {
+				switch subDir.Name() {
+				case lockFile, recordDir:
 					continue
 				}
 				err := os.RemoveAll(filepath.Join(tempDir, subDir.Name()))
@@ -107,4 +112,16 @@ func CleanUp() {
 		err := tempDirLock.Unlock()
 		terror.Log(errors.Trace(err))
 	}
+}
+
+// CheckAndCreateDir check whether the directory is existed. If not, then create it.
+func CheckAndCreateDir(path string) error {
+	_, err := os.Stat(path)
+	if err != nil && !os.IsExist(err) {
+		err = os.MkdirAll(path, 0755)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

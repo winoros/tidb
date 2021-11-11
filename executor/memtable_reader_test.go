@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -16,7 +17,6 @@ package executor_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http/httptest"
@@ -153,6 +153,12 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 				"nest1": "n-value1",
 				"nest2": "n-value2",
 			},
+			// We need hide the follow config
+			// TODO: we need remove it when index usage is GA.
+			"performance": map[string]string{
+				"index-usage-sync-lease": "0s",
+				"INDEX-USAGE-SYNC-LEASE": "0s",
+			},
 		}
 		return configuration, nil
 	}
@@ -164,7 +170,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 
 	// mock servers
 	servers := []string{}
-	for _, typ := range []string{"tidb", "tikv", "pd"} {
+	for _, typ := range []string{"tidb", "tikv", "tiflash", "pd"} {
 		for _, server := range testServers {
 			servers = append(servers, strings.Join([]string{typ, server.address, server.address}, ","))
 		}
@@ -195,6 +201,15 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 		"tikv key1 value1",
 		"tikv key2.nest1 n-value1",
 		"tikv key2.nest2 n-value2",
+		"tiflash key1 value1",
+		"tiflash key2.nest1 n-value1",
+		"tiflash key2.nest2 n-value2",
+		"tiflash key1 value1",
+		"tiflash key2.nest1 n-value1",
+		"tiflash key2.nest2 n-value2",
+		"tiflash key1 value1",
+		"tiflash key2.nest1 n-value1",
+		"tiflash key2.nest2 n-value2",
 		"pd key1 value1",
 		"pd key2.nest1 n-value1",
 		"pd key2.nest2 n-value2",
@@ -207,11 +222,20 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 	))
 	warnings := tk.Se.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(len(warnings), Equals, 0, Commentf("unexpected warnigns: %+v", warnings))
-	c.Assert(requestCounter, Equals, int32(9))
+	c.Assert(requestCounter, Equals, int32(12))
+
+	// TODO: we need remove it when index usage is GA.
+	rs := tk.MustQuery("show config").Rows()
+	for _, r := range rs {
+		s, ok := r[2].(string)
+		c.Assert(ok, IsTrue)
+		c.Assert(strings.Contains(s, "index-usage-sync-lease"), IsFalse)
+		c.Assert(strings.Contains(s, "INDEX-USAGE-SYNC-LEASE"), IsFalse)
+	}
 
 	// type => server index => row
 	rows := map[string][][]string{}
-	for _, typ := range []string{"tidb", "tikv", "pd"} {
+	for _, typ := range []string{"tidb", "tikv", "tiflash", "pd"} {
 		for _, server := range testServers {
 			rows[typ] = append(rows[typ], []string{
 				fmt.Sprintf("%s %s key1 value1", typ, server.address),
@@ -234,7 +258,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 	}{
 		{
 			sql:      "select * from information_schema.cluster_config",
-			reqCount: 9,
+			reqCount: 12,
 			rows: flatten(
 				rows["tidb"][0],
 				rows["tidb"][1],
@@ -242,6 +266,9 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 				rows["tikv"][0],
 				rows["tikv"][1],
 				rows["tikv"][2],
+				rows["tiflash"][0],
+				rows["tiflash"][1],
+				rows["tiflash"][2],
 				rows["pd"][0],
 				rows["pd"][1],
 				rows["pd"][2],
@@ -261,10 +288,11 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 		},
 		{
 			sql:      "select * from information_schema.cluster_config where type='pd' or instance='" + testServers[0].address + "'",
-			reqCount: 9,
+			reqCount: 12,
 			rows: flatten(
 				rows["tidb"][0],
 				rows["tikv"][0],
+				rows["tiflash"][0],
 				rows["pd"][0],
 				rows["pd"][1],
 				rows["pd"][2],
@@ -340,10 +368,11 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 		{
 			sql: fmt.Sprintf(`select * from information_schema.cluster_config where instance='%s'`,
 				testServers[0].address),
-			reqCount: 3,
+			reqCount: 4,
 			rows: flatten(
 				rows["tidb"][0],
 				rows["tikv"][0],
+				rows["tiflash"][0],
 				rows["pd"][0],
 			),
 		},
@@ -416,7 +445,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterConfig(c *C) {
 }
 
 func (s *testClusterTableBase) writeTmpFile(c *C, dir, filename string, lines []string) {
-	err := ioutil.WriteFile(filepath.Join(dir, filename), []byte(strings.Join(lines, "\n")), os.ModePerm)
+	err := os.WriteFile(filepath.Join(dir, filename), []byte(strings.Join(lines, "\n")), os.ModePerm)
 	c.Assert(err, IsNil, Commentf("write tmp file %s failed", filename))
 }
 
@@ -434,7 +463,7 @@ func (s *testClusterTableBase) setupClusterGRPCServer(c *C) map[string]*testServ
 
 	// create gRPC servers
 	for _, typ := range []string{"tidb", "tikv", "pd"} {
-		tmpDir, err := ioutil.TempDir("", typ)
+		tmpDir, err := os.MkdirTemp("", typ)
 		c.Assert(err, IsNil)
 
 		server := grpc.NewServer()
@@ -864,7 +893,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterLog(c *C) {
 		},
 	}
 
-	var servers []string
+	var servers = make([]string, 0, len(testServers))
 	for _, s := range testServers {
 		servers = append(servers, strings.Join([]string{s.typ, s.address, s.address}, ","))
 	}
@@ -909,6 +938,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterLogError(c *C) {
 	_, err = session.ResultSetToStringSlice(context.Background(), tk.Se, rs)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "denied to scan logs, please specified the start time, such as `time > '2020-01-01 00:00:00'`")
+	c.Assert(rs.Close(), IsNil)
 
 	// Test without end time error.
 	rs, err = tk.Exec("select * from information_schema.cluster_log where time>='2019/08/26 06:18:13.011'")
@@ -916,6 +946,7 @@ func (s *testMemTableReaderSuite) TestTiDBClusterLogError(c *C) {
 	_, err = session.ResultSetToStringSlice(context.Background(), tk.Se, rs)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "denied to scan logs, please specified the end time, such as `time < '2020-01-01 00:00:00'`")
+	c.Assert(rs.Close(), IsNil)
 
 	// Test without specified message error.
 	rs, err = tk.Exec("select * from information_schema.cluster_log where time>='2019/08/26 06:18:13.011' and time<'2019/08/26 16:18:13.011'")
@@ -923,4 +954,5 @@ func (s *testMemTableReaderSuite) TestTiDBClusterLogError(c *C) {
 	_, err = session.ResultSetToStringSlice(context.Background(), tk.Se, rs)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "denied to scan full logs (use `SELECT * FROM cluster_log WHERE message LIKE '%'` explicitly if intentionally)")
+	c.Assert(rs.Close(), IsNil)
 }

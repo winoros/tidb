@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,8 +18,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 )
@@ -35,10 +36,39 @@ type ActionOnExceed interface {
 	// SetFallback sets a fallback action which will be triggered if itself has
 	// already been triggered.
 	SetFallback(a ActionOnExceed)
+	// GetFallback get the fallback action of the Action.
+	GetFallback() ActionOnExceed
+	// GetPriority get the priority of the Action.
+	GetPriority() int64
 }
+
+// BaseOOMAction manages the fallback action for all Action.
+type BaseOOMAction struct {
+	fallbackAction ActionOnExceed
+}
+
+// SetFallback sets a fallback action which will be triggered if itself has
+// already been triggered.
+func (b *BaseOOMAction) SetFallback(a ActionOnExceed) {
+	b.fallbackAction = a
+}
+
+// GetFallback get the fallback action of the Action.
+func (b *BaseOOMAction) GetFallback() ActionOnExceed {
+	return b.fallbackAction
+}
+
+// Default OOM Action priority.
+const (
+	DefPanicPriority = iota
+	DefLogPriority
+	DefSpillPriority
+	DefRateLimitPriority
+)
 
 // LogOnExceed logs a warning only once when memory usage exceeds memory quota.
 type LogOnExceed struct {
+	BaseOOMAction
 	mutex   sync.Mutex // For synchronization.
 	acted   bool
 	ConnID  uint64
@@ -58,18 +88,21 @@ func (a *LogOnExceed) Action(t *Tracker) {
 		a.acted = true
 		if a.logHook == nil {
 			logutil.BgLogger().Warn("memory exceeds quota",
-				zap.Error(errMemExceedThreshold.GenWithStackByArgs(t.label, t.BytesConsumed(), t.bytesLimit, t.String())))
+				zap.Error(errMemExceedThreshold.GenWithStackByArgs(t.label, t.BytesConsumed(), t.bytesHardLimit, t.String())))
 			return
 		}
 		a.logHook(a.ConnID)
 	}
 }
 
-// SetFallback sets a fallback action.
-func (a *LogOnExceed) SetFallback(ActionOnExceed) {}
+// GetPriority get the priority of the Action
+func (a *LogOnExceed) GetPriority() int64 {
+	return DefLogPriority
+}
 
 // PanicOnExceed panics when memory usage exceeds memory quota.
 type PanicOnExceed struct {
+	BaseOOMAction
 	mutex   sync.Mutex // For synchronization.
 	acted   bool
 	ConnID  uint64
@@ -96,11 +129,13 @@ func (a *PanicOnExceed) Action(t *Tracker) {
 	panic(PanicMemoryExceed + fmt.Sprintf("[conn_id=%d]", a.ConnID))
 }
 
-// SetFallback sets a fallback action.
-func (a *PanicOnExceed) SetFallback(ActionOnExceed) {}
+// GetPriority get the priority of the Action
+func (a *PanicOnExceed) GetPriority() int64 {
+	return DefPanicPriority
+}
 
 var (
-	errMemExceedThreshold = terror.ClassUtil.New(errno.ErrMemExceedThreshold, errno.MySQLErrName[errno.ErrMemExceedThreshold])
+	errMemExceedThreshold = dbterror.ClassUtil.NewStd(errno.ErrMemExceedThreshold)
 )
 
 const (

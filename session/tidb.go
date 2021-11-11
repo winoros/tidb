@@ -1,7 +1,3 @@
-// Copyright 2013 The ql Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSES/QL-LICENSE file.
-
 // Copyright 2015 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +8,13 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+// Copyright 2013 The ql Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSES/QL-LICENSE file.
 
 package session
 
@@ -24,19 +25,18 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"go.uber.org/zap"
@@ -66,14 +66,20 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 
 	ddlLease := time.Duration(atomic.LoadInt64(&schemaLease))
 	statisticLease := time.Duration(atomic.LoadInt64(&statsLease))
+	idxUsageSyncLease := GetIndexUsageSyncLease()
+	planReplayerGCLease := GetPlanReplayerGCLease()
 	err = util.RunWithRetry(util.DefaultMaxRetries, util.RetryInterval, func() (retry bool, err1 error) {
 		logutil.BgLogger().Info("new domain",
 			zap.String("store", store.UUID()),
 			zap.Stringer("ddl lease", ddlLease),
-			zap.Stringer("stats lease", statisticLease))
+			zap.Stringer("stats lease", statisticLease),
+			zap.Stringer("index usage sync lease", idxUsageSyncLease))
 		factory := createSessionFunc(store)
 		sysFactory := createSessionWithDomainFunc(store)
-		d = domain.NewDomain(store, ddlLease, statisticLease, factory)
+		onClose := func() {
+			dm.Delete(store)
+		}
+		d = domain.NewDomain(store, ddlLease, statisticLease, idxUsageSyncLease, planReplayerGCLease, factory, onClose)
 		err1 = d.Init(ddlLease, sysFactory)
 		if err1 != nil {
 			// If we don't clean it, there are some dirty data when retrying the function of Init.
@@ -115,6 +121,14 @@ var (
 
 	// statsLease is the time for reload stats table.
 	statsLease = int64(3 * time.Second)
+
+	// indexUsageSyncLease is the time for index usage synchronization.
+	// Because we have not completed GC and other functions, we set it to 0.
+	// TODO: Set indexUsageSyncLease to 60s.
+	indexUsageSyncLease = int64(0 * time.Second)
+
+	// planReplayerGCLease is the time for plan replayer gc.
+	planReplayerGCLease = int64(10 * time.Minute)
 )
 
 // ResetStoreForWithTiKVTest is only used in the test code.
@@ -150,6 +164,26 @@ func SetStatsLease(lease time.Duration) {
 	atomic.StoreInt64(&statsLease, int64(lease))
 }
 
+// SetIndexUsageSyncLease changes the default index usage sync lease time for loading info.
+func SetIndexUsageSyncLease(lease time.Duration) {
+	atomic.StoreInt64(&indexUsageSyncLease, int64(lease))
+}
+
+// GetIndexUsageSyncLease returns the index usage sync lease time.
+func GetIndexUsageSyncLease() time.Duration {
+	return time.Duration(atomic.LoadInt64(&indexUsageSyncLease))
+}
+
+// SetPlanReplayerGCLease changes the default plan repalyer gc lease time.
+func SetPlanReplayerGCLease(lease time.Duration) {
+	atomic.StoreInt64(&planReplayerGCLease, int64(lease))
+}
+
+// GetPlanReplayerGCLease returns the plan replayer gc lease time.
+func GetPlanReplayerGCLease() time.Duration {
+	return time.Duration(atomic.LoadInt64(&planReplayerGCLease))
+}
+
 // DisableStats4Test disables the stats for tests.
 func DisableStats4Test() {
 	SetStatsLease(-1)
@@ -158,13 +192,13 @@ func DisableStats4Test() {
 // Parse parses a query string to raw ast.StmtNode.
 func Parse(ctx sessionctx.Context, src string) ([]ast.StmtNode, error) {
 	logutil.BgLogger().Debug("compiling", zap.String("source", src))
-	charset, collation := ctx.GetSessionVars().GetCharsetInfo()
+	sessVars := ctx.GetSessionVars()
 	p := parser.New()
-	p.EnableWindowFunc(ctx.GetSessionVars().EnableWindowFunction)
-	p.SetSQLMode(ctx.GetSessionVars().SQLMode)
-	stmts, warns, err := p.Parse(src, charset, collation)
+	p.SetParserConfig(sessVars.BuildParserConfig())
+	p.SetSQLMode(sessVars.SQLMode)
+	stmts, warns, err := p.ParseSQL(src, sessVars.GetParseParams()...)
 	for _, warn := range warns {
-		ctx.GetSessionVars().StmtCtx.AppendWarning(warn)
+		sessVars.StmtCtx.AppendWarning(warn)
 	}
 	if err != nil {
 		logutil.BgLogger().Warn("compiling",
@@ -173,13 +207,6 @@ func Parse(ctx sessionctx.Context, src string) ([]ast.StmtNode, error) {
 		return nil, err
 	}
 	return stmts, nil
-}
-
-// Compile is safe for concurrent use by multiple goroutines.
-func Compile(ctx context.Context, sctx sessionctx.Context, stmtNode ast.StmtNode) (sqlexec.Statement, error) {
-	compiler := executor.Compiler{Ctx: sctx}
-	stmt, err := compiler.Compile(ctx, stmtNode)
-	return stmt, err
 }
 
 func recordAbortTxnDuration(sessVars *variable.SessionVars) {
@@ -192,6 +219,22 @@ func recordAbortTxnDuration(sessVars *variable.SessionVars) {
 }
 
 func finishStmt(ctx context.Context, se *session, meetsErr error, sql sqlexec.Statement) error {
+	sessVars := se.sessionVars
+	if !sql.IsReadOnly(sessVars) {
+		// All the history should be added here.
+		if meetsErr == nil && sessVars.TxnCtx.CouldRetry {
+			GetHistory(se).Add(sql, sessVars.StmtCtx)
+		}
+
+		// Handle the stmt commit/rollback.
+		if se.txn.Valid() {
+			if meetsErr != nil {
+				se.StmtRollback()
+			} else {
+				se.StmtCommit()
+			}
+		}
+	}
 	err := autoCommitAfterStmt(ctx, se, meetsErr, sql)
 	if se.txn.pending() {
 		// After run statement finish, txn state is still pending means the
@@ -214,7 +257,7 @@ func autoCommitAfterStmt(ctx context.Context, se *session, meetsErr error, sql s
 	sessVars := se.sessionVars
 	if meetsErr != nil {
 		if !sessVars.InTxn() {
-			logutil.BgLogger().Info("rollbackTxn for ddl/autocommit failed")
+			logutil.BgLogger().Info("rollbackTxn called due to ddl/autocommit failure")
 			se.RollbackTxn(ctx)
 			recordAbortTxnDuration(sessVars)
 		} else if se.txn.Valid() && se.txn.IsPessimistic() && executor.ErrDeadlock.Equal(meetsErr) {
@@ -254,7 +297,7 @@ func checkStmtLimit(ctx context.Context, se *session) error {
 		// The last history could not be "commit"/"rollback" statement.
 		// It means it is impossible to start a new transaction at the end of the transaction.
 		// Because after the server executed "commit"/"rollback" statement, the session is out of the transaction.
-		sessVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
+		sessVars.SetInTxn(true)
 	}
 	return err
 }
@@ -276,7 +319,7 @@ func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs sqlexec.Recor
 		return nil, nil
 	}
 	var rows []chunk.Row
-	req := rs.NewChunk()
+	req := rs.NewChunk(nil)
 	// Must reuse `req` for imitating server.(*clientConn).writeChunks
 	for {
 		err := rs.Next(ctx, req)
@@ -327,5 +370,5 @@ func ResultSetToStringSlice(ctx context.Context, s Session, rs sqlexec.RecordSet
 
 // Session errors.
 var (
-	ErrForUpdateCantRetry = terror.ClassSession.New(errno.ErrForUpdateCantRetry, errno.MySQLErrName[errno.ErrForUpdateCantRetry])
+	ErrForUpdateCantRetry = dbterror.ClassSession.NewStd(errno.ErrForUpdateCantRetry)
 )

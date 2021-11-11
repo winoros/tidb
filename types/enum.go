@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -45,6 +46,19 @@ func (e Enum) ToNumber() float64 {
 	return float64(e.Value)
 }
 
+// ParseEnum creates a Enum with item name or value.
+func ParseEnum(elems []string, name string, collation string) (Enum, error) {
+	if enumName, err := ParseEnumName(elems, name, collation); err == nil {
+		return enumName, nil
+	}
+	// name doesn't exist, maybe an integer?
+	if num, err := strconv.ParseUint(name, 0, 64); err == nil {
+		return ParseEnumValue(elems, num)
+	}
+
+	return Enum{}, errors.Errorf("item %s is not in enum %v", name, elems)
+}
+
 // ParseEnumName creates a Enum with item name.
 func ParseEnumName(elems []string, name string, collation string) (Enum, error) {
 	ctor := collate.GetCollator(collation)
@@ -52,11 +66,6 @@ func ParseEnumName(elems []string, name string, collation string) (Enum, error) 
 		if ctor.Compare(n, name) == 0 {
 			return Enum{Name: n, Value: uint64(i) + 1}, nil
 		}
-	}
-
-	// name doesn't exist, maybe an integer?
-	if num, err := strconv.ParseUint(name, 0, 64); err == nil {
-		return ParseEnumValue(elems, num)
 	}
 
 	return Enum{}, errors.Errorf("item %s is not in enum %v", name, elems)

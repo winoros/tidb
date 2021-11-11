@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,62 +16,59 @@ package tables_test
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"testing"
+	"time"
 
-	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/parser/auth"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/binloginfo"
-	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/testkit"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/testkit"
-	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 	binlog "github.com/pingcap/tipb/go-binlog"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
 
-func TestT(t *testing.T) {
-	CustomVerboseFlag = true
-	TestingT(t)
+func firstKey(t table.Table) kv.Key {
+	return tablecodec.EncodeRecordKey(t.RecordPrefix(), kv.IntHandle(math.MinInt64))
 }
 
-var _ = Suite(&testSuite{})
-
-type testSuite struct {
-	store kv.Storage
-	dom   *domain.Domain
-	se    session.Session
+func indexPrefix(t table.PhysicalTable) kv.Key {
+	return tablecodec.GenTableIndexPrefix(t.GetPhysicalID())
 }
 
-func (ts *testSuite) SetUpSuite(c *C) {
-	testleak.BeforeTest()
-	store, err := mockstore.NewMockStore()
-	c.Check(err, IsNil)
-	ts.store = store
-	ts.dom, err = session.BootstrapSession(store)
-	c.Assert(err, IsNil)
-	ts.se, err = session.CreateSession4Test(ts.store)
-	c.Assert(err, IsNil)
-	ctx := ts.se
-	ctx.GetSessionVars().BinlogClient = binloginfo.MockPumpsClient(mockPumpClient{})
-	ctx.GetSessionVars().InRestrictedSQL = false
-}
-
-func (ts *testSuite) TearDownSuite(c *C) {
-	ts.dom.Close()
-	c.Assert(ts.store.Close(), IsNil)
-	testleak.AfterTest(c)()
+func seek(t table.PhysicalTable, ctx sessionctx.Context, h kv.Handle) (kv.Handle, bool, error) {
+	txn, err := ctx.Txn(true)
+	if err != nil {
+		return nil, false, err
+	}
+	recordPrefix := t.RecordPrefix()
+	seekKey := tablecodec.EncodeRowKeyWithHandle(t.GetPhysicalID(), h)
+	iter, err := txn.Iter(seekKey, recordPrefix.PrefixNext())
+	if err != nil {
+		return nil, false, err
+	}
+	if !iter.Valid() || !iter.Key().HasPrefix(recordPrefix) {
+		// No more records in the table, skip to the end.
+		return nil, false, nil
+	}
+	handle, err := tablecodec.DecodeRowKey(iter.Key())
+	if err != nil {
+		return nil, false, err
+	}
+	return handle, true, nil
 }
 
 type mockPumpClient struct{}
@@ -83,87 +81,92 @@ func (m mockPumpClient) PullBinlogs(ctx context.Context, in *binlog.PullBinlogRe
 	return nil, nil
 }
 
-func (ts *testSuite) TestBasic(c *C) {
-	_, err := ts.se.Execute(context.Background(), "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
-	c.Assert(err, IsNil)
-	c.Assert(ts.se.NewTxn(context.Background()), IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
-	c.Assert(err, IsNil)
-	c.Assert(tb.Meta().ID, Greater, int64(0))
-	c.Assert(tb.Meta().Name.L, Equals, "t")
-	c.Assert(tb.Meta(), NotNil)
-	c.Assert(tb.Indices(), NotNil)
-	c.Assert(string(tb.FirstKey()), Not(Equals), "")
-	c.Assert(string(tb.IndexPrefix()), Not(Equals), "")
-	c.Assert(string(tb.RecordPrefix()), Not(Equals), "")
-	c.Assert(tables.FindIndexByColName(tb, "b"), NotNil)
+func TestBasic(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(context.Background(), "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
+	require.NoError(t, err)
+	require.Nil(t, tk.Session().NewTxn(context.Background()))
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	require.NoError(t, err)
+	require.Greater(t, tb.Meta().ID, int64(0))
+	require.Equal(t, "t", tb.Meta().Name.L)
+	require.NotNil(t, tb.Meta())
+	require.NotNil(t, tb.Indices())
+	require.NotEqual(t, "", string(firstKey(tb)))
+	require.NotEqual(t, "", string(indexPrefix(tb.(table.PhysicalTable))))
+	require.NotEqual(t, "", string(tb.RecordPrefix()))
+	require.NotNil(t, tables.FindIndexByColName(tb, "b"))
 
-	autoID, err := table.AllocAutoIncrementValue(context.Background(), tb, ts.se)
-	c.Assert(err, IsNil)
-	c.Assert(autoID, Greater, int64(0))
+	autoID, err := table.AllocAutoIncrementValue(context.Background(), tb, tk.Session())
+	require.NoError(t, err)
+	require.Greater(t, autoID, int64(0))
 
-	handle, err := tables.AllocHandle(nil, tb)
-	c.Assert(err, IsNil)
-	c.Assert(handle.IntValue(), Greater, int64(0))
+	handle, err := tables.AllocHandle(context.Background(), nil, tb)
+	require.NoError(t, err)
+	require.Greater(t, handle.IntValue(), int64(0))
 
-	ctx := ts.se
+	ctx := tk.Session()
 	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
-	c.Assert(err, IsNil)
-	c.Assert(rid.IntValue(), Greater, int64(0))
-	row, err := tb.Row(ctx, rid)
-	c.Assert(err, IsNil)
-	c.Assert(len(row), Equals, 2)
-	c.Assert(row[0].GetInt64(), Equals, int64(1))
+	require.NoError(t, err)
+	require.Greater(t, rid.IntValue(), int64(0))
+	row, err := tables.RowWithCols(tb, ctx, rid, tb.Cols())
+	require.NoError(t, err)
+	require.Equal(t, 2, len(row))
+	require.Equal(t, int64(1), row[0].GetInt64())
 
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "aba"))
-	c.Assert(err, NotNil)
+	require.Error(t, err)
 	_, err = tb.AddRecord(ctx, types.MakeDatums(2, "abc"))
-	c.Assert(err, NotNil)
+	require.Error(t, err)
 
-	c.Assert(tb.UpdateRecord(context.Background(), ctx, rid, types.MakeDatums(1, "abc"), types.MakeDatums(1, "cba"), []bool{false, true}), IsNil)
+	require.Nil(t, tb.UpdateRecord(context.Background(), ctx, rid, types.MakeDatums(1, "abc"), types.MakeDatums(1, "cba"), []bool{false, true}))
 
-	tb.IterRecords(ctx, tb.FirstKey(), tb.Cols(), func(_ kv.Handle, data []types.Datum, cols []*table.Column) (bool, error) {
+	err = tables.IterRecords(tb, ctx, tb.Cols(), func(_ kv.Handle, data []types.Datum, cols []*table.Column) (bool, error) {
 		return true, nil
 	})
+	require.NoError(t, err)
 
 	indexCnt := func() int {
-		cnt, err1 := countEntriesWithPrefix(ctx, tb.IndexPrefix())
-		c.Assert(err1, IsNil)
+		cnt, err1 := countEntriesWithPrefix(ctx, indexPrefix(tb.(table.PhysicalTable)))
+		require.Nil(t, err1)
 		return cnt
 	}
 
 	// RowWithCols test
-	vals, err := tb.RowWithCols(ctx, kv.IntHandle(1), tb.Cols())
-	c.Assert(err, IsNil)
-	c.Assert(vals, HasLen, 2)
-	c.Assert(vals[0].GetInt64(), Equals, int64(1))
+	vals, err := tables.RowWithCols(tb, ctx, kv.IntHandle(1), tb.Cols())
+	require.NoError(t, err)
+	require.Len(t, vals, 2)
+	require.Equal(t, int64(1), vals[0].GetInt64())
 	cols := []*table.Column{tb.Cols()[1]}
-	vals, err = tb.RowWithCols(ctx, kv.IntHandle(1), cols)
-	c.Assert(err, IsNil)
-	c.Assert(vals, HasLen, 1)
-	c.Assert(vals[0].GetBytes(), DeepEquals, []byte("cba"))
+	vals, err = tables.RowWithCols(tb, ctx, kv.IntHandle(1), cols)
+	require.NoError(t, err)
+	require.Len(t, vals, 1)
+	require.Equal(t, []byte("cba"), vals[0].GetBytes())
 
 	// Make sure there is index data in the storage.
-	c.Assert(indexCnt(), Greater, 0)
-	c.Assert(tb.RemoveRecord(ctx, rid, types.MakeDatums(1, "cba")), IsNil)
+	require.Greater(t, indexCnt(), 0)
+	require.Nil(t, tb.RemoveRecord(ctx, rid, types.MakeDatums(1, "cba")))
 	// Make sure index data is also removed after tb.RemoveRecord().
-	c.Assert(indexCnt(), Equals, 0)
+	require.Equal(t, 0, indexCnt())
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
-	c.Assert(err, IsNil)
-	c.Assert(indexCnt(), Greater, 0)
-	handle, found, err := tb.Seek(ctx, kv.IntHandle(0))
-	c.Assert(handle.IntValue(), Equals, int64(1))
-	c.Assert(found, Equals, true)
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(context.Background(), "drop table test.t")
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
+	require.Greater(t, indexCnt(), 0)
+	handle, found, err := seek(tb.(table.PhysicalTable), ctx, kv.IntHandle(0))
+	require.Equal(t, int64(1), handle.IntValue())
+	require.Equal(t, true, found)
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(context.Background(), "drop table test.t")
+	require.NoError(t, err)
 
 	table.MockTableFromMeta(tb.Meta())
 	alc := tb.Allocators(nil).Get(autoid.RowIDAllocType)
-	c.Assert(alc, NotNil)
+	require.NotNil(t, alc)
 
-	err = tb.RebaseAutoID(nil, 0, false, autoid.RowIDAllocType)
-	c.Assert(err, IsNil)
+	err = alc.Rebase(context.Background(), 0, false)
+	require.NoError(t, err)
 }
 
 func countEntriesWithPrefix(ctx sessionctx.Context, prefix []byte) (int, error) {
@@ -179,95 +182,104 @@ func countEntriesWithPrefix(ctx sessionctx.Context, prefix []byte) (int, error) 
 	return cnt, err
 }
 
-func (ts *testSuite) TestTypes(c *C) {
+func TestTypes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
-	_, err := ts.se.Execute(context.Background(), "CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp null default CURRENT_TIMESTAMP, c10 decimal(10,1))")
-	c.Assert(err, IsNil)
-	_, err = ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(ctx, "insert test.t values (1, 2, 3, 4, '5', '6', '7', '10:10:10', null, 1.4)")
-	c.Assert(err, IsNil)
-	rs, err := ts.se.Execute(ctx, "select * from test.t where c1 = 1")
-	c.Assert(err, IsNil)
-	req := rs[0].NewChunk()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(context.Background(), "CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp null default CURRENT_TIMESTAMP, c10 decimal(10,1))")
+	require.NoError(t, err)
+	_, err = dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(ctx, "insert test.t values (1, 2, 3, 4, '5', '6', '7', '10:10:10', null, 1.4)")
+	require.NoError(t, err)
+	rs, err := tk.Session().Execute(ctx, "select * from test.t where c1 = 1")
+	require.NoError(t, err)
+	req := rs[0].NewChunk(nil)
 	err = rs[0].Next(ctx, req)
-	c.Assert(err, IsNil)
-	c.Assert(req.NumRows() == 0, IsFalse)
-	c.Assert(rs[0].Close(), IsNil)
-	_, err = ts.se.Execute(ctx, "drop table test.t")
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
+	require.False(t, req.NumRows() == 0)
+	require.Nil(t, rs[0].Close())
+	_, err = tk.Session().Execute(ctx, "drop table test.t")
+	require.NoError(t, err)
 
-	_, err = ts.se.Execute(ctx, "CREATE TABLE test.t (c1 tinyint unsigned, c2 smallint unsigned, c3 int unsigned, c4 bigint unsigned, c5 double, c6 bit(8))")
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(ctx, "insert test.t values (1, 2, 3, 4, 5, 6)")
-	c.Assert(err, IsNil)
-	rs, err = ts.se.Execute(ctx, "select * from test.t where c1 = 1")
-	c.Assert(err, IsNil)
-	req = rs[0].NewChunk()
+	_, err = tk.Session().Execute(ctx, "CREATE TABLE test.t (c1 tinyint unsigned, c2 smallint unsigned, c3 int unsigned, c4 bigint unsigned, c5 double, c6 bit(8))")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(ctx, "insert test.t values (1, 2, 3, 4, 5, 6)")
+	require.NoError(t, err)
+	rs, err = tk.Session().Execute(ctx, "select * from test.t where c1 = 1")
+	require.NoError(t, err)
+	req = rs[0].NewChunk(nil)
 	err = rs[0].Next(ctx, req)
-	c.Assert(err, IsNil)
-	c.Assert(req.NumRows() == 0, IsFalse)
+	require.NoError(t, err)
+	require.False(t, req.NumRows() == 0)
 	row := req.GetRow(0)
-	c.Assert(types.BinaryLiteral(row.GetBytes(5)), DeepEquals, types.NewBinaryLiteralFromUint(6, -1))
-	c.Assert(rs[0].Close(), IsNil)
-	_, err = ts.se.Execute(ctx, "drop table test.t")
-	c.Assert(err, IsNil)
+	require.Equal(t, types.NewBinaryLiteralFromUint(6, -1), types.BinaryLiteral(row.GetBytes(5)))
+	require.Nil(t, rs[0].Close())
+	_, err = tk.Session().Execute(ctx, "drop table test.t")
+	require.NoError(t, err)
 
-	_, err = ts.se.Execute(ctx, "CREATE TABLE test.t (c1 enum('a', 'b', 'c'))")
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(ctx, "insert test.t values ('a'), (2), ('c')")
-	c.Assert(err, IsNil)
-	rs, err = ts.se.Execute(ctx, "select c1 + 1 from test.t where c1 = 1")
-	c.Assert(err, IsNil)
-	req = rs[0].NewChunk()
+	_, err = tk.Session().Execute(ctx, "CREATE TABLE test.t (c1 enum('a', 'b', 'c'))")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(ctx, "insert test.t values ('a'), (2), ('c')")
+	require.NoError(t, err)
+	rs, err = tk.Session().Execute(ctx, "select c1 + 1 from test.t where c1 = 1")
+	require.NoError(t, err)
+	req = rs[0].NewChunk(nil)
 	err = rs[0].Next(ctx, req)
-	c.Assert(err, IsNil)
-	c.Assert(req.NumRows() == 0, IsFalse)
-	c.Assert(req.GetRow(0).GetFloat64(0), DeepEquals, float64(2))
-	c.Assert(rs[0].Close(), IsNil)
-	_, err = ts.se.Execute(ctx, "drop table test.t")
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
+	require.False(t, req.NumRows() == 0)
+	require.Equal(t, float64(2), req.GetRow(0).GetFloat64(0))
+	require.Nil(t, rs[0].Close())
+	_, err = tk.Session().Execute(ctx, "drop table test.t")
+	require.NoError(t, err)
 }
 
-func (ts *testSuite) TestUniqueIndexMultipleNullEntries(c *C) {
+func TestUniqueIndexMultipleNullEntries(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
-	_, err := ts.se.Execute(ctx, "drop table if exists test.t")
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(ctx, "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
-	c.Assert(err, IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
-	c.Assert(err, IsNil)
-	c.Assert(tb.Meta().ID, Greater, int64(0))
-	c.Assert(tb.Meta().Name.L, Equals, "t")
-	c.Assert(tb.Meta(), NotNil)
-	c.Assert(tb.Indices(), NotNil)
-	c.Assert(string(tb.FirstKey()), Not(Equals), "")
-	c.Assert(string(tb.IndexPrefix()), Not(Equals), "")
-	c.Assert(string(tb.RecordPrefix()), Not(Equals), "")
-	c.Assert(tables.FindIndexByColName(tb, "b"), NotNil)
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(ctx, "drop table if exists test.t")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(ctx, "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
+	require.NoError(t, err)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	require.NoError(t, err)
+	require.Greater(t, tb.Meta().ID, int64(0))
+	require.Equal(t, "t", tb.Meta().Name.L)
+	require.NotNil(t, tb.Meta())
+	require.NotNil(t, tb.Indices())
+	require.NotEqual(t, "", string(firstKey(tb)))
+	require.NotEqual(t, "", string(indexPrefix(tb.(table.PhysicalTable))))
+	require.NotEqual(t, "", string(tb.RecordPrefix()))
+	require.NotNil(t, tables.FindIndexByColName(tb, "b"))
 
-	handle, err := tables.AllocHandle(nil, tb)
-	c.Assert(err, IsNil)
-	c.Assert(handle.IntValue(), Greater, int64(0))
+	handle, err := tables.AllocHandle(context.Background(), nil, tb)
+	require.NoError(t, err)
+	require.Greater(t, handle.IntValue(), int64(0))
 
-	autoid, err := table.AllocAutoIncrementValue(context.Background(), tb, ts.se)
-	c.Assert(err, IsNil)
-	c.Assert(autoid, Greater, int64(0))
+	autoid, err := table.AllocAutoIncrementValue(context.Background(), tb, tk.Session())
+	require.NoError(t, err)
+	require.Greater(t, autoid, int64(0))
 
-	sctx := ts.se
-	c.Assert(sctx.NewTxn(ctx), IsNil)
+	sctx := tk.Session()
+	require.Nil(t, sctx.NewTxn(ctx))
 	_, err = tb.AddRecord(sctx, types.MakeDatums(1, nil))
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	_, err = tb.AddRecord(sctx, types.MakeDatums(2, nil))
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	txn, err := sctx.Txn(true)
-	c.Assert(err, IsNil)
-	c.Assert(txn.Rollback(), IsNil)
-	_, err = ts.se.Execute(context.Background(), "drop table test.t")
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
+	require.Nil(t, txn.Rollback())
+	_, err = tk.Session().Execute(context.Background(), "drop table test.t")
+	require.NoError(t, err)
 }
 
-func (ts *testSuite) TestRowKeyCodec(c *C) {
+func TestRowKeyCodec(t *testing.T) {
+	t.Parallel()
 	tableVal := []struct {
 		tableID int64
 		h       int64
@@ -279,16 +291,16 @@ func (ts *testSuite) TestRowKeyCodec(c *C) {
 		{4, -1, 1},
 	}
 
-	for _, t := range tableVal {
-		b := tablecodec.EncodeRowKeyWithHandle(t.tableID, kv.IntHandle(t.h))
+	for _, v := range tableVal {
+		b := tablecodec.EncodeRowKeyWithHandle(v.tableID, kv.IntHandle(v.h))
 		tableID, handle, err := tablecodec.DecodeRecordKey(b)
-		c.Assert(err, IsNil)
-		c.Assert(tableID, Equals, t.tableID)
-		c.Assert(handle.IntValue(), Equals, t.h)
+		require.NoError(t, err)
+		require.Equal(t, v.tableID, tableID)
+		require.Equal(t, v.h, handle.IntValue())
 
 		handle, err = tablecodec.DecodeRowKey(b)
-		c.Assert(err, IsNil)
-		c.Assert(handle.IntValue(), Equals, t.h)
+		require.NoError(t, err)
+		require.Equal(t, v.h, handle.IntValue())
 	}
 
 	// test error
@@ -302,102 +314,123 @@ func (ts *testSuite) TestRowKeyCodec(c *C) {
 		"t12345678_r1234567",
 	}
 
-	for _, t := range tbl {
-		_, err := tablecodec.DecodeRowKey(kv.Key(t))
-		c.Assert(err, NotNil)
+	for _, v := range tbl {
+		_, err := tablecodec.DecodeRowKey(kv.Key(v))
+		require.Error(t, err)
 	}
 }
 
-func (ts *testSuite) TestUnsignedPK(c *C) {
-	ts.se.Execute(context.Background(), "DROP TABLE IF EXISTS test.tPK")
-	_, err := ts.se.Execute(context.Background(), "CREATE TABLE test.tPK (a bigint unsigned primary key, b varchar(255))")
-	c.Assert(err, IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tPK"))
-	c.Assert(err, IsNil)
-	c.Assert(ts.se.NewTxn(context.Background()), IsNil)
-	rid, err := tb.AddRecord(ts.se, types.MakeDatums(1, "abc"))
-	c.Assert(err, IsNil)
-	row, err := tb.Row(ts.se, rid)
-	c.Assert(err, IsNil)
-	c.Assert(len(row), Equals, 2)
-	c.Assert(row[0].Kind(), Equals, types.KindUint64)
-	ts.se.StmtCommit()
-	txn, err := ts.se.Txn(true)
-	c.Assert(err, IsNil)
-	c.Assert(txn.Commit(context.Background()), IsNil)
+func TestUnsignedPK(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(context.Background(), "DROP TABLE IF EXISTS test.tPK")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(context.Background(), "CREATE TABLE test.tPK (a bigint unsigned primary key, b varchar(255))")
+	require.NoError(t, err)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tPK"))
+	require.NoError(t, err)
+	require.Nil(t, tk.Session().NewTxn(context.Background()))
+	rid, err := tb.AddRecord(tk.Session(), types.MakeDatums(1, "abc"))
+	require.NoError(t, err)
+	pt := tb.(table.PhysicalTable)
+	row, err := tables.RowWithCols(pt, tk.Session(), rid, tb.Cols())
+	require.NoError(t, err)
+	require.Equal(t, 2, len(row))
+	require.Equal(t, types.KindUint64, row[0].Kind())
+	tk.Session().StmtCommit()
+	txn, err := tk.Session().Txn(true)
+	require.NoError(t, err)
+	require.Nil(t, txn.Commit(context.Background()))
 }
 
-func (ts *testSuite) TestIterRecords(c *C) {
-	ts.se.Execute(context.Background(), "DROP TABLE IF EXISTS test.tIter")
-	_, err := ts.se.Execute(context.Background(), "CREATE TABLE test.tIter (a int primary key, b int)")
-	c.Assert(err, IsNil)
-	_, err = ts.se.Execute(context.Background(), "INSERT test.tIter VALUES (-1, 2), (2, NULL)")
-	c.Assert(err, IsNil)
-	c.Assert(ts.se.NewTxn(context.Background()), IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tIter"))
-	c.Assert(err, IsNil)
+func TestIterRecords(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(context.Background(), "DROP TABLE IF EXISTS test.tIter")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(context.Background(), "CREATE TABLE test.tIter (a int primary key, b int)")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(context.Background(), "INSERT test.tIter VALUES (-1, 2), (2, NULL)")
+	require.NoError(t, err)
+	require.Nil(t, tk.Session().NewTxn(context.Background()))
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tIter"))
+	require.NoError(t, err)
 	totalCount := 0
-	err = tb.IterRecords(ts.se, tb.FirstKey(), tb.Cols(), func(_ kv.Handle, rec []types.Datum, cols []*table.Column) (bool, error) {
+	err = tables.IterRecords(tb, tk.Session(), tb.Cols(), func(_ kv.Handle, rec []types.Datum, cols []*table.Column) (bool, error) {
 		totalCount++
-		c.Assert(rec[0].IsNull(), IsFalse)
+		require.False(t, rec[0].IsNull())
 		return true, nil
 	})
-	c.Assert(err, IsNil)
-	c.Assert(totalCount, Equals, 2)
-	txn, err := ts.se.Txn(true)
-	c.Assert(err, IsNil)
-	c.Assert(txn.Commit(context.Background()), IsNil)
+	require.NoError(t, err)
+	require.Equal(t, 2, totalCount)
+	txn, err := tk.Session().Txn(true)
+	require.NoError(t, err)
+	require.Nil(t, txn.Commit(context.Background()))
 }
 
-func (ts *testSuite) TestTableFromMeta(c *C) {
-	tk := testkit.NewTestKitWithInit(c, ts.store)
+func TestTableFromMeta(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec("CREATE TABLE meta (a int primary key auto_increment, b varchar(255) unique)")
-	c.Assert(ts.se.NewTxn(context.Background()), IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("meta"))
-	c.Assert(err, IsNil)
-	tbInfo := tb.Meta()
+	require.Nil(t, tk.Session().NewTxn(context.Background()))
+	_, err := tk.Session().Txn(true)
+	require.NoError(t, err)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("meta"))
+	require.NoError(t, err)
+	tbInfo := tb.Meta().Clone()
 
 	// For test coverage
 	tbInfo.Columns[0].GeneratedExprString = "a"
-	tables.TableFromMeta(nil, tbInfo)
+	_, err = tables.TableFromMeta(nil, tbInfo)
+	require.NoError(t, err)
 
 	tbInfo.Columns[0].GeneratedExprString = "test"
-	tables.TableFromMeta(nil, tbInfo)
+	_, err = tables.TableFromMeta(nil, tbInfo)
+	require.Error(t, err)
 	tbInfo.Columns[0].State = model.StateNone
 	tb, err = tables.TableFromMeta(nil, tbInfo)
-	c.Assert(tb, IsNil)
-	c.Assert(err, NotNil)
+	require.Nil(t, tb)
+	require.Error(t, err)
 	tbInfo.State = model.StateNone
 	tb, err = tables.TableFromMeta(nil, tbInfo)
-	c.Assert(tb, IsNil)
-	c.Assert(err, NotNil)
+	require.Nil(t, tb)
+	require.Error(t, err)
 
 	tk.MustExec(`create table t_mock (id int) partition by range (id) (partition p0 values less than maxvalue)`)
-	tb, err = ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t_mock"))
-	c.Assert(err, IsNil)
-	t := table.MockTableFromMeta(tb.Meta())
-	_, ok := t.(table.PartitionedTable)
-	c.Assert(ok, IsTrue)
+	tb, err = dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t_mock"))
+	require.NoError(t, err)
+	tt := table.MockTableFromMeta(tb.Meta())
+	_, ok := tt.(table.PartitionedTable)
+	require.True(t, ok)
 	tk.MustExec("drop table t_mock")
-	c.Assert(t.Type(), Equals, table.NormalTable)
+	require.Equal(t, table.NormalTable, tt.Type())
 
 	tk.MustExec("create table t_meta (a int) shard_row_id_bits = 15")
-	tb, err = domain.GetDomain(tk.Se).InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t_meta"))
-	c.Assert(err, IsNil)
-	_, err = tables.AllocHandle(tk.Se, tb)
-	c.Assert(err, IsNil)
+	tb, err = domain.GetDomain(tk.Session()).InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t_meta"))
+	require.NoError(t, err)
+	_, err = tables.AllocHandle(context.Background(), tk.Session(), tb)
+	require.NoError(t, err)
 
 	maxID := 1<<(64-15-1) - 1
-	err = tb.RebaseAutoID(tk.Se, int64(maxID), false, autoid.RowIDAllocType)
-	c.Assert(err, IsNil)
+	err = tb.Allocators(tk.Session()).Get(autoid.RowIDAllocType).Rebase(context.Background(), int64(maxID), false)
+	require.NoError(t, err)
 
-	_, err = tables.AllocHandle(tk.Se, tb)
-	c.Assert(err, NotNil)
+	_, err = tables.AllocHandle(context.Background(), tk.Session(), tb)
+	require.Error(t, err)
 }
 
-func (ts *testSuite) TestShardRowIDBitsStep(c *C) {
-	tk := testkit.NewTestKit(c, ts.store)
+func TestShardRowIDBitsStep(t *testing.T) {
+	t.Parallel()
+	store, clean := testkit.CreateMockStore(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists shard_t;")
 	tk.MustExec("create table shard_t (a int) shard_row_id_bits = 15;")
@@ -407,21 +440,24 @@ func (ts *testSuite) TestShardRowIDBitsStep(c *C) {
 	shards := make(map[int]struct{})
 	for _, row := range rows {
 		id, err := strconv.ParseUint(row[0].(string), 10, 64)
-		c.Assert(err, IsNil)
+		require.NoError(t, err)
 		shards[int(id>>48)] = struct{}{}
 	}
-	c.Assert(len(shards), Equals, 4)
+	require.Equal(t, 4, len(shards))
 }
 
-func (ts *testSuite) TestHiddenColumn(c *C) {
-	tk := testkit.NewTestKit(c, ts.store)
+func TestHiddenColumn(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("DROP DATABASE IF EXISTS test_hidden;")
 	tk.MustExec("CREATE DATABASE test_hidden;")
 	tk.MustExec("USE test_hidden;")
 	tk.MustExec("CREATE TABLE t (a int primary key, b int as (a+1), c int, d int as (c+1) stored, e int, f tinyint as (a+1));")
 	tk.MustExec("insert into t values (1, default, 3, default, 5, default);")
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test_hidden"), model.NewCIStr("t"))
-	c.Assert(err, IsNil)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test_hidden"), model.NewCIStr("t"))
+	require.NoError(t, err)
 	colInfo := tb.Meta().Columns
 	// Set column b, d, f to hidden
 	colInfo[1].Hidden = true
@@ -436,25 +472,25 @@ func (ts *testSuite) TestHiddenColumn(c *C) {
 
 	// Basic test
 	cols := tb.VisibleCols()
-	c.Assert(table.FindCol(cols, "a"), NotNil)
-	c.Assert(table.FindCol(cols, "b"), IsNil)
-	c.Assert(table.FindCol(cols, "c"), NotNil)
-	c.Assert(table.FindCol(cols, "d"), IsNil)
-	c.Assert(table.FindCol(cols, "e"), NotNil)
+	require.NotNil(t, table.FindCol(cols, "a"))
+	require.Nil(t, table.FindCol(cols, "b"))
+	require.NotNil(t, table.FindCol(cols, "c"))
+	require.Nil(t, table.FindCol(cols, "d"))
+	require.NotNil(t, table.FindCol(cols, "e"))
 	hiddenCols := tb.HiddenCols()
-	c.Assert(table.FindCol(hiddenCols, "a"), IsNil)
-	c.Assert(table.FindCol(hiddenCols, "b"), NotNil)
-	c.Assert(table.FindCol(hiddenCols, "c"), IsNil)
-	c.Assert(table.FindCol(hiddenCols, "d"), NotNil)
-	c.Assert(table.FindCol(hiddenCols, "e"), IsNil)
+	require.Nil(t, table.FindCol(hiddenCols, "a"))
+	require.NotNil(t, table.FindCol(hiddenCols, "b"))
+	require.Nil(t, table.FindCol(hiddenCols, "c"))
+	require.NotNil(t, table.FindCol(hiddenCols, "d"))
+	require.Nil(t, table.FindCol(hiddenCols, "e"))
 	colInfo[1].State = model.StateDeleteOnly
 	colInfo[2].State = model.StateDeleteOnly
 	fullHiddenColsAndVisibleColumns := tb.FullHiddenColsAndVisibleCols()
-	c.Assert(table.FindCol(fullHiddenColsAndVisibleColumns, "a"), NotNil)
-	c.Assert(table.FindCol(fullHiddenColsAndVisibleColumns, "b"), NotNil)
-	c.Assert(table.FindCol(fullHiddenColsAndVisibleColumns, "c"), IsNil)
-	c.Assert(table.FindCol(fullHiddenColsAndVisibleColumns, "d"), NotNil)
-	c.Assert(table.FindCol(fullHiddenColsAndVisibleColumns, "e"), NotNil)
+	require.NotNil(t, table.FindCol(fullHiddenColsAndVisibleColumns, "a"))
+	require.NotNil(t, table.FindCol(fullHiddenColsAndVisibleColumns, "b"))
+	require.Nil(t, table.FindCol(fullHiddenColsAndVisibleColumns, "c"))
+	require.NotNil(t, table.FindCol(fullHiddenColsAndVisibleColumns, "d"))
+	require.NotNil(t, table.FindCol(fullHiddenColsAndVisibleColumns, "e"))
 	// Reset schema states.
 	colInfo[1].State = model.StatePublic
 	colInfo[2].State = model.StatePublic
@@ -465,7 +501,7 @@ func (ts *testSuite) TestHiddenColumn(c *C) {
 			"  `a` int(11) NOT NULL,\n" +
 			"  `c` int(11) DEFAULT NULL,\n" +
 			"  `e` int(11) DEFAULT NULL,\n" +
-			"  PRIMARY KEY (`a`)\n" +
+			"  PRIMARY KEY (`a`) /*T![clustered_index] CLUSTERED */\n" +
 			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
 
 	// Test show (extended) columns
@@ -561,13 +597,13 @@ func (ts *testSuite) TestHiddenColumn(c *C) {
 	tk.MustQuery("select * from t;").Check(testkit.Rows("1 3 5"))
 
 	// `DROP COLUMN` statement
-	tk.MustGetErrMsg("ALTER TABLE t DROP COLUMN b;", "[ddl:1091]column b doesn't exist")
+	tk.MustGetErrMsg("ALTER TABLE t DROP COLUMN b;", "[ddl:1091]Can't DROP 'b'; check that column/key exists")
 	tk.MustQuery("show create table t;").Check(testkit.Rows(
 		"t CREATE TABLE `t` (\n" +
 			"  `a` int(11) NOT NULL,\n" +
 			"  `c` int(11) DEFAULT NULL,\n" +
 			"  `e` int(11) DEFAULT NULL,\n" +
-			"  PRIMARY KEY (`a`)\n" +
+			"  PRIMARY KEY (`a`) /*T![clustered_index] CLUSTERED */\n" +
 			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
 	tk.MustQuery("show extended columns from t").Check(testutil.RowsWithSep("|",
 		"a|int(11)|NO|PRI|<nil>|",
@@ -578,41 +614,137 @@ func (ts *testSuite) TestHiddenColumn(c *C) {
 		"f|tinyint(4)|YES||<nil>|VIRTUAL GENERATED"))
 }
 
-func (ts *testSuite) TestAddRecordWithCtx(c *C) {
-	ts.se.Execute(context.Background(), "DROP TABLE IF EXISTS test.tRecord")
-	_, err := ts.se.Execute(context.Background(), "CREATE TABLE test.tRecord (a bigint unsigned primary key, b varchar(255))")
-	c.Assert(err, IsNil)
-	tb, err := ts.dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tRecord"))
-	c.Assert(err, IsNil)
-	defer ts.se.Execute(context.Background(), "DROP TABLE test.tRecord")
+func TestAddRecordWithCtx(t *testing.T) {
+	t.Parallel()
+	store, dom, clean := testkit.CreateMockStoreAndDomain(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	_, err := tk.Session().Execute(context.Background(), "DROP TABLE IF EXISTS test.tRecord")
+	require.NoError(t, err)
+	_, err = tk.Session().Execute(context.Background(), "CREATE TABLE test.tRecord (a bigint unsigned primary key, b varchar(255))")
+	require.NoError(t, err)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tRecord"))
+	require.NoError(t, err)
+	defer func() {
+		_, err := tk.Session().Execute(context.Background(), "DROP TABLE test.tRecord")
+		require.NoError(t, err)
+	}()
 
-	c.Assert(ts.se.NewTxn(context.Background()), IsNil)
-	_, err = ts.se.Txn(true)
-	c.Assert(err, IsNil)
+	require.Nil(t, tk.Session().NewTxn(context.Background()))
+	_, err = tk.Session().Txn(true)
+	require.NoError(t, err)
 	recordCtx := tables.NewCommonAddRecordCtx(len(tb.Cols()))
-	tables.SetAddRecordCtx(ts.se, recordCtx)
-	defer tables.ClearAddRecordCtx(ts.se)
+	tables.SetAddRecordCtx(tk.Session(), recordCtx)
+	defer tables.ClearAddRecordCtx(tk.Session())
 
 	records := [][]types.Datum{types.MakeDatums(uint64(1), "abc"), types.MakeDatums(uint64(2), "abcd")}
 	for _, r := range records {
-		rid, err := tb.AddRecord(ts.se, r)
-		c.Assert(err, IsNil)
-		row, err := tb.Row(ts.se, rid)
-		c.Assert(err, IsNil)
-		c.Assert(len(row), Equals, len(r))
-		c.Assert(row[0].Kind(), Equals, types.KindUint64)
+		rid, err := tb.AddRecord(tk.Session(), r)
+		require.NoError(t, err)
+		row, err := tables.RowWithCols(tb.(table.PhysicalTable), tk.Session(), rid, tb.Cols())
+		require.NoError(t, err)
+		require.Equal(t, len(r), len(row))
+		require.Equal(t, types.KindUint64, row[0].Kind())
 	}
 
 	i := 0
-	err = tb.IterRecords(ts.se, tb.FirstKey(), tb.Cols(), func(_ kv.Handle, rec []types.Datum, cols []*table.Column) (bool, error) {
+	err = tables.IterRecords(tb, tk.Session(), tb.Cols(), func(_ kv.Handle, rec []types.Datum, cols []*table.Column) (bool, error) {
 		i++
 		return true, nil
 	})
-	c.Assert(err, IsNil)
-	c.Assert(i, Equals, len(records))
+	require.NoError(t, err)
+	require.Equal(t, len(records), i)
 
-	ts.se.StmtCommit()
-	txn, err := ts.se.Txn(true)
-	c.Assert(err, IsNil)
-	c.Assert(txn.Commit(context.Background()), IsNil)
+	tk.Session().StmtCommit()
+	txn, err := tk.Session().Txn(true)
+	require.NoError(t, err)
+	require.Nil(t, txn.Commit(context.Background()))
+}
+
+func TestConstraintCheckForUniqueIndex(t *testing.T) {
+	t.Parallel()
+	store, clean := testkit.CreateMockStore(t)
+
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("set @@autocommit = 1")
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists ttt")
+	tk.MustExec("create table ttt(id int(11) NOT NULL AUTO_INCREMENT,k int(11) NOT NULL DEFAULT '0',c char(120) NOT NULL DEFAULT '',PRIMARY KEY (id),UNIQUE KEY k_1 (k,c))")
+	tk.MustExec("insert into ttt(k,c) values(1, 'tidb')")
+	tk.MustExec("insert into ttt(k,c) values(2, 'tidb')")
+	_, err := tk.Exec("update ttt set k=1 where id=2")
+	require.Equal(t, "[kv:1062]Duplicate entry '1-tidb' for key 'k_1'", err.Error())
+	tk.MustExec("rollback")
+
+	// no auto-commit
+	tk.MustExec("set @@autocommit = 0")
+	tk.MustExec("set @@tidb_constraint_check_in_place = 0")
+	tk.MustExec("begin")
+	_, err = tk.Exec("update ttt set k=1 where id=2")
+	require.Equal(t, "[kv:1062]Duplicate entry '1-tidb' for key 'k_1'", err.Error())
+	tk.MustExec("rollback")
+
+	tk.MustExec("set @@tidb_constraint_check_in_place = 1")
+	tk.MustExec("begin")
+	_, err = tk.Exec("update ttt set k=1 where id=2")
+	require.Equal(t, "[kv:1062]Duplicate entry '1-tidb' for key 'k_1'", err.Error())
+	tk.MustExec("rollback")
+
+	// This test check that with @@tidb_constraint_check_in_place = 0, although there is not KV request for the unique index, the pessimistic lock should still be written.
+	tk1 := testkit.NewTestKit(t, store)
+	tk2 := testkit.NewTestKit(t, store)
+	tk1.MustExec("set @@tidb_txn_mode = 'pessimistic'")
+	tk1.MustExec("set @@tidb_constraint_check_in_place = 0")
+	tk2.MustExec("set @@tidb_txn_mode = 'pessimistic'")
+	tk1.MustExec("use test")
+	tk1.MustExec("begin")
+	tk1.MustExec("update ttt set k=3 where id=2")
+
+	ch := make(chan int, 2)
+	go func() {
+		tk2.MustExec("use test")
+		_, err = tk2.Exec("insert into ttt(k,c) values(3, 'tidb')")
+		require.Error(t, err)
+		ch <- 2
+		clean()
+	}()
+	// Sleep 100ms for tk2 to execute, if it's not blocked, 2 should have been sent to the channel.
+	time.Sleep(100 * time.Millisecond)
+	ch <- 1
+	_, err = tk1.Exec("commit")
+	require.NoError(t, err)
+	// The data in channel is 1 means tk2 is blocked, that's the expected behavior.
+	require.Equal(t, 1, <-ch)
+}
+
+func TestViewColumns(t *testing.T) {
+	t.Parallel()
+	store, clean := testkit.CreateMockStore(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	require.True(t, tk.Session().Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil))
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int primary key, b varchar(20))")
+	tk.MustExec("drop view if exists v")
+	tk.MustExec("create view v as select * from t")
+	tk.MustExec("drop view if exists va")
+	tk.MustExec("create view va as select count(a) from t")
+	testCases := []struct {
+		query    string
+		expected []string
+	}{
+		{"select data_type from INFORMATION_SCHEMA.columns where table_name = 'v'", []string{types.TypeToStr(mysql.TypeLong, ""), types.TypeToStr(mysql.TypeVarchar, "")}},
+		{"select data_type from INFORMATION_SCHEMA.columns where table_name = 'va'", []string{types.TypeToStr(mysql.TypeLonglong, "")}},
+	}
+	for _, testCase := range testCases {
+		tk.MustQuery(testCase.query).Check(testutil.RowsWithSep("|", testCase.expected...))
+	}
+	tk.MustExec("drop table if exists t")
+	for _, testCase := range testCases {
+		require.Len(t, tk.MustQuery(testCase.query).Rows(), 0)
+		tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|",
+			"Warning|1356|View 'test.v' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them",
+			"Warning|1356|View 'test.va' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them"))
+	}
 }

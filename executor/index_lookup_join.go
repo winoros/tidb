@@ -8,24 +8,28 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 package executor
 
 import (
+	"bytes"
 	"context"
 	"runtime"
 	"runtime/trace"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/parser/terror"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -69,7 +73,7 @@ type IndexLookUpJoin struct {
 
 	requiredRows int64
 
-	indexRanges   []*ranger.Range
+	indexRanges   ranger.MutableRanges
 	keyOff2IdxOff []int
 	innerPtrBytes [][]byte
 
@@ -77,18 +81,25 @@ type IndexLookUpJoin struct {
 	lastColHelper *plannercore.ColWithCmpFuncManager
 
 	memTracker *memory.Tracker // track memory usage.
+
+	stats *indexLookUpJoinRuntimeStats
 }
 
 type outerCtx struct {
-	rowTypes []*types.FieldType
-	keyCols  []int
-	filter   expression.CNFExprs
+	rowTypes  []*types.FieldType
+	keyCols   []int
+	hashTypes []*types.FieldType
+	hashCols  []int
+	filter    expression.CNFExprs
 }
 
 type innerCtx struct {
 	readerBuilder *dataReaderBuilder
 	rowTypes      []*types.FieldType
 	keyCols       []int
+	keyColIDs     []int64 // the original ID in its table, used by dynamic partition pruning
+	hashTypes     []*types.FieldType
+	hashCols      []int
 	colLens       []int
 	hasPrefixCol  bool
 }
@@ -138,45 +149,31 @@ type innerWorker struct {
 	indexRanges           []*ranger.Range
 	nextColCompareFilters *plannercore.ColWithCmpFuncManager
 	keyOff2IdxOff         []int
+	stats                 *innerWorkerRuntimeStats
 }
 
 // Open implements the Executor interface.
 func (e *IndexLookUpJoin) Open(ctx context.Context) error {
-	// Be careful, very dirty hack in this line!!!
-	// IndexLookUpJoin need to rebuild executor (the dataReaderBuilder) during
-	// executing. However `executor.Next()` is lazy evaluation when the RecordSet
-	// result is drained.
-	// Lazy evaluation means the saved session context may change during executor's
-	// building and its running.
-	// A specific sequence for example:
-	//
-	// e := buildExecutor()   // txn at build time
-	// recordSet := runStmt(e)
-	// session.CommitTxn()    // txn closed
-	// recordSet.Next()
-	// e.dataReaderBuilder.Build() // txn is used again, which is already closed
-	//
-	// The trick here is `getSnapshotTS` will cache snapshot ts in the dataReaderBuilder,
-	// so even txn is destroyed later, the dataReaderBuilder could still use the
-	// cached snapshot ts to construct DAG.
-	_, err := e.innerCtx.readerBuilder.getSnapshotTS()
-	if err != nil {
-		return err
-	}
-
-	err = e.children[0].Open(ctx)
+	err := e.children[0].Open(ctx)
 	if err != nil {
 		return err
 	}
 	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 	e.innerPtrBytes = make([][]byte, 0, 8)
+	if e.runtimeStats != nil {
+		e.stats = &indexLookUpJoinRuntimeStats{}
+		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id, e.stats)
+	}
 	e.startWorkers(ctx)
 	return nil
 }
 
 func (e *IndexLookUpJoin) startWorkers(ctx context.Context) {
 	concurrency := e.ctx.GetSessionVars().IndexLookupJoinConcurrency()
+	if e.stats != nil {
+		e.stats.concurrency = concurrency
+	}
 	resultCh := make(chan *lookUpJoinTask, concurrency)
 	e.resultCh = resultCh
 	workerCtx, cancelFunc := context.WithCancel(ctx)
@@ -207,11 +204,15 @@ func (e *IndexLookUpJoin) newOuterWorker(resultCh, innerCh chan *lookUpJoinTask)
 
 func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWorker {
 	// Since multiple inner workers run concurrently, we should copy join's indexRanges for every worker to avoid data race.
-	copiedRanges := make([]*ranger.Range, 0, len(e.indexRanges))
-	for _, ran := range e.indexRanges {
+	copiedRanges := make([]*ranger.Range, 0, len(e.indexRanges.Range()))
+	for _, ran := range e.indexRanges.Range() {
 		copiedRanges = append(copiedRanges, ran.Clone())
 	}
 
+	var innerStats *innerWorkerRuntimeStats
+	if e.stats != nil {
+		innerStats = &e.stats.innerWorker
+	}
 	iw := &innerWorker{
 		innerCtx:      e.innerCtx,
 		outerCtx:      e.outerCtx,
@@ -220,6 +221,7 @@ func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWork
 		executorChk:   chunk.NewChunkWithCapacity(e.innerCtx.rowTypes, e.maxChunkSize),
 		indexRanges:   copiedRanges,
 		keyOff2IdxOff: e.keyOff2IdxOff,
+		stats:         innerStats,
 	}
 	if e.lastColHelper != nil {
 		// nextCwf.TmpConstant needs to be reset for every individual
@@ -250,6 +252,7 @@ func (e *IndexLookUpJoin) Next(ctx context.Context, req *chunk.Chunk) error {
 		if task == nil {
 			return nil
 		}
+		startTime := time.Now()
 		if e.innerIter == nil || e.innerIter.Current() == e.innerIter.End() {
 			e.lookUpMatchedInners(task, task.cursor)
 			e.innerIter = chunk.NewIterator4Slice(task.matchedInners)
@@ -276,6 +279,9 @@ func (e *IndexLookUpJoin) Next(ctx context.Context, req *chunk.Chunk) error {
 			}
 			task.hasMatch = false
 			task.hasNull = false
+		}
+		if e.stats != nil {
+			atomic.AddInt64(&e.stats.probe, int64(time.Since(startTime)))
 		}
 		if req.IsFull() {
 			return nil
@@ -470,16 +476,23 @@ func (iw *innerWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 type indexJoinLookUpContent struct {
-	keys []types.Datum
-	row  chunk.Row
+	keys      []types.Datum
+	row       chunk.Row
+	keyCols   []int
+	keyColIDs []int64 // the original ID in its table, used by dynamic partition pruning
 }
 
 func (iw *innerWorker) handleTask(ctx context.Context, task *lookUpJoinTask) error {
+	if iw.stats != nil {
+		start := time.Now()
+		defer func() {
+			atomic.AddInt64(&iw.stats.totalTime, int64(time.Since(start)))
+		}()
+	}
 	lookUpContents, err := iw.constructLookupContent(task)
 	if err != nil {
 		return err
 	}
-	lookUpContents = iw.sortAndDedupLookUpContents(lookUpContents)
 	err = iw.fetchInnerResults(ctx, task, lookUpContents)
 	if err != nil {
 		return err
@@ -492,89 +505,107 @@ func (iw *innerWorker) handleTask(ctx context.Context, task *lookUpJoinTask) err
 }
 
 func (iw *innerWorker) constructLookupContent(task *lookUpJoinTask) ([]*indexJoinLookUpContent, error) {
+	if iw.stats != nil {
+		start := time.Now()
+		defer func() {
+			atomic.AddInt64(&iw.stats.task, 1)
+			atomic.AddInt64(&iw.stats.construct, int64(time.Since(start)))
+		}()
+	}
 	lookUpContents := make([]*indexJoinLookUpContent, 0, task.outerResult.Len())
 	keyBuf := make([]byte, 0, 64)
 	for chkIdx := 0; chkIdx < task.outerResult.NumChunks(); chkIdx++ {
 		chk := task.outerResult.GetChunk(chkIdx)
 		numRows := chk.NumRows()
 		for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-			dLookUpKey, err := iw.constructDatumLookupKey(task, chkIdx, rowIdx)
+			dLookUpKey, dHashKey, err := iw.constructDatumLookupKey(task, chkIdx, rowIdx)
 			if err != nil {
+				if terror.ErrorEqual(err, types.ErrWrongValue) {
+					// We ignore rows with invalid datetime.
+					task.encodedLookUpKeys[chkIdx].AppendNull(0)
+					continue
+				}
 				return nil, err
 			}
-			if dLookUpKey == nil {
+			if dHashKey == nil {
 				// Append null to make looUpKeys the same length as outer Result.
 				task.encodedLookUpKeys[chkIdx].AppendNull(0)
 				continue
 			}
 			keyBuf = keyBuf[:0]
-			keyBuf, err = codec.EncodeKey(iw.ctx.GetSessionVars().StmtCtx, keyBuf, dLookUpKey...)
+			keyBuf, err = codec.EncodeKey(iw.ctx.GetSessionVars().StmtCtx, keyBuf, dHashKey...)
 			if err != nil {
+				if terror.ErrorEqual(err, types.ErrWrongValue) {
+					// we ignore rows with invalid datetime
+					task.encodedLookUpKeys[chkIdx].AppendNull(0)
+					continue
+				}
 				return nil, err
 			}
 			// Store the encoded lookup key in chunk, so we can use it to lookup the matched inners directly.
 			task.encodedLookUpKeys[chkIdx].AppendBytes(0, keyBuf)
 			if iw.hasPrefixCol {
-				for i := range iw.outerCtx.keyCols {
+				for i, outerOffset := range iw.keyOff2IdxOff {
 					// If it's a prefix column. Try to fix it.
-					if iw.colLens[i] != types.UnspecifiedLength {
-						ranger.CutDatumByPrefixLen(&dLookUpKey[i], iw.colLens[i], iw.rowTypes[iw.keyCols[i]])
+					joinKeyColPrefixLen := iw.colLens[outerOffset]
+					if joinKeyColPrefixLen != types.UnspecifiedLength {
+						ranger.CutDatumByPrefixLen(&dLookUpKey[i], joinKeyColPrefixLen, iw.rowTypes[iw.keyCols[i]])
 					}
 				}
 				// dLookUpKey is sorted and deduplicated at sortAndDedupLookUpContents.
 				// So we don't need to do it here.
 			}
-			lookUpContents = append(lookUpContents, &indexJoinLookUpContent{keys: dLookUpKey, row: chk.GetRow(rowIdx)})
+			lookUpContents = append(lookUpContents, &indexJoinLookUpContent{keys: dLookUpKey, row: chk.GetRow(rowIdx), keyCols: iw.keyCols, keyColIDs: iw.keyColIDs})
 		}
 	}
 
 	for i := range task.encodedLookUpKeys {
 		task.memTracker.Consume(task.encodedLookUpKeys[i].MemoryUsage())
 	}
+	lookUpContents = iw.sortAndDedupLookUpContents(lookUpContents)
 	return lookUpContents, nil
 }
 
-func (iw *innerWorker) constructDatumLookupKey(task *lookUpJoinTask, chkIdx, rowIdx int) ([]types.Datum, error) {
+func (iw *innerWorker) constructDatumLookupKey(task *lookUpJoinTask, chkIdx, rowIdx int) ([]types.Datum, []types.Datum, error) {
 	if task.outerMatch != nil && !task.outerMatch[chkIdx][rowIdx] {
-		return nil, nil
+		return nil, nil, nil
 	}
 	outerRow := task.outerResult.GetChunk(chkIdx).GetRow(rowIdx)
 	sc := iw.ctx.GetSessionVars().StmtCtx
 	keyLen := len(iw.keyCols)
 	dLookupKey := make([]types.Datum, 0, keyLen)
-	for i, keyCol := range iw.outerCtx.keyCols {
-		outerValue := outerRow.GetDatum(keyCol, iw.outerCtx.rowTypes[keyCol])
+	dHashKey := make([]types.Datum, 0, len(iw.hashCols))
+	for i, hashCol := range iw.outerCtx.hashCols {
+		outerValue := outerRow.GetDatum(hashCol, iw.outerCtx.rowTypes[hashCol])
 		// Join-on-condition can be promised to be equal-condition in
 		// IndexNestedLoopJoin, thus the filter will always be false if
 		// outerValue is null, and we don't need to lookup it.
 		if outerValue.IsNull() {
-			return nil, nil
+			return nil, nil, nil
 		}
-		innerColType := iw.rowTypes[iw.keyCols[i]]
-		// TODO: collate should be taken into consideration
-		// https://github.com/pingcap/tidb/issues/19654
+		innerColType := iw.rowTypes[iw.hashCols[i]]
 		innerValue, err := outerValue.ConvertTo(sc, innerColType)
-		if err != nil {
-			// If the converted outerValue overflows, we don't need to lookup it.
-			if terror.ErrorEqual(err, types.ErrOverflow) {
-				return nil, nil
+		if err != nil && !(terror.ErrorEqual(err, types.ErrTruncated) && (innerColType.Tp == mysql.TypeSet || innerColType.Tp == mysql.TypeEnum)) {
+			// If the converted outerValue overflows or invalid to innerValue, we don't need to lookup it.
+			if terror.ErrorEqual(err, types.ErrOverflow) || terror.ErrorEqual(err, types.ErrWarnDataOutOfRange) {
+				return nil, nil, nil
 			}
-			if terror.ErrorEqual(err, types.ErrTruncated) && (innerColType.Tp == mysql.TypeSet || innerColType.Tp == mysql.TypeEnum) {
-				return nil, nil
-			}
-			return nil, err
+			return nil, nil, err
 		}
 		cmp, err := outerValue.CompareDatum(sc, &innerValue)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if cmp != 0 {
 			// If the converted outerValue is not equal to the origin outerValue, we don't need to lookup it.
-			return nil, nil
+			return nil, nil, nil
 		}
-		dLookupKey = append(dLookupKey, innerValue)
+		if i < keyLen {
+			dLookupKey = append(dLookupKey, innerValue)
+		}
+		dHashKey = append(dHashKey, innerValue)
 	}
-	return dLookupKey, nil
+	return dLookupKey, dHashKey, nil
 }
 
 func (iw *innerWorker) sortAndDedupLookUpContents(lookUpContents []*indexJoinLookUpContent) []*indexJoinLookUpContent {
@@ -614,11 +645,20 @@ func compareRow(sc *stmtctx.StatementContext, left, right []types.Datum) int {
 }
 
 func (iw *innerWorker) fetchInnerResults(ctx context.Context, task *lookUpJoinTask, lookUpContent []*indexJoinLookUpContent) error {
-	innerExec, err := iw.readerBuilder.buildExecutorForIndexJoin(ctx, lookUpContent, iw.indexRanges, iw.keyOff2IdxOff, iw.nextColCompareFilters)
+	if iw.stats != nil {
+		start := time.Now()
+		defer func() {
+			atomic.AddInt64(&iw.stats.fetch, int64(time.Since(start)))
+		}()
+	}
+	innerExec, err := iw.readerBuilder.buildExecutorForIndexJoin(ctx, lookUpContent, iw.indexRanges, iw.keyOff2IdxOff, iw.nextColCompareFilters, true)
+	if innerExec != nil {
+		defer terror.Call(innerExec.Close)
+	}
 	if err != nil {
 		return err
 	}
-	defer terror.Call(innerExec.Close)
+
 	innerResult := chunk.NewList(retTypes(innerExec), iw.ctx.GetSessionVars().MaxChunkSize, iw.ctx.GetSessionVars().MaxChunkSize)
 	innerResult.GetMemTracker().SetLabel(memory.LabelForBuildSideResult)
 	innerResult.GetMemTracker().AttachTo(task.memTracker)
@@ -643,6 +683,12 @@ func (iw *innerWorker) fetchInnerResults(ctx context.Context, task *lookUpJoinTa
 }
 
 func (iw *innerWorker) buildLookUpMap(task *lookUpJoinTask) error {
+	if iw.stats != nil {
+		start := time.Now()
+		defer func() {
+			atomic.AddInt64(&iw.stats.build, int64(time.Since(start)))
+		}()
+	}
 	keyBuf := make([]byte, 0, 64)
 	valBuf := make([]byte, 8)
 	for i := 0; i < task.innerResult.NumChunks(); i++ {
@@ -654,7 +700,7 @@ func (iw *innerWorker) buildLookUpMap(task *lookUpJoinTask) error {
 			}
 
 			keyBuf = keyBuf[:0]
-			for _, keyCol := range iw.keyCols {
+			for _, keyCol := range iw.hashCols {
 				d := innerRow.GetDatum(keyCol, iw.rowTypes[keyCol])
 				var err error
 				keyBuf, err = codec.EncodeKey(iw.ctx.GetSessionVars().StmtCtx, keyBuf, d)
@@ -671,7 +717,7 @@ func (iw *innerWorker) buildLookUpMap(task *lookUpJoinTask) error {
 }
 
 func (iw *innerWorker) hasNullInJoinKey(row chunk.Row) bool {
-	for _, ordinal := range iw.keyCols {
+	for _, ordinal := range iw.hashCols {
 		if row.IsNull(ordinal) {
 			return true
 		}
@@ -687,11 +733,79 @@ func (e *IndexLookUpJoin) Close() error {
 	e.workerWg.Wait()
 	e.memTracker = nil
 	e.task = nil
-	if e.runtimeStats != nil {
-		concurrency := cap(e.resultCh)
-		runtimeStats := &execdetails.RuntimeStatsWithConcurrencyInfo{BasicRuntimeStats: e.runtimeStats}
-		runtimeStats.SetConcurrencyInfo(execdetails.NewConcurrencyInfo("Concurrency", concurrency))
-		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id, runtimeStats)
-	}
 	return e.baseExecutor.Close()
+}
+
+type indexLookUpJoinRuntimeStats struct {
+	concurrency int
+	probe       int64
+	innerWorker innerWorkerRuntimeStats
+}
+
+type innerWorkerRuntimeStats struct {
+	totalTime int64
+	task      int64
+	construct int64
+	fetch     int64
+	build     int64
+	join      int64
+}
+
+func (e *indexLookUpJoinRuntimeStats) String() string {
+	buf := bytes.NewBuffer(make([]byte, 0, 16))
+	if e.innerWorker.totalTime > 0 {
+		buf.WriteString("inner:{total:")
+		buf.WriteString(execdetails.FormatDuration(time.Duration(e.innerWorker.totalTime)))
+		buf.WriteString(", concurrency:")
+		if e.concurrency > 0 {
+			buf.WriteString(strconv.Itoa(e.concurrency))
+		} else {
+			buf.WriteString("OFF")
+		}
+		buf.WriteString(", task:")
+		buf.WriteString(strconv.FormatInt(e.innerWorker.task, 10))
+		buf.WriteString(", construct:")
+		buf.WriteString(execdetails.FormatDuration(time.Duration(e.innerWorker.construct)))
+		buf.WriteString(", fetch:")
+		buf.WriteString(execdetails.FormatDuration(time.Duration(e.innerWorker.fetch)))
+		buf.WriteString(", build:")
+		buf.WriteString(execdetails.FormatDuration(time.Duration(e.innerWorker.build)))
+		if e.innerWorker.join > 0 {
+			buf.WriteString(", join:")
+			buf.WriteString(execdetails.FormatDuration(time.Duration(e.innerWorker.join)))
+		}
+		buf.WriteString("}")
+	}
+	if e.probe > 0 {
+		buf.WriteString(", probe:")
+		buf.WriteString(execdetails.FormatDuration(time.Duration(e.probe)))
+	}
+	return buf.String()
+}
+
+func (e *indexLookUpJoinRuntimeStats) Clone() execdetails.RuntimeStats {
+	return &indexLookUpJoinRuntimeStats{
+		concurrency: e.concurrency,
+		probe:       e.probe,
+		innerWorker: e.innerWorker,
+	}
+}
+
+func (e *indexLookUpJoinRuntimeStats) Merge(rs execdetails.RuntimeStats) {
+	tmp, ok := rs.(*indexLookUpJoinRuntimeStats)
+	if !ok {
+		return
+	}
+	e.probe += tmp.probe
+	e.innerWorker.totalTime += tmp.innerWorker.totalTime
+	e.innerWorker.task += tmp.innerWorker.task
+	e.innerWorker.construct += tmp.innerWorker.construct
+	e.innerWorker.fetch += tmp.innerWorker.fetch
+	e.innerWorker.build += tmp.innerWorker.build
+	e.innerWorker.join += tmp.innerWorker.join
+}
+
+// Tp implements the RuntimeStats interface.
+func (e *indexLookUpJoinRuntimeStats) Tp() int {
+	return execdetails.TpIndexLookUpJoinRuntimeStats
 }

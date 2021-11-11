@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,9 +16,15 @@ package aggfuncs
 
 import (
 	"math"
+	"unsafe"
 
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/chunk"
+)
+
+const (
+	// DefPartialResult4BitFuncSize the size of partialResult4BitFunc
+	DefPartialResult4BitFuncSize = int64(unsafe.Sizeof(partialResult4BitFunc(0)))
 )
 
 type baseBitAggFunc struct {
@@ -27,7 +34,7 @@ type baseBitAggFunc struct {
 type partialResult4BitFunc = uint64
 
 func (e *baseBitAggFunc) AllocPartialResult() (pr PartialResult, memDelta int64) {
-	return PartialResult(new(partialResult4BitFunc)), 0
+	return PartialResult(new(partialResult4BitFunc)), DefPartialResult4BitFuncSize
 }
 
 func (e *baseBitAggFunc) ResetPartialResult(pr PartialResult) {
@@ -50,20 +57,20 @@ func (e *bitOrUint64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup [
 	for _, row := range rowsInGroup {
 		inputValue, isNull, err := e.args[0].EvalInt(sctx, row)
 		if err != nil {
-			return 0, err
+			return memDelta, err
 		}
 		if isNull {
 			continue
 		}
 		*p |= uint64(inputValue)
 	}
-	return 0, nil
+	return memDelta, nil
 }
 
 func (*bitOrUint64) MergePartialResult(sctx sessionctx.Context, src, dst PartialResult) (memDelta int64, err error) {
 	p1, p2 := (*partialResult4BitFunc)(src), (*partialResult4BitFunc)(dst)
 	*p2 |= *p1
-	return 0, nil
+	return memDelta, nil
 }
 
 type bitXorUint64 struct {
@@ -75,20 +82,22 @@ func (e *bitXorUint64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup 
 	for _, row := range rowsInGroup {
 		inputValue, isNull, err := e.args[0].EvalInt(sctx, row)
 		if err != nil {
-			return 0, err
+			return memDelta, err
 		}
 		if isNull {
 			continue
 		}
 		*p ^= uint64(inputValue)
 	}
-	return 0, nil
+	return memDelta, nil
 }
 
-func (e *bitXorUint64) Slide(sctx sessionctx.Context, rows []chunk.Row, lastStart, lastEnd uint64, shiftStart, shiftEnd uint64, pr PartialResult) error {
+var _ SlidingWindowAggFunc = &bitXorUint64{}
+
+func (e *bitXorUint64) Slide(sctx sessionctx.Context, getRow func(uint64) chunk.Row, lastStart, lastEnd uint64, shiftStart, shiftEnd uint64, pr PartialResult) error {
 	p := (*partialResult4BitFunc)(pr)
 	for i := uint64(0); i < shiftStart; i++ {
-		inputValue, isNull, err := e.args[0].EvalInt(sctx, rows[lastStart+i])
+		inputValue, isNull, err := e.args[0].EvalInt(sctx, getRow(lastStart+i))
 		if err != nil {
 			return err
 		}
@@ -98,7 +107,7 @@ func (e *bitXorUint64) Slide(sctx sessionctx.Context, rows []chunk.Row, lastStar
 		*p ^= uint64(inputValue)
 	}
 	for i := uint64(0); i < shiftEnd; i++ {
-		inputValue, isNull, err := e.args[0].EvalInt(sctx, rows[lastEnd+i])
+		inputValue, isNull, err := e.args[0].EvalInt(sctx, getRow(lastEnd+i))
 		if err != nil {
 			return err
 		}
@@ -113,7 +122,7 @@ func (e *bitXorUint64) Slide(sctx sessionctx.Context, rows []chunk.Row, lastStar
 func (*bitXorUint64) MergePartialResult(sctx sessionctx.Context, src, dst PartialResult) (memDelta int64, err error) {
 	p1, p2 := (*partialResult4BitFunc)(src), (*partialResult4BitFunc)(dst)
 	*p2 ^= *p1
-	return 0, nil
+	return memDelta, nil
 }
 
 type bitAndUint64 struct {
@@ -123,7 +132,7 @@ type bitAndUint64 struct {
 func (e *bitAndUint64) AllocPartialResult() (pr PartialResult, memDelta int64) {
 	p := new(partialResult4BitFunc)
 	*p = math.MaxUint64
-	return PartialResult(p), 0
+	return PartialResult(p), DefPartialResult4BitFuncSize
 }
 
 func (e *bitAndUint64) ResetPartialResult(pr PartialResult) {
@@ -136,18 +145,19 @@ func (e *bitAndUint64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup 
 	for _, row := range rowsInGroup {
 		inputValue, isNull, err := e.args[0].EvalInt(sctx, row)
 		if err != nil {
-			return 0, err
+			return memDelta, err
 		}
 		if isNull {
 			continue
 		}
+
 		*p &= uint64(inputValue)
 	}
-	return 0, nil
+	return memDelta, nil
 }
 
 func (*bitAndUint64) MergePartialResult(sctx sessionctx.Context, src, dst PartialResult) (memDelta int64, err error) {
 	p1, p2 := (*partialResult4BitFunc)(src), (*partialResult4BitFunc)(dst)
 	*p2 &= *p1
-	return 0, nil
+	return memDelta, nil
 }
