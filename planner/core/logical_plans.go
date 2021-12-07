@@ -594,7 +594,6 @@ func (ds *DataSource) extractFD() *fd.FDSet {
 	// b
 	for i := range ds.table.Meta().Indices {
 		fmt.Println(i)
-		i.
 	}
 	return nil
 
