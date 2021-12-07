@@ -15,7 +15,6 @@
 package core
 
 import (
-	"fmt"
 	"math"
 
 	"github.com/pingcap/tidb/expression"
@@ -26,7 +25,6 @@ import (
 	"github.com/pingcap/tidb/parser/auth"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/mysql"
-	fd "github.com/pingcap/tidb/planner/function_dependency"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/sessionctx"
@@ -588,15 +586,6 @@ type DataSource struct {
 	// 1. use `inside insert`, `update`, `delete` or `select for update` statement
 	// 2. isolation level is RC
 	isForUpdateRead bool
-}
-
-func (ds *DataSource) extractFD() *fd.FDSet {
-	// b
-	for i := range ds.table.Meta().Indices {
-		fmt.Println(i)
-	}
-	return nil
-
 }
 
 // ExtractCorrelatedCols implements LogicalPlan interface.
