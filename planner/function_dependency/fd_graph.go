@@ -1,23 +1,80 @@
 package function_dependency
 
-// IntSet is used to hold set of vertexes of one side of an edge.
-type IntSet []int
+import "sort"
 
+// IntSet is used to hold set of vertexes of one side of an edge.
+type IntSet map[int]struct{}
+
+// SubsetOf is used to judge whether IntSet itself is a subset of others.
 func (is IntSet) SubsetOf (target IntSet) bool {
-	for i := range is {
-		found := false
-		for j := range target {
-			if i == j {
-				found = true
-				break
-			}
-		}
-		if found {
+	for i, _ := range is {
+		if _, ok := target[i]; ok {
 			continue
 		}
 		return false
 	}
 	return true
+}
+
+// Intersects is used to judge whether IntSet itself intersects with others.
+func (is IntSet) Intersects(target IntSet) bool {
+	for i, _ := range is {
+		if _, ok := target[i]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Difference is used to exclude the intersection sector away from itself.
+func (is IntSet) Difference(target IntSet) {
+	for i, _ := range target {
+		if _, ok := is[i]; ok {
+			delete(is, i)
+		}
+	}
+}
+
+// Union is used to union the IntSet itself with others
+func (is IntSet) Union (target IntSet) {
+	// deduplicate
+	for i, _ := range target {
+		if _, ok := is[i]; ok {
+			continue
+		}
+		is[i] = struct{}{}
+	}
+}
+
+// Equals is used to judge whether two IntSet are semantically equal.
+func (is IntSet) Equals (target IntSet) bool {
+	if len(is) != len(target) {
+		return false
+	}
+	for i, _ := range target {
+		if _, ok := is[i]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (is IntSet) CopyFrom (target IntSet) {
+	for k, _ := range is {
+		delete(is, k)
+	}
+	for k, v := range target {
+		is[k] = v
+	}
+}
+
+func (is IntSet) SortedArray() []int {
+	arr := make([]int, 0, len(is))
+	for k, _ := range is {
+		arr = append(arr, k)
+	}
+	sort.Slice(arr, func(i, j int) bool { return arr[i] < arr[j] })
+	return arr
 }
 
 type fdEdge struct {
@@ -31,18 +88,24 @@ type fdEdge struct {
 }
 
 func NewIntSet() IntSet {
-	return []int{}
+	return make(map[int]struct{})
 }
 
 type FDSet struct {
 	fdEdges []*fdEdge
 }
 
+// closureOf is to find closure of X with respect to F.
+// A -> B  =  colSet -> { resultIntSet }
+// eg: considering closure F: {A-> CD, B -> E}, and input is {AB}
+// res: AB -> {CDE} (AB is included in trivial FD)
 func (s *FDSet) closureOf(colSet IntSet) IntSet {
 	resultSet := NewIntSet()
+	// self included in trivial FD.
+	resultSet.Union(colSet)
 	for i := 0; i < len(s.fdEdges); i++ {
 		fd := s.fdEdges[i]
-		if fd.strict && fd.from.SubsetOf(colSet) && !fd.to.SubsetOf(colSet) {
+		if fd.strict && fd.from.SubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
 			resultSet.Union(fd.to)
 			// If the closure is updated, we redo from the beginning.
 			i = -1
@@ -52,11 +115,15 @@ func (s *FDSet) closureOf(colSet IntSet) IntSet {
 }
 
 func (s *FDSet) inClosure(setA, setB IntSet) bool {
-	var currentClosure IntSet
+	currentClosure := NewIntSet()
+	// self included in trivial FD.
+	currentClosure.Union(setA)
 	for i := 0; i < len(s.fdEdges); i++ {
 		fd := s.fdEdges[i]
-		if fd.strict && fd.from.SubsetOf(setA) && !fd.to.SubsetOf(setA) {
-			resultSet.Union(fd.to)
+		if fd.strict && fd.from.SubsetOf(currentClosure) && !fd.to.SubsetOf(currentClosure) {
+			// once fd.from is subset of setA, which means fd is part of our closure;
+			// when fd.to is not subset setA itself, it means inference result is necessary to add;
+			currentClosure.Union(fd.to)
 			if setB.SubsetOf(currentClosure) {
 				return true
 			}
@@ -71,13 +138,13 @@ func (s *FDSet) ReduceCols(colSet IntSet) IntSet {
 	// Suppose the colSet is A and B, we have A --> B. Then we only need A since B' value is always determined by A.
 	var removed, result IntSet
 	result.CopyFrom(colSet)
-	for i := colSet.FirstBit(); i != colSet.End(); i = colSet.NextBit(i) {
-		removed.Insert(i)
-		result.Remove(i)
+	for k, v := range colSet {
+		removed[k] = v
+		delete(result, k)
 		// If the removed one is not dependent with the result. We add the bit back.
 		if !s.inClosure(result, removed) {
-			removed.Remove(i)
-			result.Insert(i)
+			delete(removed, k)
+			result[k] = v
 		}
 	}
 	return result
@@ -86,25 +153,30 @@ func (s *FDSet) ReduceCols(colSet IntSet) IntSet {
 // AddStrictFunctionalDependency is to add functional dependency to the fdGraph, to reduce the edge number,
 // we limit the functional dependency when we insert into the set. The key code of insert is like the following codes.
 func (s *FDSet) AddStrictFunctionalDependency (from, to IntSet) {
+	// trivial FD, refused.
 	if to.SubsetOf(from) {
 		return
 	}
 
+	// exclude the intersection part.
 	if to.Intersects(from) {
 		to.Difference(from)
 	}
 
-	newFD := fdEdge{
+	newFD := &fdEdge{
 		from: from,
 		to: to,
 		strict: true,
 		equiv: false,
 	}
+
 	swapPointer := 0
 	added := false
+	// the newFD couldn't be superSet of existed one A and be subset of the other existed one B at same time.
+	// Because the subset relationship between A and B will be replaced previously.
 	for i := range s.fdEdges {
-		fd := &s.fdEdges[i]
-		// If the new one is strong than the old one. Just replace it.
+		fd := s.fdEdges[i]
+		// If the new one is stronger than the old one. Just replace it.
 		if newFD.implies(fd) {
 			if added {
 				continue
@@ -117,8 +189,10 @@ func (s *FDSet) AddStrictFunctionalDependency (from, to IntSet) {
 			// There's a strong one. No need to add.
 			if fd.implies(newFD) {
 				added = true
-			} else if fd.strict = true && fd.equiv == false && fd.from.Equals(from) {
+			} else if fd.strict == true && fd.equiv == false && fd.from.Equals(from) {
 				// We can use the new FD to extend the current one.
+				// eg:  A -> BC, A -> CE, they couldn't be the subset of each other, union them.
+				// res: A -> BCE
 				fd.to.Union(to)
 				added = true
 			}
