@@ -1,97 +1,16 @@
 package function_dependency
 
-import "sort"
-
-// IntSet is used to hold set of vertexes of one side of an edge.
-type IntSet map[int]struct{}
-
-// SubsetOf is used to judge whether IntSet itself is a subset of others.
-func (is IntSet) SubsetOf(target IntSet) bool {
-	for i := range is {
-		if _, ok := target[i]; ok {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-// Intersects is used to judge whether IntSet itself intersects with others.
-func (is IntSet) Intersects(target IntSet) bool {
-	for i := range is {
-		if _, ok := target[i]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// Difference is used to exclude the intersection sector away from itself.
-func (is IntSet) Difference(target IntSet) {
-	for i := range target {
-		if _, ok := is[i]; ok {
-			delete(is, i)
-		}
-	}
-}
-
-// Union is used to union the IntSet itself with others
-func (is IntSet) Union(target IntSet) {
-	// deduplicate
-	for i := range target {
-		if _, ok := is[i]; ok {
-			continue
-		}
-		is[i] = struct{}{}
-	}
-}
-
-// Equals is used to judge whether two IntSet are semantically equal.
-func (is IntSet) Equals(target IntSet) bool {
-	if len(is) != len(target) {
-		return false
-	}
-	for i := range target {
-		if _, ok := is[i]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func (is IntSet) CopyFrom(target IntSet) {
-	for k := range is {
-		delete(is, k)
-	}
-	for k, v := range target {
-		is[k] = v
-	}
-}
-
-func (is IntSet) SortedArray() []int {
-	arr := make([]int, 0, len(is))
-	for k := range is {
-		arr = append(arr, k)
-	}
-	sort.Slice(arr, func(i, j int) bool { return arr[i] < arr[j] })
-	return arr
-}
-
 type fdEdge struct {
 	// function dependency = determinants -> dependencies
 	// determinants = from
 	// dependencies = to
-	from IntSet
-	to   IntSet
+	from FastIntSet
+	to   FastIntSet
 	// The value of the strict and eq bool forms the four kind of edges:
 	// functional dependency, lax functional dependency, strict equivalence constraint, lax equivalence constraint.
 	// And if there's a functional dependency `const` -> `column` exists. We would let the from side be empty.
 	strict bool
 	equiv  bool
-}
-
-func NewIntSet() IntSet {
-	return make(map[int]struct{})
 }
 
 type FDSet struct {
@@ -102,14 +21,14 @@ type FDSet struct {
 // A -> B  =  colSet -> { resultIntSet }
 // eg: considering closure F: {A-> CD, B -> E}, and input is {AB}
 // res: AB -> {CDE} (AB is included in trivial FD)
-func (s *FDSet) closureOf(colSet IntSet) IntSet {
-	resultSet := NewIntSet()
+func (s *FDSet) closureOf(colSet FastIntSet) FastIntSet {
+	resultSet := NewFastIntSet()
 	// self included.
-	resultSet.Union(colSet)
+	resultSet.UnionWith(colSet)
 	for i := 0; i < len(s.fdEdges); i++ {
 		fd := s.fdEdges[i]
 		if fd.strict && fd.from.SubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
-			resultSet.Union(fd.to)
+			resultSet.UnionWith(fd.to)
 			// If the closure is updated, we redo from the beginning.
 			i = -1
 		}
@@ -118,16 +37,16 @@ func (s *FDSet) closureOf(colSet IntSet) IntSet {
 }
 
 // inClosure is used to judge whether fd: setA -> setB can be inferred from closure s.
-func (s *FDSet) inClosure(setA, setB IntSet) bool {
-	currentClosure := NewIntSet()
+func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
+	currentClosure := NewFastIntSet()
 	// self included.
-	currentClosure.Union(setA)
+	currentClosure.UnionWith(setA)
 	for i := 0; i < len(s.fdEdges); i++ {
 		fd := s.fdEdges[i]
 		if fd.strict && fd.from.SubsetOf(currentClosure) && !fd.to.SubsetOf(currentClosure) {
 			// once fd.from is subset of setA, which means fd is part of our closure;
 			// when fd.to is not subset of setA itself, it means inference result is necessary to add; (closure extending)
-			currentClosure.Union(fd.to)
+			currentClosure.UnionWith(fd.to)
 			if setB.SubsetOf(currentClosure) {
 				return true
 			}
@@ -141,17 +60,17 @@ func (s *FDSet) inClosure(setA, setB IntSet) bool {
 // ReduceCols is used to minimize the determinants in one fd input.
 // function dependency = determinants -> dependencies
 // given: AB -> XY, once B can be inferred from current closure when inserting,  take A -> XY instead.
-func (s *FDSet) ReduceCols(colSet IntSet) IntSet {
+func (s *FDSet) ReduceCols(colSet FastIntSet) FastIntSet {
 	// Suppose the colSet is A and B, we have A --> B. Then we only need A since B' value is always determined by A.
-	var removed, result = NewIntSet(), NewIntSet()
+	var removed, result = NewFastIntSet(), NewFastIntSet()
 	result.CopyFrom(colSet)
-	for k, v := range colSet {
-		removed[k] = v
-		delete(result, k)
+	for k, ok := colSet.Next(0); ok; k, ok = colSet.Next(k + 1) {
+		removed.Insert(k)
+		result.Remove(k)
 		// If the removed one is not dependent with the result. We add the bit back.
 		if !s.inClosure(result, removed) {
-			delete(removed, k)
-			result[k] = v
+			removed.Remove(k)
+			result.Insert(k)
 		}
 	}
 	return result
@@ -159,7 +78,7 @@ func (s *FDSet) ReduceCols(colSet IntSet) IntSet {
 
 // AddStrictFunctionalDependency is to add functional dependency to the fdGraph, to reduce the edge number,
 // we limit the functional dependency when we insert into the set. The key code of insert is like the following codes.
-func (s *FDSet) AddStrictFunctionalDependency(from, to IntSet) {
+func (s *FDSet) AddStrictFunctionalDependency(from, to FastIntSet) {
 	// trivial FD, refused.
 	if to.SubsetOf(from) {
 		return
