@@ -1,7 +1,7 @@
-package function_dependency
+package functional_dependency
 
 type fdEdge struct {
-	// function dependency = determinants -> dependencies
+	// functional dependency = determinants -> dependencies
 	// determinants = from
 	// dependencies = to
 	from FastIntSet
@@ -21,6 +21,7 @@ type FDSet struct {
 // A -> B  =  colSet -> { resultIntSet }
 // eg: considering closure F: {A-> CD, B -> E}, and input is {AB}
 // res: AB -> {CDE} (AB is included in trivial FD)
+// The time complexity is O(n^2).
 func (s *FDSet) closureOf(colSet FastIntSet) FastIntSet {
 	resultSet := NewFastIntSet()
 	// self included.
@@ -37,6 +38,7 @@ func (s *FDSet) closureOf(colSet FastIntSet) FastIntSet {
 }
 
 // inClosure is used to judge whether fd: setA -> setB can be inferred from closure s.
+// It's a short-circuit version of the `closureOf`.
 func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
 	currentClosure := NewFastIntSet()
 	// self included.
@@ -59,7 +61,7 @@ func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
 
 // ReduceCols is used to minimize the determinants in one fd input.
 // function dependency = determinants -> dependencies
-// given: AB -> XY, once B can be inferred from current closure when inserting,  take A -> XY instead.
+// given: AB -> XY, once B can be inferred from current closure when inserting, take A -> XY instead.
 func (s *FDSet) ReduceCols(colSet FastIntSet) FastIntSet {
 	// Suppose the colSet is A and B, we have A --> B. Then we only need A since B' value is always determined by A.
 	var removed, result = NewFastIntSet(), NewFastIntSet()

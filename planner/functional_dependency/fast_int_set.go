@@ -1,15 +1,16 @@
-package function_dependency
+package functional_dependency
 
 import (
 	"bytes"
 	"fmt"
-	"golang.org/x/tools/container/intsets"
 	"math/bits"
+
+	"golang.org/x/tools/container/intsets"
 )
 
 const smallCutOff = 64
 
-// FastIntSet is wrapper of sparse with an optimization that number (0 ~ 63) can be cached for quick access.
+// FastIntSet is wrapper of sparse with an optimization that number [0 ~ 64) can be cached for quick access.
 // From the benchmark in fd_graph_test.go, we choose to use sparse to accelerate int set. And when the set
 // size is quite small we can just skip the block allocation in the sparse chain list.
 type FastIntSet struct {
@@ -178,7 +179,7 @@ func (s FastIntSet) Equals(rhs FastIntSet) bool {
 	if s.large != nil && rhs.large != nil {
 		return s.large.Equals(rhs.large)
 	}
-	// how come to this? eg: a set operates like: +1, +65, -65, resulting a large int-set with only small numbers.
+	// how come to this? eg: a set operates like: {insert:1, insert:65, remove:65}, resulting a large int-set with only small numbers.
 	// so we need calculate the exact numbers.
 	var excess bool
 	s1 := s.small
@@ -294,7 +295,7 @@ func (s FastIntSet) SubsetOf(rhs FastIntSet) bool {
 		// couldn't map s to small.
 		return false
 	}
-	// how come to this? eg: a set operates like: +1, +65, -65, resulting a large
+	// how come to this? eg: a set operates like: {insert:1, insert:65, remove:65}, resulting a large
 	// int-set with only small numbers.
 	return (s.small & rhs.small) == s.small
 }
