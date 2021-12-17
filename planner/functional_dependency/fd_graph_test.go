@@ -99,7 +99,7 @@ func TestFDSet_ClosureOf(t *testing.T) {
 	}
 	fd.fdEdges = append(fd.fdEdges, fe1, fe2, fe3, fe4)
 	// A -> ADEH
-	closure := fd.closureOf(NewFastIntSet(1)).SortedArray()
+	closure := fd.closureOfStrict(NewFastIntSet(1)).SortedArray()
 	ass.Equal(len(closure), 4)
 	ass.Equal(closure[0], 1)
 	ass.Equal(closure[1], 4)
@@ -107,7 +107,7 @@ func TestFDSet_ClosureOf(t *testing.T) {
 	ass.Equal(closure[3], 8)
 	// AB -> ABCDEFGH
 	fd.fdEdges = append(fd.fdEdges, fe1, fe2, fe3, fe4)
-	closure = fd.closureOf(NewFastIntSet(1, 2)).SortedArray()
+	closure = fd.closureOfStrict(NewFastIntSet(1, 2)).SortedArray()
 	ass.Equal(len(closure), 8)
 	ass.Equal(closure[0], 1)
 	ass.Equal(closure[1], 2)
@@ -338,3 +338,112 @@ func BenchmarkFastIntSet_Insert(b *testing.B) {
 // in computing the difference (bit | technically).
 //
 // From all above, we are in favour of sparse. sparse to store fast-int-set instead of using map.
+
+func TestFDSet_AddConstant(t *testing.T) {
+	t.Parallel()
+	ass := assert.New(t)
+
+	fd := FDSet{}
+	ass.Equal("()", fd.ConstantCols().String())
+
+	fd.AddConstants(NewFastIntSet(1, 2)) // {} --> {a,b}
+	ass.Equal(len(fd.fdEdges), 1)
+	ass.True(fd.fdEdges[0].strict)
+	ass.False(fd.fdEdges[0].equiv)
+	ass.Equal("()", fd.fdEdges[0].from.String())
+	ass.Equal("(1,2)", fd.fdEdges[0].to.String())
+	ass.Equal("(1,2)", fd.ConstantCols().String())
+
+	fd.AddConstants(NewFastIntSet(3)) // c, {} --> {a,b,c}
+	ass.Equal(len(fd.fdEdges), 1)
+	ass.True(fd.fdEdges[0].strict)
+	ass.False(fd.fdEdges[0].equiv)
+	ass.Equal("()", fd.fdEdges[0].from.String())
+	ass.Equal("(1-3)", fd.fdEdges[0].to.String())
+	ass.Equal("(1-3)", fd.ConstantCols().String())
+
+	fd.AddStrictFunctionalDependency(NewFastIntSet(3, 4), NewFastIntSet(5, 6)) // {c,d} --> {e,f}
+	ass.Equal(len(fd.fdEdges), 2)
+	ass.True(fd.fdEdges[0].strict)
+	ass.False(fd.fdEdges[0].equiv)
+	ass.Equal("()", fd.fdEdges[0].from.String())
+	ass.Equal("(1-3)", fd.fdEdges[0].to.String())
+	ass.Equal("(1-3)", fd.ConstantCols().String())
+	ass.True(fd.fdEdges[1].strict)
+	ass.False(fd.fdEdges[1].equiv)
+	ass.Equal("(4)", fd.fdEdges[1].from.String()) // determinant 3 reduced as constant, leaving FD {d} --> {f,g}.
+	ass.Equal("(5,6)", fd.fdEdges[1].to.String())
+
+	fd.AddLaxFunctionalDependency(NewFastIntSet(7), NewFastIntSet(5, 6)) // {g} ~~> {e,f}
+	ass.Equal(len(fd.fdEdges), 3)
+	ass.False(fd.fdEdges[2].strict)
+	ass.False(fd.fdEdges[2].equiv)
+	ass.Equal("(7)", fd.fdEdges[2].from.String())
+	ass.Equal("(5,6)", fd.fdEdges[2].to.String())
+
+	fd.AddConstants(NewFastIntSet(4)) // add d, {} --> {a,b,c,d}, and FD {d} --> {f,g} is transferred to constant closure.
+	ass.Equal(1, len(fd.fdEdges))     // => {} --> {a,b,c,d,e,f}, for lax FD {g} ~~> {e,f}, dependencies are constants, removed.
+	ass.True(fd.fdEdges[0].strict)
+	ass.False(fd.fdEdges[0].equiv)
+	ass.Equal("()", fd.fdEdges[0].from.String())
+	ass.Equal("(1-6)", fd.fdEdges[0].to.String())
+	ass.Equal("(1-6)", fd.ConstantCols().String())
+}
+
+func TestFDSet_AddEquivalence(t *testing.T) {
+	t.Parallel()
+	ass := assert.New(t)
+
+	fd := FDSet{}
+	ass.Equal(0, len(fd.EquivalenceCols()))
+
+	fd.AddEquivalence(NewFastIntSet(1), NewFastIntSet(2)) // {a} == {b}
+	ass.Equal(1, len(fd.fdEdges))                         // res: {a} == {b}
+	ass.Equal(1, len(fd.EquivalenceCols()))
+	ass.True(fd.fdEdges[0].strict)
+	ass.True(fd.fdEdges[0].equiv)
+	ass.Equal("(1,2)", fd.fdEdges[0].from.String())
+	ass.Equal("(1,2)", fd.fdEdges[0].to.String())
+	ass.Equal("(1,2)", fd.EquivalenceCols()[0].String())
+
+	fd.AddEquivalence(NewFastIntSet(3), NewFastIntSet(4)) // {c} == {d}
+	ass.Equal(2, len(fd.fdEdges))                         // res: {a,b} == {a,b}, {c,d} == {c,d}
+	ass.Equal(2, len(fd.EquivalenceCols()))
+	ass.True(fd.fdEdges[0].strict)
+	ass.True(fd.fdEdges[0].equiv)
+	ass.Equal("(1,2)", fd.fdEdges[0].from.String())
+	ass.Equal("(1,2)", fd.fdEdges[0].to.String())
+	ass.Equal("(1,2)", fd.EquivalenceCols()[0].String())
+	ass.True(fd.fdEdges[1].strict)
+	ass.True(fd.fdEdges[1].equiv)
+	ass.Equal("(3,4)", fd.fdEdges[1].from.String())
+	ass.Equal("(3,4)", fd.fdEdges[1].to.String())
+	ass.Equal("(3,4)", fd.EquivalenceCols()[1].String())
+
+	fd.AddConstants(NewFastIntSet(4, 5)) // {} --> {d,e}
+	ass.Equal(3, len(fd.fdEdges))        // res: {a,b} == {a,b}, {c,d} == {c,d},{} --> {c,d,e}
+	ass.True(fd.fdEdges[2].strict)       // explain: constant closure is extended by equivalence {c,d} == {c,d}
+	ass.False(fd.fdEdges[2].equiv)
+	ass.Equal("()", fd.fdEdges[2].from.String())
+	ass.Equal("(3-5)", fd.fdEdges[2].to.String())
+	ass.Equal("(3-5)", fd.ConstantCols().String())
+
+	fd.AddStrictFunctionalDependency(NewFastIntSet(2, 3), NewFastIntSet(5, 6)) // {b,c} --> {e,f}
+	ass.Equal(4, len(fd.fdEdges))                                              // res: {a,b} == {a,b}, {c,d} == {c,d},{} --> {c,d,e}, {b} --> {e,f}
+	ass.True(fd.fdEdges[3].strict)                                             // explain: strict FD's from side c is eliminated by constant closure.
+	ass.False(fd.fdEdges[3].equiv)
+	ass.Equal("(2)", fd.fdEdges[3].from.String())
+	ass.Equal("(5,6)", fd.fdEdges[3].to.String())
+
+	fd.AddEquivalence(NewFastIntSet(2), NewFastIntSet(3)) // {b} == {d}
+	// res: {a,b,c,d} == {a,b,c,d}, {} --> {a,b,c,d,e,f}
+	// explain:
+	// b = d build the connection between {a,b} == {a,b}, {c,d} == {c,d}, make the superset of equivalence closure.
+	// the superset equivalence closure extend the existed constant closure in turn, resulting {} --> {a,b,c,d,e}
+	// the superset constant closure eliminate existed strict FD, since determinants is constant, so the dependencies must be constant as well.
+	// so extending the current constant closure as to {} --> {a,b,c,d,e,f}
+	ass.Equal(2, len(fd.fdEdges))
+	ass.Equal(1, len(fd.EquivalenceCols()))
+	ass.Equal("(1-4)", fd.EquivalenceCols()[0].String())
+	ass.Equal("(1-6)", fd.ConstantCols().String())
+}

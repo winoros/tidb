@@ -33,6 +33,14 @@ func (s *FDSet) closureOfStrict(colSet FastIntSet) FastIntSet {
 			// If the closure is updated, we redo from the beginning.
 			i = -1
 		}
+		// why this? it is caused by our definition of equivalence as {superset} == {superset},
+		// which is also seen as {superset} --> {superset}. but when we compute the transitive
+		// closure, `fd.from.SubsetOf(resultSet)` is not transitive here. Actually, we can also
+		// see the equivalence as {single element} == {superset} / {single element} --> {superset}.
+		if fd.equiv && fd.from.ElementSubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
+			resultSet.UnionWith(fd.to)
+			i = -1
+		}
 	}
 	return resultSet
 }
@@ -43,13 +51,13 @@ func (s *FDSet) closureOfEquivalence(colSet FastIntSet) FastIntSet {
 	// self included.
 	resultSet.UnionWith(colSet)
 	for i := 0; i < len(s.fdEdges); i++ {
-		// Since there is only one super set of equivalence closure, we don't need to do transitive computation.
+		// equivalence is maintained as {superset} == {superset}, we don't need to do transitive computation.
+		// but they may multi equivalence closure, eg: {a,b}=={a,b}, {c,d} =={c,d}, when adding b=c, we need traverse them all.
 		fd := s.fdEdges[i]
 		if fd.equiv {
-			if fd.from.SubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
+			if fd.from.ElementSubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
 				resultSet.UnionWith(fd.to)
 			}
-			break
 		}
 	}
 	return resultSet
@@ -71,6 +79,17 @@ func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
 				return true
 			}
 			// If the closure is updated, we redo from the beginning.
+			i = -1
+		}
+		// why this? it is caused by our definition of equivalence as {superset} == {superset},
+		// which is also seen as {superset} --> {superset}. but when we compute the transitive
+		// closure, `fd.from.SubsetOf(resultSet)` is not transitive here. Actually, we can also
+		// see the equivalence as {single element} == {superset} / {single element} --> {superset}.
+		if fd.equiv && fd.from.ElementSubsetOf(currentClosure) && !fd.to.SubsetOf(currentClosure) {
+			currentClosure.UnionWith(fd.to)
+			if setB.SubsetOf(currentClosure) {
+				return true
+			}
 			i = -1
 		}
 	}
@@ -96,9 +115,25 @@ func (s *FDSet) ReduceCols(colSet FastIntSet) FastIntSet {
 	return result
 }
 
-// AddStrictFunctionalDependency is to add functional dependency to the fdGraph, to reduce the edge number,
-// we limit the functional dependency when we insert into the set. The key code of insert is like the following codes.
+// AddStrictFunctionalDependency is to add `STRICT` functional dependency to the fdGraph.
 func (s *FDSet) AddStrictFunctionalDependency(from, to FastIntSet) {
+	s.addFunctionalDependency(from, to, true, false)
+}
+
+// AddLaxFunctionalDependency is to add `LAX` functional dependency to the fdGraph.
+func (s *FDSet) AddLaxFunctionalDependency(from, to FastIntSet) {
+	s.addFunctionalDependency(from, to, false, false)
+}
+
+// addFunctionalDependency will add strict/lax functional dependency to the fdGraph.
+// eg:
+// CREATE TABLE t (a int key, b int, c int, d int, e int, UNIQUE (b,c))
+// strict FD: {a} --> {a,b,c,d,e} && lax FD: {b,c} --> {a,b,c,d,e} will be added.
+// stored FD: {a} --> {b,c,d,e} && lax FD: {b,c} --> {a,d,e} is determinant eliminated.
+//
+// To reduce the edge number, we limit the functional dependency when we insert into the
+// set. The key code of insert is like the following codes.
+func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool) {
 	// trivial FD, refused.
 	if to.SubsetOf(from) {
 		return
@@ -115,8 +150,8 @@ func (s *FDSet) AddStrictFunctionalDependency(from, to FastIntSet) {
 	newFD := &fdEdge{
 		from:   from,
 		to:     to,
-		strict: true,
-		equiv:  false,
+		strict: strict,
+		equiv:  equiv,
 	}
 
 	swapPointer := 0
@@ -259,7 +294,8 @@ func (s *FDSet) AddConstants(cons FastIntSet) {
 	}
 	// 1: {} --> {a}, {} --> {b}, when counting the closure, it will collect all constant FD if it has.
 	// 2: {m,n} --> {x, y}, once the m,n is subset of constant closure, x,y must be constant as well.
-	cols := s.closureOfStrict(cons) // 怎么没看 equiv 的闭包
+	// 3: {a,b,c} == {a,b,c}, equiv dependency is also strict FD included int the closure computation here.
+	cols := s.closureOfStrict(cons)
 	s.fdEdges = append(s.fdEdges, &fdEdge{to: cols.Copy(), strict: true})
 
 	// skip the last, newly append one.
@@ -316,6 +352,11 @@ func (e *fdEdge) isConstant() bool {
 	return e.from.IsEmpty()
 }
 
+// isEquivalence returns whether this FD indicates an equivalence FD which means {xyz...} == {xyz...}
+func (e *fdEdge) isEquivalence() bool {
+	return e.equiv && e.from.Equals(e.to)
+}
+
 // removeConstantColumnsToSide remove the constant columns from dependencies side of FDs in source.
 //
 // eg: {A} --> {B, C}
@@ -327,4 +368,25 @@ func (e *fdEdge) removeColumnsToSide(cons FastIntSet) bool {
 		e.to = e.to.Difference(cons)
 	}
 	return e.to.IsEmpty()
+}
+
+// ConstantCols returns the set of columns that will always have the same value for all rows in table.
+func (s *FDSet) ConstantCols() FastIntSet {
+	for i := 0; i < len(s.fdEdges); i++ {
+		if s.fdEdges[i].isConstant() {
+			return s.fdEdges[i].to
+		}
+	}
+	return FastIntSet{}
+}
+
+// EquivalenceCols returns the set of columns that are constrained to equal to each other.
+func (s *FDSet) EquivalenceCols() (eqs []*FastIntSet) {
+	for i := 0; i < len(s.fdEdges); i++ {
+		if s.fdEdges[i].isEquivalence() {
+			// return either side is the same.
+			eqs = append(eqs, &s.fdEdges[i].from)
+		}
+	}
+	return eqs
 }

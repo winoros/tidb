@@ -219,7 +219,7 @@ func (s FastIntSet) Difference(rhs FastIntSet) FastIntSet {
 }
 
 // DifferenceWith removes any elements in rhs from source.
-func (s FastIntSet) DifferenceWith(rhs FastIntSet) {
+func (s *FastIntSet) DifferenceWith(rhs FastIntSet) {
 	s.small &^= rhs.small
 	if s.large == nil {
 		return
@@ -280,6 +280,16 @@ func (s FastIntSet) Intersects(rhs FastIntSet) bool {
 		return false
 	}
 	return s.large.Intersects(rhs.toLarge())
+}
+
+// ElementSubsetOf is used to judge whether rhs contains at least one element of source set.
+func (s FastIntSet) ElementSubsetOf(rhs FastIntSet) bool {
+	for i, ok := s.Next(0); ok; i, ok = s.Next(i + 1) {
+		if NewFastIntSet(i).SubsetOf(rhs) {
+			return true
+		}
+	}
+	return false
 }
 
 // SubsetOf is used to judge whether rhs contains source set.
