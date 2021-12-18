@@ -327,7 +327,7 @@ func (s *FDSet) AddConstants(cons FastIntSet) {
 	}
 }
 
-// removeConstantsInFromSide remove the constant columns from determinant side of FDs in source.
+// removeColumnsFromSide remove the constant columns from determinant side of FDs in source.
 //
 // eg: {A B} --> {C}
 //
@@ -357,7 +357,7 @@ func (e *fdEdge) isEquivalence() bool {
 	return e.equiv && e.from.Equals(e.to)
 }
 
-// removeConstantColumnsToSide remove the constant columns from dependencies side of FDs in source.
+// removeColumnsToSide remove the constant columns from dependencies side of FDs in source.
 //
 // eg: {A} --> {B, C}
 //
