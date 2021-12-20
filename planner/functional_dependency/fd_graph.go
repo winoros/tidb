@@ -37,7 +37,7 @@ func (s *FDSet) closureOfStrict(colSet FastIntSet) FastIntSet {
 		// which is also seen as {superset} --> {superset}. but when we compute the transitive
 		// closure, `fd.from.SubsetOf(resultSet)` is not transitive here. Actually, we can also
 		// see the equivalence as {single element} == {superset} / {single element} --> {superset}.
-		if fd.equiv && fd.from.ElementSubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
+		if fd.equiv && fd.from.Intersects(resultSet) && !fd.to.SubsetOf(resultSet) {
 			resultSet.UnionWith(fd.to)
 			i = -1
 		}
@@ -55,7 +55,7 @@ func (s *FDSet) closureOfEquivalence(colSet FastIntSet) FastIntSet {
 		// but they may multi equivalence closure, eg: {a,b}=={a,b}, {c,d} =={c,d}, when adding b=c, we need traverse them all.
 		fd := s.fdEdges[i]
 		if fd.equiv {
-			if fd.from.ElementSubsetOf(resultSet) && !fd.to.SubsetOf(resultSet) {
+			if fd.from.Intersects(resultSet) && !fd.to.SubsetOf(resultSet) {
 				resultSet.UnionWith(fd.to)
 			}
 		}
@@ -85,7 +85,7 @@ func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
 		// which is also seen as {superset} --> {superset}. but when we compute the transitive
 		// closure, `fd.from.SubsetOf(resultSet)` is not transitive here. Actually, we can also
 		// see the equivalence as {single element} == {superset} / {single element} --> {superset}.
-		if fd.equiv && fd.from.ElementSubsetOf(currentClosure) && !fd.to.SubsetOf(currentClosure) {
+		if fd.equiv && fd.from.Intersects(currentClosure) && !fd.to.SubsetOf(currentClosure) {
 			currentClosure.UnionWith(fd.to)
 			if setB.SubsetOf(currentClosure) {
 				return true

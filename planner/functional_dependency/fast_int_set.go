@@ -282,16 +282,6 @@ func (s FastIntSet) Intersects(rhs FastIntSet) bool {
 	return s.large.Intersects(rhs.toLarge())
 }
 
-// ElementSubsetOf is used to judge whether rhs contains at least one element of source set.
-func (s FastIntSet) ElementSubsetOf(rhs FastIntSet) bool {
-	for i, ok := s.Next(0); ok; i, ok = s.Next(i + 1) {
-		if NewFastIntSet(i).SubsetOf(rhs) {
-			return true
-		}
-	}
-	return false
-}
-
 // SubsetOf is used to judge whether rhs contains source set.
 func (s FastIntSet) SubsetOf(rhs FastIntSet) bool {
 	if s.large == nil {
