@@ -17,7 +17,7 @@ type FDSet struct {
 	fdEdges []*fdEdge
 }
 
-// closureOf is to find strict fd closure of X with respect to F.
+// closureOfStrict is to find strict fd closure of X with respect to F.
 // A -> B  =  colSet -> { resultIntSet }
 // eg: considering closure F: {A-> CD, B -> E}, and input is {AB}
 // res: AB -> {CDE} (AB is included in trivial FD)
