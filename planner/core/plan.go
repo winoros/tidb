@@ -711,11 +711,6 @@ func (p *basePhysicalPlan) Children() []PhysicalPlan {
 // SetChildren implements LogicalPlan SetChildren interface.
 func (p *baseLogicalPlan) SetChildren(children ...LogicalPlan) {
 	p.children = children
-	fds := &fd.FDSet{}
-	for _, ch := range children {
-		fds.AddFrom(ch.extractFD())
-	}
-	p.fdSet = fds
 }
 
 // ChildrenCount returns the number of the children.
