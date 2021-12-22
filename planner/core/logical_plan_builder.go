@@ -42,6 +42,7 @@ import (
 	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/parser/opcode"
 	"github.com/pingcap/tidb/parser/terror"
+	fd "github.com/pingcap/tidb/planner/functional_dependency"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/privilege"
@@ -4242,6 +4243,55 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 	}
 
 	return result, nil
+}
+
+func (ds *DataSource) extractFD() *fd.FDSet {
+	// FD in datasource (leaf node) can be cached and reused.
+	if ds.fdSet == nil {
+		fds := &fd.FDSet{}
+		allCols := fd.NewFastIntSet()
+		// should use the column's unique ID avoiding fdSet conflict.
+		for _, col := range ds.TblCols {
+			// todo: change it to int64
+			allCols.Insert(int(col.UniqueID))
+		}
+		for _, idx := range ds.tableInfo.Indices {
+			keyCols := fd.NewFastIntSet()
+
+			// consider invisible index.
+			if !idx.Invisible {
+				continue
+			}
+			// consider prefix indexes.
+			allColIsNotNull := true
+			for _, idxCol := range idx.Columns {
+				if idxCol.Length != types.UnspecifiedLength {
+					// prefix indexes cannot be considered while building functional
+					// dependency keys for the table because their keys are only unique
+					// for a subset of the rows in the table.
+					continue
+				}
+				refCol := ds.tableInfo.Columns[idxCol.Offset]
+				if !mysql.HasNotNullFlag(refCol.Flag) {
+					allColIsNotNull = false
+				}
+				keyCols.Insert(int(ds.TblCols[idxCol.Offset].UniqueID))
+			}
+			if idx.Primary {
+				fds.AddStrictFunctionalDependency(keyCols, allCols)
+			} else if idx.Unique {
+				if allColIsNotNull {
+					fds.AddStrictFunctionalDependency(keyCols, allCols)
+				} else {
+					fds.AddLaxFunctionalDependency(keyCols, allCols)
+				}
+			} else {
+				fds.AddLaxFunctionalDependency(keyCols, allCols)
+			}
+		}
+		ds.fdSet = fds
+	}
+	return ds.fdSet
 }
 
 func (b *PlanBuilder) timeRangeForSummaryTable() QueryTimeRange {

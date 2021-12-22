@@ -377,12 +377,20 @@ type baseLogicalPlan struct {
 	self         LogicalPlan
 	maxOneRow    bool
 	children     []LogicalPlan
-	fdSet        *fd.FDSet
+	// fdSet is a set of functional dependencies(FDs) which powers many optimizations,
+	// including eliminating unnecessary DISTINCT operators, simplifying ORDER BY columns,
+	// removing Max1Row operators, and mapping semi-joins to inner-joins.
+	// for now, it's hard to maintain in individual operator, build it from bottom up when using.
+	fdSet *fd.FDSet
 }
 
 // extractFD return the children[0]'s fdSet if there are no adding/removing fd in this logic plan.
 func (p *baseLogicalPlan) extractFD() *fd.FDSet {
-	return p.children[0].extractFD()
+	fds := &fd.FDSet{}
+	for _, ch := range p.children {
+		fds.AddFrom(ch.extractFD())
+	}
+	return fds
 }
 
 func (p *baseLogicalPlan) MaxOneRow() bool {
@@ -703,6 +711,11 @@ func (p *basePhysicalPlan) Children() []PhysicalPlan {
 // SetChildren implements LogicalPlan SetChildren interface.
 func (p *baseLogicalPlan) SetChildren(children ...LogicalPlan) {
 	p.children = children
+	fds := &fd.FDSet{}
+	for _, ch := range children {
+		fds.AddFrom(ch.extractFD())
+	}
+	p.fdSet = fds
 }
 
 // ChildrenCount returns the number of the children.
