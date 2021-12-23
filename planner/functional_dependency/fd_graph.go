@@ -158,8 +158,8 @@ func (s *FDSet) AddLaxFunctionalDependency(from, to FastIntSet) {
 // addFunctionalDependency will add strict/lax functional dependency to the fdGraph.
 // eg:
 // CREATE TABLE t (a int key, b int, c int, d int, e int, UNIQUE (b,c))
-// strict FD: {a} --> {a,b,c,d,e} && lax FD: {b,c} --> {a,b,c,d,e} will be added.
-// stored FD: {a} --> {b,c,d,e} && lax FD: {b,c} --> {a,d,e} is determinant eliminated.
+// strict FD: {a} --> {a,b,c,d,e} && lax FD: {b,c} ~~> {a,b,c,d,e} will be added.
+// stored FD: {a} --> {b,c,d,e} && lax FD: {b,c} ~~> {a,d,e} is determinant eliminated.
 //
 // To reduce the edge number, we limit the functional dependency when we insert into the
 // set. The key code of insert is like the following codes.
@@ -357,7 +357,7 @@ func (s *FDSet) AddConstants(cons FastIntSet) {
 	}
 }
 
-// removeColumnsFromSide remove the constant columns from determinant side of FDs in source.
+// removeColumnsFromSide remove the columns from determinant side of FDs in source.
 //
 // eg: {A B} --> {C}
 //
@@ -387,7 +387,7 @@ func (e *fdEdge) isEquivalence() bool {
 	return e.equiv && e.from.Equals(e.to)
 }
 
-// removeColumnsToSide remove the constant columns from dependencies side of FDs in source.
+// removeColumnsToSide remove the columns from dependencies side of FDs in source.
 //
 // eg: {A} --> {B, C}
 //
@@ -527,10 +527,172 @@ func (s *FDSet) MaxOneRow(cols FastIntSet) {
 }
 
 // ProjectCols projects FDSet to the target columns
+// Formula:
+// Strict decomposition FD4A: If X −→ Y Z then X −→ Y and X −→ Z.
+// Lax decomposition FD4B: If X ~→ Y Z and I(R) is Y -definite then X ~→ Z.
 func (s *FDSet) ProjectCols(cols FastIntSet) {
-	// do nothing here, once a col is projected out in some operator, it's coloured grey in the paper.
-	// but it's still can be used to compute the transitive closure. for example:
-	// {a} --> {b}, {b} --> {c}
-	// in this FDSet, {a} --> {b,c}, which means a can determine c, and we should do some re-computation
-	// to maintain this after b is `deleted` from the FDSet. Just keep it here.
+	// **************************************** START LOOP 1 ********************************************
+	// Ensure the transitive relationship between remaining columns won't be lost.
+	// 1: record all the constant columns
+	// 2: if an FD's to side contain un-projected column, substitute it with its closure.
+	// 		fd1: {a} --> {b,c}
+	//	    fd2: {b} --> {d}
+	//      when b is un-projected, the fd1 should be {a} --> {b,c's closure} which is {a} --> {b,c,d}
+	// 3: track all columns that have equivalent alternates that are part of the projection.
+	//		fd1: {a} --> {c}
+	//      fd2: {a,b} == {a,b}
+	//      if only a is un-projected, the fd1 can actually be kept as {b} --> {c}.
+	var constCols, detCols, equivCols FastIntSet
+	for i := 0; i < len(s.fdEdges); i++ {
+		fd := s.fdEdges[i]
+
+		if fd.isConstant() {
+			constCols = fd.to
+		}
+
+		if !fd.to.SubsetOf(cols) {
+			// equivalence FD has been the closure as {superset} == {superset}.
+			if !fd.equiv && fd.strict {
+				fd.to = s.closureOfStrict(fd.to)
+				fd.to.DifferenceWith(fd.from)
+			}
+		}
+
+		// {a,b} --> {c}, when b is un-projected, this FD should be handled latter, recording `b` here.
+		if !fd.equiv && !fd.from.SubsetOf(cols) {
+			detCols.UnionWith(fd.from.Difference(cols))
+		}
+
+		// equivalence {superset} == {superset}
+		if fd.equiv && fd.from.Intersects(cols) {
+			equivCols.UnionWith(fd.from)
+		}
+	}
+	// ****************************************** END LOOP 1 ********************************************
+
+	// find deleted columns with equivalence.
+	detCols.IntersectionWith(equivCols)
+	equivMap := s.makeEquivMap(detCols, cols)
+
+	// it's actually maintained already.
+	if !constCols.IsEmpty() {
+		s.AddConstants(constCols)
+	}
+
+	// **************************************** START LOOP 2 ********************************************
+	// leverage the information collected in the loop1 above and try to do some FD substitution.
+	var (
+		cnt    int
+		newFDs []*fdEdge
+	)
+	for i := range s.fdEdges {
+		fd := s.fdEdges[i]
+
+		// step1: clear the `to` side
+		// subtract out un-projected columns from dependants.
+		// subtract out strict constant columns from dependants.
+		if !fd.to.SubsetOf(cols) {
+			// since loop 1 has computed the complete transitive closure for strict FD, now as:
+			// 1: equivalence FD: {superset} == {superset}
+			// 2: strict FD: {xxx} --> {complete closure}
+			// 3: lax FD: {xxx} ~~> {yyy}
+			if fd.equiv {
+				// As formula FD4A above, delete from un-projected column from `to` side directly.
+				fd.to = fd.to.Intersection(cols)
+				// Since from are the same, delete it too here.
+				fd.from = fd.from.Intersection(cols)
+			} else if fd.strict {
+				// As formula FD4A above, delete from un-projected column from `to` side directly.
+				fd.to = fd.to.Intersection(cols)
+			} else {
+				// As formula FD4B above, only if the deleted columns are definite, then we can keep it.
+				deletedCols := fd.to.Difference(cols)
+				if deletedCols.SubsetOf(constCols) {
+					fd.to = fd.to.Intersection(cols)
+				} else {
+					continue
+				}
+			}
+
+			if !fd.isConstant() {
+				// clear the constant columns in the dependency of FD.
+				if fd.removeColumnsToSide(constCols) {
+					continue
+				}
+			}
+			if fd.removeColumnsToSide(fd.from) {
+				// fd.to side is empty, remove this FD.
+				continue
+			}
+		}
+
+		// step2: clear the `from` side
+		// substitute the equivalence columns for removed determinant columns.
+		if !fd.from.SubsetOf(cols) {
+			// equivalence and constant FD couldn't be here.
+			deletedCols := fd.from.Difference(cols)
+			substitutedCols := NewFastIntSet()
+			foundAll := true
+			for c, ok := deletedCols.Next(0); ok; c, ok = deletedCols.Next(c + 1) {
+				// For every un-projected column, try to found their substituted column in projection list.
+				var id int
+				if id, foundAll = equivMap[c]; !foundAll {
+					break
+				}
+				substitutedCols.Insert(id)
+			}
+			if foundAll {
+				// deleted columns can be remapped using equivalencies.
+				from := fd.from.Union(substitutedCols)
+				from.DifferenceWith(deletedCols)
+				newFDs = append(newFDs, &fdEdge{
+					from:   from,
+					to:     fd.to,
+					strict: fd.strict,
+					equiv:  fd.equiv,
+				})
+			}
+			continue
+		}
+
+		if cnt != i {
+			s.fdEdges[cnt] = s.fdEdges[i]
+		}
+		cnt++
+	}
+	s.fdEdges = s.fdEdges[:cnt]
+	// ****************************************** END LOOP 2 ********************************************
+
+	for i := range newFDs {
+		fd := newFDs[i]
+		if fd.equiv {
+			s.addEquivalence(fd.from)
+		} else if fd.isConstant() {
+			s.AddConstants(fd.to)
+		} else if fd.strict {
+			s.AddStrictFunctionalDependency(fd.from, fd.to)
+		} else {
+			s.AddLaxFunctionalDependency(fd.from, fd.to)
+		}
+	}
+}
+
+// makeEquivMap try to find the equivalence column of every deleted column in the project list.
+func (s *FDSet) makeEquivMap(detCols, projectedCols FastIntSet) map[int]int {
+	var equivMap map[int]int
+	for i, ok := detCols.Next(0); ok; i, ok = detCols.Next(i + 1) {
+		var oneCol FastIntSet
+		oneCol.Insert(i)
+		closure := s.closureOfEquivalence(oneCol)
+		closure.IntersectionWith(projectedCols)
+		// the column to be deleted has an equivalence column exactly in the project list.
+		if !closure.IsEmpty() {
+			if equivMap == nil {
+				equivMap = make(map[int]int)
+			}
+			id, _ := closure.Next(0)
+			equivMap[i] = id
+		}
+	}
+	return equivMap
 }
