@@ -1,5 +1,11 @@
 package functional_dependency
 
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 type fdEdge struct {
 	// functional dependency = determinants -> dependencies
 	// determinants = from
@@ -15,6 +21,11 @@ type fdEdge struct {
 
 type FDSet struct {
 	fdEdges []*fdEdge
+	// NotNullCols is used to record the columns with not-null attributes applied.
+	// eg: {1} ~~> {2,3}, when {2,3} not null is applied, it actually does nothing.
+	// but we should record {2,3} as not-null down for the convenience of transferring
+	// Lax FD: {1} ~~> {2,3} to strict FD: {1} --> {2,3} with {1} as not-null next time.
+	NotNullCols FastIntSet
 }
 
 // closureOfStrict is to find strict fd closure of X with respect to F.
@@ -171,7 +182,7 @@ func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool)
 
 	// exclude the intersection part.
 	if to.Intersects(from) {
-		to.Difference(from)
+		to.DifferenceWith(from)
 	}
 
 	// reduce the determinants.
@@ -227,8 +238,25 @@ func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool)
 // implies is used to shrink the edge size, keeping the minimum of the functional dependency set size.
 func (e *fdEdge) implies(otherEdge *fdEdge) bool {
 	// The given one's from should be larger than the current one and the current one's to should be larger than the given one.
-	// A --> C is stronger than AB --> C
-	// A --> BC is stronger than A --> C.
+	// STRICT FD:
+	// A --> C is stronger than AB --> C. --- YES
+	// A --> BC is stronger than A --> C. --- YES
+	//
+	// LAX FD:
+	// 1: A ~~> C is stronger than AB ~~> C. --- YES
+	// 2: A ~~> BC is stronger than A ~~> C. --- NO
+	// The precondition for 2 to be strict FD is much easier to satisfied than 1, only to
+	// need {a,c} is not null. So we couldn't merge this two to be one lax FD.
+	// but for strict/equiv FD implies lax FD, 1 & 2 is implied both reasonably.
+	lhsIsLax := !e.equiv && !e.strict
+	rhsIsLax := !otherEdge.equiv && !otherEdge.strict
+	if lhsIsLax && rhsIsLax {
+		if e.from.SubsetOf(otherEdge.from) && e.to.Equals(otherEdge.to) {
+			return true
+		} else {
+			return false
+		}
+	}
 	if e.from.SubsetOf(otherEdge.from) && otherEdge.to.SubsetOf(e.to) {
 		// The given one should be weaker than the current one.
 		// So the given one should not be more strict than the current one.
@@ -236,6 +264,10 @@ func (e *fdEdge) implies(otherEdge *fdEdge) bool {
 		if (e.strict || !otherEdge.strict) && (e.equiv || !otherEdge.equiv) {
 			return true
 		}
+		// 1: e.strict   + e.equiv       => e > o
+		// 2: e.strict   + !o.equiv      => e >= o
+		// 3: !o.strict  + e.equiv       => e > o
+		// 4: !o.strict  + !o.equiv      => o.lax
 	}
 	return false
 }
@@ -425,19 +457,22 @@ func (s *FDSet) EquivalenceCols() (eqs []*FastIntSet) {
 // Most of the case is used in the derived process after predicate evaluation,
 // which can upgrade lax FDs to strict ones.
 func (s *FDSet) MakeNotNull(notNullCols FastIntSet) {
+	notNullCols.UnionWith(s.NotNullCols)
+	notNullColsSet := s.closureOfEquivalence(notNullCols)
 	for i := 0; i < len(s.fdEdges); i++ {
 		fd := s.fdEdges[i]
 		if fd.strict {
 			continue
 		}
-		// lax can be made strict if all determinant columns are not null.
-		if fd.from.SubsetOf(notNullCols) {
-			// we don't need to clean the old lax one.
+		// lax can be made strict if all determinant & dependency columns are not null.
+		if fd.from.SubsetOf(notNullColsSet) && fd.to.SubsetOf(notNullColsSet) {
+			s.fdEdges = append(s.fdEdges[:i], s.fdEdges[i+1:]...)
 			s.AddStrictFunctionalDependency(fd.from, fd.to)
 			// add strict FDs will cause reconstruction of FDSet, re-traverse it.
 			i = -1
 		}
 	}
+	s.NotNullCols = notNullColsSet
 }
 
 // MakeCartesianProduct records fdSet after the impact of Cartesian Product of (T1 x T2) is made.
@@ -609,6 +644,8 @@ func (s *FDSet) ProjectCols(cols FastIntSet) {
 				deletedCols := fd.to.Difference(cols)
 				if deletedCols.SubsetOf(constCols) {
 					fd.to = fd.to.Intersection(cols)
+				} else if deletedCols.SubsetOf(s.NotNullCols) {
+					fd.to = fd.to.Intersection(cols)
 				} else {
 					continue
 				}
@@ -695,4 +732,35 @@ func (s *FDSet) makeEquivMap(detCols, projectedCols FastIntSet) map[int]int {
 		}
 	}
 	return equivMap
+}
+
+// String returns format string of this FDSet.
+func (s *FDSet) String() string {
+	var builder strings.Builder
+
+	for i := range s.fdEdges {
+		if i != 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(s.fdEdges[i].String())
+	}
+	return builder.String()
+}
+
+// String returns format string of this FD.
+func (e *fdEdge) String() string {
+	var b strings.Builder
+	if e.equiv {
+		if !e.strict {
+			panic(errors.New("lax equivalent columns are not supported"))
+		}
+		_, _ = fmt.Fprintf(&b, "%s==%s", e.from, e.to)
+	} else {
+		if e.strict {
+			_, _ = fmt.Fprintf(&b, "%s-->%s", e.from, e.to)
+		} else {
+			_, _ = fmt.Fprintf(&b, "%s~~>%s", e.from, e.to)
+		}
+	}
+	return b.String()
 }
