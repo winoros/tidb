@@ -1772,7 +1772,7 @@ func (e *tableStorageStatsRetriever) setDataForTableStorageStats(ctx sessionctx.
 	for e.curTable < len(e.initialTables) && count < 1024 {
 		table := e.initialTables[e.curTable]
 		tableID := table.ID
-		err := e.helper.GetPDRegionStats(tableID, &e.stats)
+		err := e.helper.GetPDRegionStats(tableID, &e.stats, false)
 		if err != nil {
 			return nil, err
 		}
