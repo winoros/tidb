@@ -4257,20 +4257,11 @@ func (ds *DataSource) extractFD() *fd.FDSet {
 		}
 		for _, idx := range ds.tableInfo.Indices {
 			keyCols := fd.NewFastIntSet()
-
-			// consider invisible index.
-			if !idx.Invisible {
-				continue
-			}
-			// consider prefix indexes.
 			allColIsNotNull := true
 			for _, idxCol := range idx.Columns {
-				if idxCol.Length != types.UnspecifiedLength {
-					// prefix indexes cannot be considered while building functional
-					// dependency keys for the table because their keys are only unique
-					// for a subset of the rows in the table.
-					continue
-				}
+				// Note: even the prefix column can also be the FD. For example:
+				// unique(char_column(10)), will also guarantee the prefix to be
+				// the unique which means the while column is unique too.
 				refCol := ds.tableInfo.Columns[idxCol.Offset]
 				if !mysql.HasNotNullFlag(refCol.Flag) {
 					allColIsNotNull = false
@@ -4279,9 +4270,11 @@ func (ds *DataSource) extractFD() *fd.FDSet {
 			}
 			if idx.Primary {
 				fds.AddStrictFunctionalDependency(keyCols, allCols)
+				fds.MakeNotNull(keyCols)
 			} else if idx.Unique {
 				if allColIsNotNull {
 					fds.AddStrictFunctionalDependency(keyCols, allCols)
+					fds.MakeNotNull(keyCols)
 				} else {
 					fds.AddLaxFunctionalDependency(keyCols, allCols)
 				}

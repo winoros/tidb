@@ -19,6 +19,8 @@ type fdEdge struct {
 	equiv  bool
 }
 
+// FDSet is the main portal of functional dependency, it stores the relationship between (extended table/ physical table)'s
+// columns. For more theory about this design, ref the head comments in the functional_dependency/doc.go.
 type FDSet struct {
 	fdEdges []*fdEdge
 	// NotNullCols is used to record the columns with not-null attributes applied.
@@ -466,7 +468,8 @@ func (s *FDSet) MakeNotNull(notNullCols FastIntSet) {
 		}
 		// lax can be made strict if all determinant & dependency columns are not null.
 		if fd.from.SubsetOf(notNullColsSet) && fd.to.SubsetOf(notNullColsSet) {
-			s.fdEdges = append(s.fdEdges[:i], s.fdEdges[i+1:]...)
+			// we don't need to clean the old lax FD because when adding the corresponding strict one, the lax
+			// one will be implied by that and itself is removed.
 			s.AddStrictFunctionalDependency(fd.from, fd.to)
 			// add strict FDs will cause reconstruction of FDSet, re-traverse it.
 			i = -1
