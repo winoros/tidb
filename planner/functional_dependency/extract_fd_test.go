@@ -45,7 +45,30 @@ func TestFDSet_ExtractFD(t *testing.T) {
 		{
 			sql:  "select a from t1",
 			best: "DataScan(t1)->Projection",
-			fd:   "",
+			fd:   "{} >>> {(1)-->(2,3), (2,3)~~>(1)}",
+		},
+		{
+			sql:  "select a,b from t1",
+			best: "DataScan(t1)->Projection",
+			fd:   "{(1)-->(2)} >>> {(1)-->(2,3), (2,3)~~>(1)}",
+		},
+		{
+			sql:  "select a,c,b+1 from t1",
+			best: "DataScan(t1)->Projection",
+			// 4 is the extended column from (b+1) determined by b, also determined by a.
+			fd: "{(1)-->(3,4)} >>> {(1)-->(2,3), (2,3)~~>(1)}",
+		},
+		{
+			sql:  "select a,b+1,c+b from t1",
+			best: "DataScan(t1)->Projection",
+			// 4, 5 is the extended column from (b+1),(c+b) determined by b,c, also determined by a.
+			fd: "{(1)-->(4,5)} >>> {(1)-->(2,3), (2,3)~~>(1)}",
+		},
+		{
+			sql:  "select a,a+b,1 from t1",
+			best: "DataScan(t1)->Projection",
+			// 4 is the extended column from (b+1) determined by b, also determined by a.
+			fd: "{(1)-->(4), ()-->(5)} >>> {(1)-->(2,3), (2,3)~~>(1)}",
 		},
 	}
 
@@ -55,6 +78,8 @@ func TestFDSet_ExtractFD(t *testing.T) {
 		comment := fmt.Sprintf("case:%v sql:%s", i, tt.sql)
 		stmt, err := par.ParseOneStmt(tt.sql, "", "")
 		ass.Nil(err, comment)
+		tk.Session().GetSessionVars().PlanID = 0
+		tk.Session().GetSessionVars().PlanColumnID = 0
 		err = plannercore.Preprocess(tk.Session(), stmt, plannercore.WithPreprocessorReturn(&plannercore.PreprocessorReturn{InfoSchema: is}))
 		ass.Nil(err)
 		builder, _ := plannercore.NewPlanBuilder().Init(tk.Session(), is, &hint.BlockHintProcessor{})
@@ -63,6 +88,8 @@ func TestFDSet_ExtractFD(t *testing.T) {
 		p, err = plannercore.LogicalOptimize(ctx, builder.GetOptFlag(), p.(plannercore.LogicalPlan))
 		ass.Nil(err)
 		ass.Equal(plannercore.ToString(p), tt.best, comment)
-		ass.Equal(p.(plannercore.LogicalPlan).ExtractFD().String(), "")
+		// extract FD to every OP
+		p.(plannercore.LogicalPlan).ExtractFD()
+		ass.Equal(tt.fd, plannercore.FDToString(p.(plannercore.LogicalPlan)), comment)
 	}
 }

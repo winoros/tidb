@@ -316,7 +316,7 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
-	outputColsUniqueIDsArray := make([]int, len(p.Schema().Columns))
+	outputColsUniqueIDsArray := make([]int, 0, len(p.Schema().Columns))
 	// here schema extended columns may contain expr, const and column allocated with uniqueID.
 	for _, one := range p.Schema().Columns {
 		outputColsUniqueIDs.Insert(int(one.UniqueID))
@@ -371,6 +371,8 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	// since the distinct attribute is built as firstRow agg func, we don't need to think about it here.
 	fds.MakeNotNull(notnullColsUniqueIDs)
 	fds.ProjectCols(outputColsUniqueIDs)
+	// just trace it down in every operator for test checking.
+	p.fdSet = fds
 	return fds
 }
 
@@ -488,6 +490,8 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 			fds.AddStrictFunctionalDependency(groupByColsUniqueIDs, outputColsUniqueIDs)
 		}
 	}
+	// just trace it down in every operator for test checking.
+	la.fdSet = fds
 	return fds
 }
 
@@ -691,6 +695,8 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 		fds.AddEquivalence(equiv[0], equiv[1])
 	}
 	fds.ProjectCols(outputColsUniqueIDs)
+	// just trace it down in every operator for test checking.
+	p.fdSet = fds
 	return fds
 }
 

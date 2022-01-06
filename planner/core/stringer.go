@@ -28,6 +28,12 @@ func ToString(p Plan) string {
 	return strings.Join(strs, "->")
 }
 
+// FDToString explains fd transfer over a Plan, returns description string.
+func FDToString(p LogicalPlan) string {
+	strs, _ := fdToString(p, []string{}, []int{})
+	return strings.Join(strs, " >>> ")
+}
+
 func needIncludeChildrenString(plan Plan) bool {
 	switch x := plan.(type) {
 	case *LogicalUnionAll, *PhysicalUnionAll, *LogicalPartitionUnionAll:
@@ -41,6 +47,25 @@ func needIncludeChildrenString(plan Plan) bool {
 	default:
 		return false
 	}
+}
+
+func fdToString(in LogicalPlan, strs []string, idxs []int) ([]string, []int) {
+	switch x := in.(type) {
+	case *LogicalProjection:
+		strs = append(strs, "{"+x.fdSet.String()+"}")
+		for i := 0; i < x.ChildrenCount(); i++ {
+			strs, idxs = fdToString(x.GetChild(i), strs, idxs)
+		}
+	case *LogicalAggregation:
+		strs = append(strs, "{"+x.fdSet.String()+"}")
+		for i := 0; i < x.ChildrenCount(); i++ {
+			strs, idxs = fdToString(x.GetChild(i), strs, idxs)
+		}
+	case *DataSource:
+		strs = append(strs, "{"+x.fdSet.String()+"}")
+	default:
+	}
+	return strs, idxs
 }
 
 func toString(in Plan, strs []string, idxs []int) ([]string, []int) {

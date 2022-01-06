@@ -4248,13 +4248,25 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 func (ds *DataSource) ExtractFD() *fd.FDSet {
 	// FD in datasource (leaf node) can be cached and reused.
 	if ds.fdSet == nil {
-		fds := &fd.FDSet{}
+		fds := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
 		allCols := fd.NewFastIntSet()
 		// should use the column's unique ID avoiding fdSet conflict.
 		for _, col := range ds.TblCols {
 			// todo: change it to int64
 			allCols.Insert(int(col.UniqueID))
 		}
+		// int pk doesn't store its index column in indexInfo.
+		if ds.tableInfo.PKIsHandle {
+			keyCols := fd.NewFastIntSet()
+			for _, col := range ds.TblCols {
+				if mysql.HasPriKeyFlag(col.RetType.Flag) {
+					keyCols.Insert(int(col.UniqueID))
+				}
+			}
+			fds.AddStrictFunctionalDependency(keyCols, allCols)
+			fds.MakeNotNull(keyCols)
+		}
+		// other indices including common handle.
 		for _, idx := range ds.tableInfo.Indices {
 			keyCols := fd.NewFastIntSet()
 			allColIsNotNull := true
