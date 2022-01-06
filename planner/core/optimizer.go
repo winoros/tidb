@@ -375,6 +375,11 @@ func enableParallelApply(sctx sessionctx.Context, plan PhysicalPlan) PhysicalPla
 	return plan
 }
 
+// LogicalOptimize is just exported for test.
+func LogicalOptimize(ctx context.Context, flag uint64, logic LogicalPlan) (LogicalPlan, error) {
+	return logicalOptimize(ctx, flag, logic)
+}
+
 func logicalOptimize(ctx context.Context, flag uint64, logic LogicalPlan) (LogicalPlan, error) {
 	opt := defaultLogicalOptimizeOption()
 	vars := logic.SCtx().GetSessionVars()

@@ -166,6 +166,161 @@ func extractColumns(result []*Column, expr Expression, filter func(*Column) bool
 	return result
 }
 
+func ExtractEquivalenceColumns(result [][]interface{}, exprs []Expression) [][]interface{} {
+	for _, expr := range exprs {
+		result = extractEquivalenceColumns(result, expr)
+	}
+	return result
+}
+
+func extractEquivalenceColumns(result [][]interface{}, expr Expression) [][]interface{} {
+	switch v := expr.(type) {
+	case *ScalarFunction:
+		if v.FuncName.L == ast.EQ {
+			args := v.GetArgs()
+			if len(args) == 2 {
+				col1, ok1 := args[0].(*Column)
+				col2, ok2 := args[1].(*Column)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col1, col2})
+				}
+				col, ok1 := args[0].(*Column)
+				scl, ok2 := args[1].(*ScalarFunction)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col, scl})
+				}
+				col, ok1 = args[1].(*Column)
+				scl, ok2 = args[0].(*ScalarFunction)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col, scl})
+				}
+			}
+			return result
+		}
+		if v.FuncName.L == ast.In {
+			args := v.GetArgs()
+			// only `col in (only 1 element)`, can we build an equivalence here.
+			if len(args[1:]) == 1 {
+				col1, ok1 := args[0].(*Column)
+				col2, ok2 := args[1].(*Column)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col1, col2})
+				}
+				col, ok1 := args[0].(*Column)
+				scl, ok2 := args[1].(*ScalarFunction)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col, scl})
+				}
+				col, ok1 = args[1].(*Column)
+				scl, ok2 = args[0].(*ScalarFunction)
+				if ok1 && ok2 {
+					result = append(result, []interface{}{col, scl})
+				}
+			}
+			return result
+		}
+		// For Non-EQ function, traverse down.
+		for _, arg := range v.GetArgs() {
+			result = extractEquivalenceColumns(result, arg)
+		}
+	}
+	return result
+}
+
+func ExtractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface{}, exprs []Expression) []interface{} {
+	for _, expr := range exprs {
+		result = extractConstantEqColumnsOrScalar(ctx, result, expr)
+	}
+	return result
+}
+
+func extractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface{}, expr Expression) []interface{} {
+	switch v := expr.(type) {
+	case *ScalarFunction:
+		if v.FuncName.L == ast.EQ || v.FuncName.L == ast.NullEQ {
+			args := v.GetArgs()
+			if len(args) == 2 {
+				col, ok1 := args[0].(*Column)
+				_, ok2 := args[1].(*Constant)
+				if ok1 && ok2 {
+					result = append(result, col)
+				}
+				col, ok1 = args[1].(*Column)
+				_, ok2 = args[0].(*Constant)
+				if ok1 && ok2 {
+					result = append(result, col)
+				}
+				// take the correlated column as constant here.
+				col, ok1 = args[0].(*Column)
+				_, ok2 = args[1].(*CorrelatedColumn)
+				if ok1 && ok2 {
+					result = append(result, col)
+				}
+				col, ok1 = args[1].(*Column)
+				_, ok2 = args[0].(*CorrelatedColumn)
+				if ok1 && ok2 {
+					result = append(result, col)
+				}
+				scl, ok1 := args[0].(*ScalarFunction)
+				_, ok2 = args[1].(*Constant)
+				if ok1 && ok2 {
+					result = append(result, scl)
+				}
+				scl, ok1 = args[1].(*ScalarFunction)
+				_, ok2 = args[0].(*Constant)
+				if ok1 && ok2 {
+					result = append(result, scl)
+				}
+				// take the correlated column as constant here.
+				scl, ok1 = args[0].(*ScalarFunction)
+				_, ok2 = args[1].(*CorrelatedColumn)
+				if ok1 && ok2 {
+					result = append(result, scl)
+				}
+				scl, ok1 = args[1].(*ScalarFunction)
+				_, ok2 = args[0].(*CorrelatedColumn)
+				if ok1 && ok2 {
+					result = append(result, scl)
+				}
+			}
+			return result
+		}
+		if v.FuncName.L == ast.In {
+			args := v.GetArgs()
+			allArgsIsConst := true
+			// only `col in (all same const)`, can col be the constant column.
+			// eg: where a in (1, '2').
+			guard := args[1]
+			for i, v := range args[1:] {
+				if _, ok := v.(*Constant); !ok {
+					allArgsIsConst = false
+					break
+				}
+				if i == 0 {
+					continue
+				}
+				if !guard.Equal(ctx, v) {
+					allArgsIsConst = false
+					break
+				}
+			}
+			if allArgsIsConst {
+				if col, ok := args[0].(*Column); ok {
+					result = append(result, col)
+				} else if scl, ok := args[0].(*ScalarFunction); ok {
+					result = append(result, scl)
+				}
+			}
+			return result
+		}
+		// For Non-EQ function, traverse down.
+		for _, arg := range v.GetArgs() {
+			result = extractConstantEqColumnsOrScalar(ctx, result, arg)
+		}
+	}
+	return result
+}
+
 // ExtractColumnSet extracts the different values of `UniqueId` for columns in expressions.
 func ExtractColumnSet(exprs []Expression) *intsets.Sparse {
 	set := &intsets.Sparse{}

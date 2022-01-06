@@ -28,6 +28,10 @@ type FDSet struct {
 	// but we should record {2,3} as not-null down for the convenience of transferring
 	// Lax FD: {1} ~~> {2,3} to strict FD: {1} --> {2,3} with {1} as not-null next time.
 	NotNullCols FastIntSet
+	// hashCodeToUniqueID map the expression's hashcode to a statement allocated unique
+	// ID quite like the unique ID bounded with column. It's mainly used to add the expr
+	// to the fdSet as an extended column. <NOT CONCURRENT SAFE FOR NOW>
+	hashCodeToUniqueID map[string]int
 }
 
 // closureOfStrict is to find strict fd closure of X with respect to F.
@@ -766,4 +770,24 @@ func (e *fdEdge) String() string {
 		}
 	}
 	return b.String()
+}
+
+// RegisterUniqueID is used to record the map relationship between expr and allocated uniqueID.
+func (s *FDSet) RegisterUniqueID(hashCode string, uniqueID int) {
+	if len(hashCode) == 0 {
+		// shouldn't be here.
+		panic("map empty expr hashcode to uniqueID")
+	}
+	if _, ok := s.hashCodeToUniqueID[hashCode]; ok {
+		// shouldn't be here.
+		panic("hashcode has been registered")
+	}
+	s.hashCodeToUniqueID[hashCode] = uniqueID
+}
+
+func (s *FDSet) IsHashCodeRegistered(hashCode string) (int, bool) {
+	if uniqueID, ok := s.hashCodeToUniqueID[hashCode]; ok {
+		return uniqueID, true
+	}
+	return -1, false
 }

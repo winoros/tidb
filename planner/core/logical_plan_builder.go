@@ -4245,7 +4245,7 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 	return result, nil
 }
 
-func (ds *DataSource) extractFD() *fd.FDSet {
+func (ds *DataSource) ExtractFD() *fd.FDSet {
 	// FD in datasource (leaf node) can be cached and reused.
 	if ds.fdSet == nil {
 		fds := &fd.FDSet{}
