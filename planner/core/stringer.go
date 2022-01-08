@@ -17,6 +17,7 @@ package core
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pingcap/tidb/util/plancodec"
@@ -31,6 +32,9 @@ func ToString(p Plan) string {
 // FDToString explains fd transfer over a Plan, returns description string.
 func FDToString(p LogicalPlan) string {
 	strs, _ := fdToString(p, []string{}, []int{})
+	sort.SliceStable(strs, func(i, j int) bool {
+		return true
+	})
 	return strings.Join(strs, " >>> ")
 }
 

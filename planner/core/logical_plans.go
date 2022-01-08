@@ -439,12 +439,17 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
 	groupByColsUniqueIDs := fd.NewFastIntSet()
+	// Since the aggregation is build ahead of projection, the latter one will reuse the column with UniqueID allocated in aggregation
+	// via aggMapper, so we don't need unnecessarily maintain the <aggDes, UniqueID> mapping in the FDSet like expr did, just treating
+	// it as normal column.
 	for _, one := range la.Schema().Columns {
 		outputColsUniqueIDs.Insert(int(one.UniqueID))
 		if mysql.HasNotNullFlag(one.RetType.Flag) {
 			notnullColsUniqueIDs.Insert(int(one.UniqueID))
 		}
 	}
+	// For one like sum(a), we don't need to build functional dependency from a --> sum(a), cause it's only determined by the
+	// group-by-item (group-by-item --> sum(a)).
 	for _, expr := range la.GroupByItems {
 		switch x := expr.(type) {
 		case *expression.Column:
