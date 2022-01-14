@@ -96,7 +96,7 @@ func TestFDSet_ExtractFD(t *testing.T) {
 		builder, _ := plannercore.NewPlanBuilder().Init(tk.Session(), is, &hint.BlockHintProcessor{})
 		p, err := builder.Build(ctx, stmt)
 		ass.Nil(err)
-		p, err = plannercore.LogicalOptimize(ctx, builder.GetOptFlag(), p.(plannercore.LogicalPlan))
+		p, err = plannercore.LogicalOptimizeTest(ctx, builder.GetOptFlag(), p.(plannercore.LogicalPlan))
 		ass.Nil(err)
 		ass.Equal(tt.best, plannercore.ToString(p), comment)
 		// extract FD to every OP

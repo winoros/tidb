@@ -633,7 +633,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// eg: where a=1 and b is null and (1+c)=5.
 	// TODO: Some columns can only be determined to be constant from multiple constraints (e.g. x <= 1 AND x >= 1)
 	var (
-		constObjs      []interface{}
+		constObjs      []expression.Expression
 		constUniqueIDs = fd.NewFastIntSet()
 	)
 	constObjs = expression.ExtractConstantEqColumnsOrScalar(p.ctx, constObjs, p.Conditions)
@@ -654,7 +654,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	}
 
 	// extract equivalence cols.
-	var equivObjsPair [][]interface{}
+	var equivObjsPair [][]expression.Expression
 	equivObjsPair = expression.ExtractEquivalenceColumns(equivObjsPair, p.Conditions)
 	equivUniqueIDs := make([][]fd.FastIntSet, 0, len(equivObjsPair))
 	for _, equivObjPair := range equivObjsPair {

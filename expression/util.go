@@ -166,33 +166,36 @@ func extractColumns(result []*Column, expr Expression, filter func(*Column) bool
 	return result
 }
 
-func ExtractEquivalenceColumns(result [][]interface{}, exprs []Expression) [][]interface{} {
+// ExtractEquivalenceColumns detects the equivalence from CNF exprs.
+func ExtractEquivalenceColumns(result [][]Expression, exprs []Expression) [][]Expression {
+	// exprs are CNF expressions, EQ condition only make sense in the top level of every expr.
 	for _, expr := range exprs {
 		result = extractEquivalenceColumns(result, expr)
 	}
 	return result
 }
 
-func extractEquivalenceColumns(result [][]interface{}, expr Expression) [][]interface{} {
+func extractEquivalenceColumns(result [][]Expression, expr Expression) [][]Expression {
 	switch v := expr.(type) {
 	case *ScalarFunction:
-		if v.FuncName.L == ast.EQ {
+		// a==b, a<=>b, the latter one is evaluated to true when a,b are both null.
+		if v.FuncName.L == ast.EQ || v.FuncName.L == ast.NullEQ {
 			args := v.GetArgs()
 			if len(args) == 2 {
 				col1, ok1 := args[0].(*Column)
 				col2, ok2 := args[1].(*Column)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col1, col2})
+					result = append(result, []Expression{col1, col2})
 				}
 				col, ok1 := args[0].(*Column)
 				scl, ok2 := args[1].(*ScalarFunction)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col, scl})
+					result = append(result, []Expression{col, scl})
 				}
 				col, ok1 = args[1].(*Column)
 				scl, ok2 = args[0].(*ScalarFunction)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col, scl})
+					result = append(result, []Expression{col, scl})
 				}
 			}
 			return result
@@ -204,37 +207,37 @@ func extractEquivalenceColumns(result [][]interface{}, expr Expression) [][]inte
 				col1, ok1 := args[0].(*Column)
 				col2, ok2 := args[1].(*Column)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col1, col2})
+					result = append(result, []Expression{col1, col2})
 				}
 				col, ok1 := args[0].(*Column)
 				scl, ok2 := args[1].(*ScalarFunction)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col, scl})
+					result = append(result, []Expression{col, scl})
 				}
 				col, ok1 = args[1].(*Column)
 				scl, ok2 = args[0].(*ScalarFunction)
 				if ok1 && ok2 {
-					result = append(result, []interface{}{col, scl})
+					result = append(result, []Expression{col, scl})
 				}
 			}
 			return result
 		}
-		// For Non-EQ function, traverse down.
-		for _, arg := range v.GetArgs() {
-			result = extractEquivalenceColumns(result, arg)
-		}
+		// For Non-EQ function, we don't have to traverse down.
+		// eg: (a=b or c=d) doesn't make any definitely equivalence assertion.
 	}
 	return result
 }
 
-func ExtractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface{}, exprs []Expression) []interface{} {
+// ExtractConstantEqColumnsOrScalar detects the constant equal relationship from CNF exprs.
+func ExtractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []Expression, exprs []Expression) []Expression {
+	// exprs are CNF expressions, EQ condition only make sense in the top level of every expr.
 	for _, expr := range exprs {
 		result = extractConstantEqColumnsOrScalar(ctx, result, expr)
 	}
 	return result
 }
 
-func extractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface{}, expr Expression) []interface{} {
+func extractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []Expression, expr Expression) []Expression {
 	switch v := expr.(type) {
 	case *ScalarFunction:
 		if v.FuncName.L == ast.EQ || v.FuncName.L == ast.NullEQ {
@@ -289,7 +292,7 @@ func extractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface
 			args := v.GetArgs()
 			allArgsIsConst := true
 			// only `col in (all same const)`, can col be the constant column.
-			// eg: where a in (1, '2').
+			// eg: a in (1, "1") does, while a in (1, '2') doesn't.
 			guard := args[1]
 			for i, v := range args[1:] {
 				if _, ok := v.(*Constant); !ok {
@@ -313,10 +316,7 @@ func extractConstantEqColumnsOrScalar(ctx sessionctx.Context, result []interface
 			}
 			return result
 		}
-		// For Non-EQ function, traverse down.
-		for _, arg := range v.GetArgs() {
-			result = extractConstantEqColumnsOrScalar(ctx, result, arg)
-		}
+		// For Non-EQ function, we don't have to traverse down.
 	}
 	return result
 }

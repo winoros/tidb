@@ -537,7 +537,7 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 	} else {
 		for k, v := range fds.HashCodeToUniqueID {
 			if _, ok := s.HashCodeToUniqueID[k]; ok {
-				panic("shouldn't be here, children has same expr while register not only once")
+				panic("shouldn't be here, children has same expr while registered not only once")
 			}
 			s.HashCodeToUniqueID[k] = v
 		}
