@@ -582,7 +582,7 @@ func (s *FDSet) MaxOneRow(cols FastIntSet) {
 // ProjectCols projects FDSet to the target columns
 // Formula:
 // Strict decomposition FD4A: If X −→ Y Z then X −→ Y and X −→ Z.
-// Lax decomposition FD4B: If X ~→ Y Z and I(R) is Y -definite then X ~→ Z.
+// Lax decomposition FD4B: If X ~→ Y Z and I(R) is Y-definite then X ~→ Z.
 func (s *FDSet) ProjectCols(cols FastIntSet) {
 	// **************************************** START LOOP 1 ********************************************
 	// Ensure the transitive relationship between remaining columns won't be lost.

@@ -357,11 +357,18 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 			if scalarUniqueID, ok = fds.IsHashCodeRegistered(hashCode); !ok {
 				scalarUniqueID = outputColsUniqueIDsArray[idx]
 				fds.RegisterUniqueID(hashCode, scalarUniqueID)
+			} else {
+				// since the scalar's hash code has been registered before, the equivalence exists between the unique ID
+				// allocated by phase of building-projection-for-scalar and that of previous registered unique ID.
+				fds.AddEquivalence(fd.NewFastIntSet(scalarUniqueID), fd.NewFastIntSet(outputColsUniqueIDsArray[idx]))
 			}
 			determinants := fd.NewFastIntSet()
 			extractedColumns := expression.ExtractColumns(x)
 			for _, one := range extractedColumns {
 				determinants.Insert(int(one.UniqueID))
+				// the dependent columns in scalar function should be also considered as output columns as well.
+				outputColsUniqueIDs.Insert(int(one.UniqueID))
+				outputColsUniqueIDsArray = append(outputColsUniqueIDsArray, int(one.UniqueID))
 			}
 			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(outputColsUniqueIDsArray[idx]))
 		}
@@ -432,6 +439,17 @@ func (la *LogicalAggregation) HasOrderBy() bool {
 }
 
 // ExtractFD implements the logical plan interface, extracting the FD from bottom up.
+// 1:
+// In most of the cases, using FDs to check the only_full_group_by problem should be done in the buildAggregation phase
+// by extracting the bottom-up FDs graph from the `p` --- the sub plan tree that has already been built.
+//
+// 2:
+// and this requires that some conditions push-down into the `p` like selection should be done before building aggregation,
+// otherwise, 'a=1 and a can occur in the select lists of a group by' will be miss-checked because it doesn't be implied in the known FDs graph.
+//
+// 3:
+// when a logical agg is built, it's schema columns indicates what the permitted-non-agg columns is. Therefore, we shouldn't
+// depend on logicalAgg.ExtractFD() to finish the only_full_group_by checking problem rather than by 1 & 2.
 func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
 	fds := la.logicalSchemaProducer.ExtractFD()
@@ -439,6 +457,7 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
 	groupByColsUniqueIDs := fd.NewFastIntSet()
+	groupByColsOutputCols := fd.NewFastIntSet()
 	// Since the aggregation is build ahead of projection, the latter one will reuse the column with UniqueID allocated in aggregation
 	// via aggMapper, so we don't need unnecessarily maintain the <aggDes, UniqueID> mapping in the FDSet like expr did, just treating
 	// it as normal column.
@@ -469,7 +488,10 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 			if scalarUniqueID, ok = fds.IsHashCodeRegistered(hashCode); ok {
 				groupByColsUniqueIDs.Insert(scalarUniqueID)
 			} else {
-				scalarUniqueID := int(la.ctx.GetSessionVars().AllocPlanColumnID())
+				// retrieve unique plan column id.  1: completely new one, allocating new unique id. 2: registered by projection earlier, using it.
+				if scalarUniqueID, ok = la.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol[hashCode]; !ok {
+					scalarUniqueID = int(la.ctx.GetSessionVars().AllocPlanColumnID())
+				}
 				fds.RegisterUniqueID(hashCode, scalarUniqueID)
 				groupByColsUniqueIDs.Insert(scalarUniqueID)
 			}
@@ -477,6 +499,17 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 			extractedColumns := expression.ExtractColumns(x)
 			for _, one := range extractedColumns {
 				determinants.Insert(int(one.UniqueID))
+				groupByColsOutputCols.Insert(int(one.UniqueID))
+			}
+			nullable := false
+			result := expression.EvaluateExprWithNull(la.ctx, la.schema, x)
+			con, ok := result.(*expression.Constant)
+			if !ok || con.Value.IsNull() {
+				// if x can be nullable when referred columns are null, the extended column can be nullable.
+				nullable = true
+			}
+			if !nullable {
+				notnullColsUniqueIDs.Insert(scalarUniqueID)
 			}
 			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(scalarUniqueID))
 		}
@@ -484,16 +517,14 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 
 	// apply operator's characteristic's FD setting.
 	if len(la.GroupByItems) == 0 {
-		fds.MaxOneRow(outputColsUniqueIDs)
+		fds.MaxOneRow(outputColsUniqueIDs.Union(groupByColsOutputCols))
 	} else {
 		// eliminating input columns that are un-projected.
-		fds.ProjectCols(outputColsUniqueIDs.Union(groupByColsUniqueIDs))
+		fds.ProjectCols(outputColsUniqueIDs.Union(groupByColsOutputCols).Union(groupByColsUniqueIDs))
 
-		if !groupByColsUniqueIDs.SubsetOf(notnullColsUniqueIDs) {
-			fds.AddLaxFunctionalDependency(groupByColsUniqueIDs, outputColsUniqueIDs)
-		} else {
-			fds.AddStrictFunctionalDependency(groupByColsUniqueIDs, outputColsUniqueIDs)
-		}
+		fds.AddLaxFunctionalDependency(groupByColsUniqueIDs, outputColsUniqueIDs)
+		// agg funcDes has been tag not null flag when building aggregation.
+		fds.MakeNotNull(notnullColsUniqueIDs)
 	}
 	// just trace it down in every operator for test checking.
 	la.fdSet = fds
@@ -699,7 +730,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	for _, equiv := range equivUniqueIDs {
 		fds.AddEquivalence(equiv[0], equiv[1])
 	}
-	fds.ProjectCols(outputColsUniqueIDs)
+	// fds.ProjectCols(outputColsUniqueIDs)
 	// just trace it down in every operator for test checking.
 	p.fdSet = fds
 	return fds
