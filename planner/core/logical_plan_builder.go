@@ -4253,7 +4253,8 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 
 func (ds *DataSource) ExtractFD() *fd.FDSet {
 	// FD in datasource (leaf node) can be cached and reused.
-	if ds.fdSet == nil {
+	// Once the all conditions are not equal to nil, built it again.
+	if ds.fdSet == nil || ds.allConds != nil {
 		fds := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
 		allCols := fd.NewFastIntSet()
 		// should use the column's unique ID avoiding fdSet conflict.
@@ -4298,6 +4299,24 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 				}
 			} else {
 				fds.AddLaxFunctionalDependency(keyCols, allCols)
+			}
+		}
+		// handle the datasource conditions (maybe pushed down from upper layer OP)
+		if ds.allConds != nil {
+			// extract the not null attributes from selection conditions.
+			notnullColsUniqueIDs := extractNotNullFromConds(ds.allConds, ds)
+
+			// extract the constant cols from selection conditions.
+			constUniqueIDs := extractConstantCols(ds.allConds, ds, fds)
+
+			// extract equivalence cols.
+			equivUniqueIDs := extractEquivalenceCols(ds.allConds, ds, fds)
+
+			// apply conditions to FD.
+			fds.MakeNotNull(notnullColsUniqueIDs)
+			fds.AddConstants(constUniqueIDs)
+			for _, equiv := range equivUniqueIDs {
+				fds.AddEquivalence(equiv[0], equiv[1])
 			}
 		}
 		ds.fdSet = fds

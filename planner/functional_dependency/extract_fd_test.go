@@ -145,6 +145,54 @@ func TestFDSet_ExtractFD(t *testing.T) {
 			// 14 is added in the logicAgg pruning process cause all the columns of agg has been pruned.
 			fd: "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {(4)~~>(14)} >>> {()-->(13)}",
 		},
+		{
+			sql:  "select c is null from x1 group by c",
+			best: "DataScan(x1)->Aggr(firstrow(test.x1.c))->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {} >>> {(3)-->(5)}",
+		},
+		{
+			sql:  "select c is true from x1 group by c",
+			best: "DataScan(x1)->Aggr(firstrow(test.x1.c))->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {} >>> {(3)-->(5)}",
+		},
+		{
+			sql: "select (c+b)*d from x1 group by c,b,d",
+			// agg elimination.
+			best: "DataScan(x1)->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {(2,3)~~>(4), (2,4)-->(3,5)}",
+		},
+		{
+			sql:  "select b in (c,d) from x1 group by b,c,d",
+			best: "DataScan(x1)->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {(2,3)~~>(4), (2,4)-->(3,5)}",
+		},
+		{
+			sql:  "select b like '%a' from x1 group by b",
+			best: "DataScan(x1)->Aggr(firstrow(test.x1.b))->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {} >>> {(2)-->(5)}",
+		},
+		// test functional dependency on primary key
+		{
+			sql: "select * from x1 group by a",
+			// agg eliminated by primary key.
+			best: "DataScan(x1)->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)}",
+		},
+		// test functional dependency on unique key with not null
+		{
+			sql:  "select * from x1 group by b,d",
+			best: "DataScan(x1)->Projection",
+			fd:   "{(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)} >>> {(1)-->(2-4), (2,3)~~>(1,4), (2,4)-->(1,3)}",
+		},
+		// test functional dependency derived from keys in where condition
+		{
+			sql:  "select * from x1 where c = d group by b, c",
+			best: "DataScan(x1)->Aggr(firstrow(test.x1.a),firstrow(test.x1.b),firstrow(test.x1.c),firstrow(test.x1.d))->Projection",
+			// c = d derives:
+			// 1: c and d are not null, make lax FD (2,3)~~>(1,4) to be strict one.
+			// 2: c and d are equivalent.
+			fd: "{(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)} >>> {(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)} >>> {(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)}",
+		},
 	}
 
 	ctx := context.TODO()
@@ -160,9 +208,6 @@ func TestFDSet_ExtractFD(t *testing.T) {
 		tk.Session().PrepareTSFuture(ctx)
 		builder, _ := plannercore.NewPlanBuilder().Init(tk.Session(), is, &hint.BlockHintProcessor{})
 		// extract FD to every OP
-		if tt.sql == "select exists (select * from x1) from x1 group by d" {
-			fmt.Println(1)
-		}
 		p, err := builder.Build(ctx, stmt)
 		ass.Nil(err)
 		p, err = plannercore.LogicalOptimizeTest(ctx, builder.GetOptFlag(), p.(plannercore.LogicalPlan))

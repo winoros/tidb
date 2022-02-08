@@ -625,6 +625,101 @@ type LogicalSelection struct {
 	buildByHaving bool
 }
 
+func extractNotNullFromConds(Conditions []expression.Expression, p LogicalPlan) fd.FastIntSet {
+	// extract the column NOT NULL rejection characteristic from selection condition.
+	// CNF considered only, DNF doesn't have its meanings (cause that condition's eval may don't take effect)
+	//
+	// Take this case: select * from t where (a = 1) and (b is null):
+	//
+	// If we wanna where phrase eval to true, two pre-condition: {a=1} and {b is null} both need to be true.
+	// Hence, we assert that:
+	//
+	// 1: `a` must not be null since `NULL = 1` is evaluated as NULL.
+	// 2: `b` must be null since only `NULL is NULL` is evaluated as true.
+	//
+	// As a result,	`a` will be extracted as not-null column to abound the FDSet.
+	notnullColsUniqueIDs := fd.NewFastIntSet()
+	for _, condition := range Conditions {
+		var cols []*expression.Column
+		cols = expression.ExtractColumnsFromExpressions(cols, []expression.Expression{condition}, nil)
+		if isNullRejected(p.SCtx(), p.Schema(), condition) {
+			for _, col := range cols {
+				notnullColsUniqueIDs.Insert(int(col.UniqueID))
+			}
+		}
+	}
+	return notnullColsUniqueIDs
+}
+
+func extractConstantCols(Conditions []expression.Expression, p LogicalPlan, fds *fd.FDSet) fd.FastIntSet {
+	// extract constant cols
+	// eg: where a=1 and b is null and (1+c)=5.
+	// TODO: Some columns can only be determined to be constant from multiple constraints (e.g. x <= 1 AND x >= 1)
+	var (
+		constObjs      []expression.Expression
+		constUniqueIDs = fd.NewFastIntSet()
+	)
+	constObjs = expression.ExtractConstantEqColumnsOrScalar(p.SCtx(), constObjs, Conditions)
+	for _, constObj := range constObjs {
+		switch x := constObj.(type) {
+		case *expression.Column:
+			constUniqueIDs.Insert(int(x.UniqueID))
+		case *expression.ScalarFunction:
+			hashCode := string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))
+			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
+				constUniqueIDs.Insert(uniqueID)
+			} else {
+				scalarUniqueID := int(p.SCtx().GetSessionVars().AllocPlanColumnID())
+				fds.RegisterUniqueID(string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx)), scalarUniqueID)
+				constUniqueIDs.Insert(scalarUniqueID)
+			}
+		}
+	}
+	return constUniqueIDs
+}
+
+func extractEquivalenceCols(Conditions []expression.Expression, p LogicalPlan, fds *fd.FDSet) [][]fd.FastIntSet {
+	var equivObjsPair [][]expression.Expression
+	equivObjsPair = expression.ExtractEquivalenceColumns(equivObjsPair, Conditions)
+	equivUniqueIDs := make([][]fd.FastIntSet, 0, len(equivObjsPair))
+	for _, equivObjPair := range equivObjsPair {
+		// lhs of equivalence.
+		var (
+			lhsUniqueID int
+			rhsUniqueID int
+		)
+		switch x := equivObjPair[0].(type) {
+		case *expression.Column:
+			lhsUniqueID = int(x.UniqueID)
+		case *expression.ScalarFunction:
+			hashCode := string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))
+			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
+				lhsUniqueID = uniqueID
+			} else {
+				scalarUniqueID := int(p.SCtx().GetSessionVars().AllocPlanColumnID())
+				fds.RegisterUniqueID(string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx)), scalarUniqueID)
+				lhsUniqueID = scalarUniqueID
+			}
+		}
+		// rhs of equivalence.
+		switch x := equivObjPair[1].(type) {
+		case *expression.Column:
+			rhsUniqueID = int(x.UniqueID)
+		case *expression.ScalarFunction:
+			hashCode := string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))
+			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
+				rhsUniqueID = uniqueID
+			} else {
+				scalarUniqueID := int(p.SCtx().GetSessionVars().AllocPlanColumnID())
+				fds.RegisterUniqueID(string(x.HashCode(p.SCtx().GetSessionVars().StmtCtx)), scalarUniqueID)
+				rhsUniqueID = scalarUniqueID
+			}
+		}
+		equivUniqueIDs = append(equivUniqueIDs, []fd.FastIntSet{fd.NewFastIntSet(lhsUniqueID), fd.NewFastIntSet(rhsUniqueID)})
+	}
+	return equivUniqueIDs
+}
+
 func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
 	fds := p.baseLogicalPlan.ExtractFD()
@@ -638,91 +733,14 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 		}
 	}
 
-	// extract the column NOT NULL rejection characteristic from selection condition.
-	// CNF considered only, DNF doesn't have its meanings (cause that condition's eval may don't take effect)
-	//
-	// Take this case: select * from t where (a = 1) and (b is null):
-	//
-	// If we wanna where phrase eval to true, two pre-condition: {a=1} and {b is null} both need to be true.
-	// Hence, we assert that:
-	//
-	// 1: `a` must not be null since `NULL = 1` is evaluated as NULL.
-	// 2: `b` must be null since only `NULL is NULL` is evaluated as true.
-	//
-	// As a result,	`a` will be extracted as not-null column to abound the FDSet.
-	for _, condition := range p.Conditions {
-		var cols []*expression.Column
-		cols = expression.ExtractColumnsFromExpressions(cols, []expression.Expression{condition}, nil)
-		if isNullRejected(p.ctx, p.Schema(), condition) {
-			for _, col := range cols {
-				notnullColsUniqueIDs.Insert(int(col.UniqueID))
-			}
-		}
-	}
+	// extract the not null attributes from selection conditions.
+	notnullColsUniqueIDs.UnionWith(extractNotNullFromConds(p.Conditions, p))
 
-	// extract constant cols
-	// eg: where a=1 and b is null and (1+c)=5.
-	// TODO: Some columns can only be determined to be constant from multiple constraints (e.g. x <= 1 AND x >= 1)
-	var (
-		constObjs      []expression.Expression
-		constUniqueIDs = fd.NewFastIntSet()
-	)
-	constObjs = expression.ExtractConstantEqColumnsOrScalar(p.ctx, constObjs, p.Conditions)
-	for _, constObj := range constObjs {
-		switch x := constObj.(type) {
-		case *expression.Column:
-			constUniqueIDs.Insert(int(x.UniqueID))
-		case *expression.ScalarFunction:
-			hashCode := string(x.HashCode(p.ctx.GetSessionVars().StmtCtx))
-			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
-				constUniqueIDs.Insert(uniqueID)
-			} else {
-				scalarUniqueID := int(p.ctx.GetSessionVars().AllocPlanColumnID())
-				fds.RegisterUniqueID(string(x.HashCode(p.ctx.GetSessionVars().StmtCtx)), scalarUniqueID)
-				constUniqueIDs.Insert(scalarUniqueID)
-			}
-		}
-	}
+	// extract the constant cols from selection conditions.
+	constUniqueIDs := extractConstantCols(p.Conditions, p, fds)
 
 	// extract equivalence cols.
-	var equivObjsPair [][]expression.Expression
-	equivObjsPair = expression.ExtractEquivalenceColumns(equivObjsPair, p.Conditions)
-	equivUniqueIDs := make([][]fd.FastIntSet, 0, len(equivObjsPair))
-	for _, equivObjPair := range equivObjsPair {
-		// lhs of equivalence.
-		var (
-			lhsUniqueID int
-			rhsUniqueID int
-		)
-		switch x := equivObjPair[0].(type) {
-		case *expression.Column:
-			lhsUniqueID = int(x.UniqueID)
-		case *expression.ScalarFunction:
-			hashCode := string(x.HashCode(p.ctx.GetSessionVars().StmtCtx))
-			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
-				lhsUniqueID = uniqueID
-			} else {
-				scalarUniqueID := int(p.ctx.GetSessionVars().AllocPlanColumnID())
-				fds.RegisterUniqueID(string(x.HashCode(p.ctx.GetSessionVars().StmtCtx)), scalarUniqueID)
-				lhsUniqueID = scalarUniqueID
-			}
-		}
-		// rhs of equivalence.
-		switch x := equivObjPair[0].(type) {
-		case *expression.Column:
-			rhsUniqueID = int(x.UniqueID)
-		case *expression.ScalarFunction:
-			hashCode := string(x.HashCode(p.ctx.GetSessionVars().StmtCtx))
-			if uniqueID, ok := fds.IsHashCodeRegistered(hashCode); ok {
-				rhsUniqueID = uniqueID
-			} else {
-				scalarUniqueID := int(p.ctx.GetSessionVars().AllocPlanColumnID())
-				fds.RegisterUniqueID(string(x.HashCode(p.ctx.GetSessionVars().StmtCtx)), scalarUniqueID)
-				rhsUniqueID = scalarUniqueID
-			}
-		}
-		equivUniqueIDs = append(equivUniqueIDs, []fd.FastIntSet{fd.NewFastIntSet(lhsUniqueID), fd.NewFastIntSet(rhsUniqueID)})
-	}
+	equivUniqueIDs := extractEquivalenceCols(p.Conditions, p, fds)
 
 	// apply operator's characteristic's FD setting.
 	fds.MakeNotNull(notnullColsUniqueIDs)
@@ -730,7 +748,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	for _, equiv := range equivUniqueIDs {
 		fds.AddEquivalence(equiv[0], equiv[1])
 	}
-	// fds.ProjectCols(outputColsUniqueIDs)
+	fds.ProjectCols(outputColsUniqueIDs)
 	// just trace it down in every operator for test checking.
 	p.fdSet = fds
 	return fds
