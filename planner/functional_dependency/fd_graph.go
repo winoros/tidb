@@ -500,6 +500,11 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 	}
 }
 
+// MakeApply maintain the FD relationship between outer and inner table after Apply OP is done.
+// Since Apply is implemented by join, it seems the fd can be extracted through its inner join directly.
+func (s *FDSet) MakeApply(inner *FDSet) {
+}
+
 // MakeOuterJoin generates the records the fdSet of the outer join.
 // As we know, the outer join would generate null extended rows compared with inner join.
 // So we cannot directly do the same thing with the inner join. This function deals with the special cases of the outer join.

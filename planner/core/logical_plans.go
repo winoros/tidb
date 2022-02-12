@@ -182,9 +182,29 @@ func (p *LogicalJoin) ExtractFD() *fd.FDSet {
 		return p.extractFDForInnerJoin()
 	case LeftOuterJoin, RightOuterJoin:
 		return p.extractFDForOuterJoin()
+	case SemiJoin:
+		return p.extractFDForSemiJoin()
 	default:
 		return &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
 	}
+}
+
+func (p *LogicalJoin) extractFDForSemiJoin() *fd.FDSet {
+	// 1: since semi join will keep the part or all rows of the outer table, it's outer FD can be saved.
+	// 2: the un-projected column will be left for the upper layer projection or already be pruned from bottom up.
+	outerFD, _ := p.children[0].ExtractFD(), p.children[1].ExtractFD()
+	fds := outerFD
+
+	eqCondSlice := expression.ScalarFuncs2Exprs(p.EqualConditions)
+	allConds := append(eqCondSlice, p.OtherConditions...)
+	notNullColsFromFilters := extractNotNullFromConds(allConds, p)
+
+	constUniqueIDs := extractConstantCols(p.LeftConditions, p.SCtx(), fds)
+
+	fds.MakeNotNull(notNullColsFromFilters)
+	fds.AddConstants(constUniqueIDs)
+	p.fdSet = fds
+	return fds
 }
 
 func (p *LogicalJoin) extractFDForInnerJoin() *fd.FDSet {
