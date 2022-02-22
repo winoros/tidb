@@ -318,7 +318,8 @@ type LogicalProjection struct {
 // ExtractFD implements the logical plan interface, extracting the FD from bottom up.
 func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
-	fds := p.logicalSchemaProducer.ExtractFD()
+	fds := &fd.FDSet{}
+	fds.CopyFrom(p.logicalSchemaProducer.ExtractFD())
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
@@ -458,7 +459,8 @@ func (la *LogicalAggregation) HasOrderBy() bool {
 // depend on logicalAgg.ExtractFD() to finish the only_full_group_by checking problem rather than by 1 & 2.
 func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
-	fds := la.logicalSchemaProducer.ExtractFD()
+	fds := &fd.FDSet{}
+	fds.CopyFrom(la.logicalSchemaProducer.ExtractFD())
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
@@ -728,7 +730,8 @@ func extractEquivalenceCols(Conditions []expression.Expression, p LogicalPlan, f
 
 func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
-	fds := p.baseLogicalPlan.ExtractFD()
+	fds := &fd.FDSet{}
+	fds.CopyFrom(p.baseLogicalPlan.ExtractFD())
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()

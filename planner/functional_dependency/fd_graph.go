@@ -579,6 +579,16 @@ func (s *FDSet) MaxOneRow(cols FastIntSet) {
 	}
 }
 
+func (s *FDSet) CopyFrom(srcSet *FDSet) {
+	s.fdEdges = make([]*fdEdge, len(srcSet.fdEdges))
+	copy(s.fdEdges, srcSet.fdEdges)
+	s.NotNullCols.CopyFrom(srcSet.NotNullCols)
+	s.HashCodeToUniqueID = make(map[string]int, len(srcSet.HashCodeToUniqueID))
+	for k, v := range srcSet.HashCodeToUniqueID {
+		s.HashCodeToUniqueID[k] = v
+	}
+}
+
 // ProjectCols projects FDSet to the target columns
 // Formula:
 // Strict decomposition FD4A: If X −→ Y Z then X −→ Y and X −→ Z.
