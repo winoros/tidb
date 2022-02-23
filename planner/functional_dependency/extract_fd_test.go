@@ -33,10 +33,12 @@ func TestFDSet_ExtractFD(t *testing.T) {
 
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
+	tk.MustExec("set sql_mode=''")
 	tk.MustExec("create table t1(a int key, b int, c int, unique(b,c))")
 	tk.MustExec("create table t2(m int key, n int, p int, unique(m,n))")
 	tk.MustExec("create table x1(a int not null primary key, b int not null, c int default null, d int not null, unique key I_b_c (b,c), unique key I_b_d (b,d))")
 	tk.MustExec("create table x2(a int not null primary key, b int not null, c int default null, d int not null, unique key I_b_c (b,c), unique key I_b_d (b,d))")
+	tk.MustExec("create table test_expr (a varchar(12));")
 
 	tests := []struct {
 		sql  string
@@ -192,6 +194,18 @@ func TestFDSet_ExtractFD(t *testing.T) {
 			// 2: c and d are equivalent.
 			fd: "{(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)} >>> {(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)} >>> {(1)-->(2-4), (2,3)-->(1,4), (2,4)-->(1,3), (3,4)==(3,4)}",
 		},
+		// Test https://github.com/pingcap/tidb/issues/27723
+		{
+			sql:  "select substr(a, 12, 1) from test_expr group by SUBSTR(a, 12, 1)",
+			best: "DataScan(test_expr)->Aggr(firstrow(test.test_expr.a),firstrow(test.test_expr._tidb_rowid))->Projection",
+			fd:   "{} >>> {(1)-->(3), (3)~~>(1,2)} >>> {(1)-->(3), (3)~~>(1)}",
+		},
+		// Test https://github.com/pingcap/tidb/issues/25199
+		{
+			sql:  "SELECT c FROM(SELECT d c, d e FROM(SELECT 2 d FROM t1) f) g GROUP BY e;",
+			best: "DataScan(t1)->Projection->Projection->Aggr(firstrow(Column#4),firstrow(Column#4))->Projection",
+			fd:   "{(1)-->(2,3), (2,3)~~>(1)} >>> {()-->(4)} >>> {()-->(4)} >>> {()-->(4)} >>> {()-->(4)}",
+		},
 	}
 
 	ctx := context.TODO()
@@ -199,16 +213,16 @@ func TestFDSet_ExtractFD(t *testing.T) {
 	for i, tt := range tests {
 		comment := fmt.Sprintf("case:%v sql:%s", i, tt.sql)
 		stmt, err := par.ParseOneStmt(tt.sql, "", "")
-		ass.Nil(err, comment)
+		ass.NoError(err, comment)
 		tk.Session().GetSessionVars().PlanID = 0
 		tk.Session().GetSessionVars().PlanColumnID = 0
 		err = plannercore.Preprocess(tk.Session(), stmt, plannercore.WithPreprocessorReturn(&plannercore.PreprocessorReturn{InfoSchema: is}))
-		ass.Nil(err)
+		ass.NoError(err)
 		tk.Session().PrepareTSFuture(ctx)
 		builder, _ := plannercore.NewPlanBuilder().Init(tk.Session(), is, &hint.BlockHintProcessor{})
 		// extract FD to every OP
 		p, err := builder.Build(ctx, stmt)
-		ass.Nil(err)
+		ass.NoError(err)
 		ass.Equal(tt.best, plannercore.ToString(p), comment)
 		// extract FD to every OP
 		p.(plannercore.LogicalPlan).ExtractFD()
