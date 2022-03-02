@@ -3931,9 +3931,6 @@ func (b *PlanBuilder) tryBuildCTE(ctx context.Context, tn *ast.TableName, asName
 }
 
 func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, asName *model.CIStr) (LogicalPlan, error) {
-	if tn.TableInfo.Name.L == "t" || tn.TableInfo.Name.L == "t1" {
-		fmt.Println(1)
-	}
 	dbName := tn.Schema
 	sessionVars := b.ctx.GetSessionVars()
 
