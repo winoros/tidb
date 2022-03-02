@@ -176,19 +176,19 @@ func TestFDSet_InClosure(t *testing.T) {
 	}
 	fd.fdEdges = append(fd.fdEdges, fe1, fe2, fe3)
 	// A -> F : false (determinants should not be torn apart)
-	ass.False(fd.inClosure(NewFastIntSet(1), NewFastIntSet(6)))
+	ass.False(fd.InClosure(NewFastIntSet(1), NewFastIntSet(6)))
 	// B -> G : true (dependency can be torn apart)
-	ass.True(fd.inClosure(NewFastIntSet(2), NewFastIntSet(7)))
+	ass.True(fd.InClosure(NewFastIntSet(2), NewFastIntSet(7)))
 	// AB -> E : true (dependency can be torn apart)
-	ass.True(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(5)))
+	ass.True(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(5)))
 	// AB -> FG: true (in closure node set)
-	ass.True(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(6, 7)))
+	ass.True(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(6, 7)))
 	// AB -> DF: true (in closure node set)
-	ass.True(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(4, 6)))
+	ass.True(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(4, 6)))
 	// AB -> EG: true (in closure node set)
-	ass.True(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7)))
+	ass.True(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7)))
 	// AB -> EGH: false (H is not in closure node set)
-	ass.False(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7, 8)))
+	ass.False(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7, 8)))
 
 	fe4 := &fdEdge{
 		from:   NewFastIntSet(2), // B -> CH
@@ -198,7 +198,7 @@ func TestFDSet_InClosure(t *testing.T) {
 	}
 	fd.fdEdges = append(fd.fdEdges, fe4)
 	// AB -> EGH: true (in closure node set)
-	ass.True(fd.inClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7, 8)))
+	ass.True(fd.InClosure(NewFastIntSet(1, 2), NewFastIntSet(5, 7, 8)))
 }
 
 func TestFDSet_AddConstant(t *testing.T) {

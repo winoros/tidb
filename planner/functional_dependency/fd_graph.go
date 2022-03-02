@@ -110,9 +110,12 @@ func (s *FDSet) closureOfEquivalence(colSet FastIntSet) FastIntSet {
 	return resultSet
 }
 
-// inClosure is used to judge whether fd: setA -> setB can be inferred from closure s.
+// InClosure is used to judge whether fd: setA -> setB can be inferred from closure s.
 // It's a short-circuit version of the `closureOf`.
-func (s *FDSet) inClosure(setA, setB FastIntSet) bool {
+func (s *FDSet) InClosure(setA, setB FastIntSet) bool {
+	if setB.SubsetOf(setA) {
+		return true
+	}
 	currentClosure := NewFastIntSet()
 	// self included.
 	currentClosure.UnionWith(setA)
@@ -154,7 +157,7 @@ func (s *FDSet) ReduceCols(colSet FastIntSet) FastIntSet {
 		removed.Insert(k)
 		result.Remove(k)
 		// If the removed one is not dependent with the result. We add the bit back.
-		if !s.inClosure(result, removed) {
+		if !s.InClosure(result, removed) {
 			removed.Remove(k)
 			result.Insert(k)
 		}

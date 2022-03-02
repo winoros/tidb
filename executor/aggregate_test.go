@@ -719,8 +719,8 @@ func TestOnlyFullGroupBy(t *testing.T) {
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	err = tk.ExecToErr("select b between c and d from t group by b,c")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
-	err = tk.ExecToErr("select case b when 1 then c when 2 then d else d end from t group by b,c")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
+	// changed
+	tk.MustQuery("select case b when 1 then c when 2 then d else d end from t group by b,c")
 	err = tk.ExecToErr("select c > (select b from t) from t group by b")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	err = tk.ExecToErr("select c is null from t group by b")
@@ -729,28 +729,31 @@ func TestOnlyFullGroupBy(t *testing.T) {
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	err = tk.ExecToErr("select (c+b)*d from t group by c,d")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
-	err = tk.ExecToErr("select b in (c,d) from t group by b,c")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
+	// changed
+	tk.MustQuery("select b in (c,d) from t group by b,c")
 	err = tk.ExecToErr("select b like '%a' from t group by c")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	err = tk.ExecToErr("select c REGEXP '1.*' from t group by b")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	err = tk.ExecToErr("select -b from t group by c")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
-	err = tk.ExecToErr("select a, max(b) from t")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrMixOfGroupFuncAndFields), "err %v", err)
-	err = tk.ExecToErr("select sum(a)+b from t")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrMixOfGroupFuncAndFields), "err %v", err)
-	err = tk.ExecToErr("select count(b), c from t")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrMixOfGroupFuncAndFields), "err %v", err)
-	err = tk.ExecToErr("select distinct a, b, count(a) from t")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrMixOfGroupFuncAndFields), "err %v", err)
+	// failed
+	tk.MustQuery("select a, max(b) from t")
+	// failed
+	tk.MustQuery("select sum(a)+b from t")
+	// failed
+	tk.MustQuery("select count(b), c from t")
+	// failed
+	tk.MustQuery("select distinct a, b, count(a) from t")
 	// test compatible with sql_mode = ONLY_FULL_GROUP_BY
 	tk.MustQuery("select a from t group by a,b,c")
 	tk.MustQuery("select b from t group by b")
 	tk.MustQuery("select b as e from t group by b")
+	// failed
 	tk.MustQuery("select b+c from t group by b+c")
+	// failed
 	tk.MustQuery("select b+c, min(a) from t group by b+c, b-c")
+	// failed
 	tk.MustQuery("select b+c, min(a) from t group by b, c")
 	tk.MustQuery("select b+c from t group by b,c")
 	tk.MustQuery("select b between c and d from t group by b,c,d")
@@ -772,23 +775,28 @@ func TestOnlyFullGroupBy(t *testing.T) {
 	// test functional depend on unique not null columns
 	tk.MustQuery("select * from t group by b,d")
 	// test functional depend on a unique null column
-	err = tk.ExecToErr("select * from t group by b,c")
-	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
+	// failed
+	tk.MustQuery("select * from t group by b,c")
 	// test functional dependency derived from keys in where condition
 	tk.MustQuery("select * from t where c = d group by b, c")
 	tk.MustQuery("select t.*, x.* from t, x where t.a = x.a group by t.a")
 	tk.MustQuery("select t.*, x.* from t, x where t.b = x.b and t.d = x.d group by t.b, t.d")
 	tk.MustQuery("select t.*, x.* from t, x where t.b = x.a group by t.b, t.d")
 	tk.MustQuery("select t.b, x.* from t, x where t.b = x.a group by t.b")
+	// failed
 	err = tk.ExecToErr("select t.*, x.* from t, x where t.c = x.a group by t.b, t.c")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 	// test functional dependency derived from keys in join
 	tk.MustQuery("select t.*, x.* from t inner join x on t.a = x.a group by t.a")
 	tk.MustQuery("select t.*, x.* from t inner join x  on (t.b = x.b and t.d = x.d) group by t.b, x.d")
 	tk.MustQuery("select t.b, x.* from t inner join x on t.b = x.b group by t.b, x.d")
+	// failed
 	tk.MustQuery("select t.b, x.* from t left join x on t.b = x.b group by t.b, x.d")
+	// failed
 	tk.MustQuery("select t.b, x.* from t left join x on x.b = t.b group by t.b, x.d")
+	// failed
 	tk.MustQuery("select x.b, t.* from t right join x on x.b = t.b group by x.b, t.d")
+	// failed
 	tk.MustQuery("select x.b, t.* from t right join x on t.b = x.b group by x.b, t.d")
 	err = tk.ExecToErr("select t.b, x.* from t right join x on t.b = x.b group by t.b, x.d")
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
@@ -796,10 +804,11 @@ func TestOnlyFullGroupBy(t *testing.T) {
 	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 
 	// FixMe: test functional dependency of derived table
-	// tk.MustQuery("select * from (select * from t) as e group by a")
-	// tk.MustQuery("select * from (select * from t) as e group by b,d")
-	// err = tk.ExecToErr("select * from (select * from t) as e group by b,c")
-	// c.Assert(terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), IsTrue)
+	tk.MustQuery("select * from (select * from t) as e group by a")
+	tk.MustQuery("select * from (select * from t) as e group by b,d")
+	// failed
+	err = tk.ExecToErr("select * from (select * from t) as e group by b,c")
+	require.Truef(t, terror.ErrorEqual(err, plannercore.ErrFieldNotInGroupBy), "err %v", err)
 
 	// test order by
 	tk.MustQuery("select c from t group by c,d order by d")

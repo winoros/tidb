@@ -19,6 +19,11 @@ import (
 	"context"
 	"fmt"
 
+	fd "github.com/pingcap/tidb/planner/functional_dependency"
+	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/infoschema"
@@ -175,6 +180,56 @@ func (la *LogicalAggregation) PruneColumns(parentUsedCols []*expression.Column, 
 		if len(childProjection.Exprs) == 0 && childProjection.Schema().Len() == 0 {
 			childOfChild := childProjection.children[0]
 			la.SetChildren(childOfChild)
+		}
+	}
+	if la.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
+		la.ExtractFD()
+		groupBySet := fd.NewFastIntSet()
+		for _, groupByExpr := range la.GroupByItems {
+			switch x := groupByExpr.(type) {
+			case *expression.Column:
+				groupBySet.Insert(int(x.UniqueID))
+				logutil.BgLogger().Warn("build group by", zap.String("col", x.String()), zap.Int64("uid", x.UniqueID))
+			case *expression.ScalarFunction:
+				scalarUniqueID, ok := la.fdSet.IsHashCodeRegistered(string(hack.String(x.HashCode(la.ctx.GetSessionVars().StmtCtx))))
+				if !ok {
+					// This branch should not happen, we just create it for safe.
+					continue
+				}
+				groupBySet.Insert(scalarUniqueID)
+				logutil.BgLogger().Warn("build group by", zap.String("expr", x.String()), zap.Int("uid", scalarUniqueID))
+			default:
+			}
+		}
+		idSetForTest := fd.NewFastIntSet()
+		for _, gExpr := range la.AggFuncs {
+			idSetForTest.Clear()
+			if gExpr.Name != ast.AggFuncFirstRow {
+				continue
+			}
+			arg := gExpr.Args[0]
+			switch x := arg.(type) {
+			case *expression.Column:
+				idSetForTest.Insert(int(x.UniqueID))
+				logutil.BgLogger().Warn("build test", zap.String("col", x.String()), zap.Int64("uid", x.UniqueID))
+			case *expression.ScalarFunction:
+				scalarUniqueID, ok := la.fdSet.IsHashCodeRegistered(string(hack.String(x.HashCode(la.ctx.GetSessionVars().StmtCtx))))
+				if !ok {
+					// This branch should not happen, we just create it for safe.
+					continue
+				}
+				idSetForTest.Insert(scalarUniqueID)
+				logutil.BgLogger().Warn("build group by", zap.String("expr", x.String()), zap.Int("uid", scalarUniqueID))
+			}
+			if !la.fdSet.InClosure(groupBySet, idSetForTest) {
+				logutil.BgLogger().Warn("test fd",
+					zap.String("group by set", groupBySet.String()),
+					zap.String("expr", idSetForTest.String()),
+					zap.String("fd", la.fdSet.String()),
+					zap.String("the agg", gExpr.String()),
+				)
+				return ErrFieldNotInGroupBy.GenWithStackByArgs(0, fmt.Sprintf("block#%v", la.blockOffset), arg.String())
+			}
 		}
 	}
 	return nil
