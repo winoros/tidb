@@ -863,21 +863,3 @@ func (s *FDSet) IsHashCodeRegistered(hashCode string) (int, bool) {
 	}
 	return -1, false
 }
-
-func (s FDSet) FindUniqueKeys() []*FastIntSet {
-	res := make([]*FastIntSet, 0)
-	allCols := s.AllCols()
-	for i := 0; i < len(s.fdEdges); i++ {
-		fd := s.fdEdges[i]
-		// Since we haven't maintained the key column, let's traverse every strict FD to judge with.
-		if fd.strict && !fd.equiv {
-			closure := s.closureOfStrict(fd.from)
-			if allCols.SubsetOf(closure) {
-				uniq := NewFastIntSet()
-				uniq.CopyFrom(fd.from)
-				res = append(res, &uniq)
-			}
-		}
-	}
-	return res
-}

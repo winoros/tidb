@@ -3,7 +3,6 @@ package functional_dependency_test
 import (
 	"context"
 	"fmt"
-	fd "github.com/pingcap/tidb/planner/functional_dependency"
 	"testing"
 
 	"github.com/pingcap/tidb/domain"
@@ -22,17 +21,6 @@ func testGetIS(ass *assert.Assertions, ctx sessionctx.Context) infoschema.InfoSc
 	err := dom.Reload()
 	ass.Nil(err)
 	return dom.InfoSchema()
-}
-
-func TestFDSet_Ex1tractFD(t *testing.T) {
-	t.Parallel()
-	fds := fd.NewFastIntSet()
-	fds.Insert(0)
-	fmt.Println(fds.Len())
-	for i, ok := fds.Next(0); ok; i, ok = fds.Next(i + 1) {
-		fmt.Println(i)
-	}
-
 }
 
 func TestFDSet_ExtractFD(t *testing.T) {
