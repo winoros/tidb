@@ -749,11 +749,8 @@ func TestOnlyFullGroupBy(t *testing.T) {
 	tk.MustQuery("select a from t group by a,b,c")
 	tk.MustQuery("select b from t group by b")
 	tk.MustQuery("select b as e from t group by b")
-	// failed
 	tk.MustQuery("select b+c from t group by b+c")
-	// failed
 	tk.MustQuery("select b+c, min(a) from t group by b+c, b-c")
-	// failed
 	tk.MustQuery("select b+c, min(a) from t group by b, c")
 	tk.MustQuery("select b+c from t group by b,c")
 	tk.MustQuery("select b between c and d from t group by b,c,d")
