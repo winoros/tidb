@@ -17,6 +17,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap/tidb/util/hack"
 	"math"
 	"math/bits"
 	"sort"
@@ -1319,6 +1320,80 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 		}
 	}
 	proj.SetChildren(p)
+	fds := proj.ExtractFD()
+	// Projection -> Children -> ...
+	// Let the projection itself to evaluate the whole FD, which will build the connection
+	// 1: from select-expr to registered-expr
+	// 2: from base-column to select-expr
+	// After that
+	if p.SCtx().GetSessionVars().SQLMode.HasOnlyFullGroupBy() && fds.HasAggBuilt {
+		for offset, expr := range proj.Exprs[:len(fields)] {
+			item := fd.NewFastIntSet()
+			switch x := expr.(type) {
+			case *expression.Column:
+				item.Insert(int(x.UniqueID))
+			case *expression.ScalarFunction:
+				if x.FuncName.L == "any_value" {
+					continue
+				}
+				scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+				if !ok {
+					panic("selected expr must have been registered, shouldn't be here")
+				}
+				item.Insert(scalarUniqueID)
+			default:
+			}
+			// Rule #1, if select fields are constant, it's ok.
+			if item.SubsetOf(fds.ConstantCols()) {
+				continue
+			}
+			// Rule #2, if select fields are subset of group by items, it's ok.
+			if item.SubsetOf(fds.GroupByCols) {
+				continue
+			}
+
+			// Rule #3, if select fields are dependencies of Strict FD with determinants in group-by items, it's ok.
+			// lax FD couldn't be done here, eg: for unique key (b), index key NULL & NULL are different rows with
+			// uncertain other column values.
+			strictClosure := fds.ClosureOfStrict(fds.GroupByCols)
+			if item.SubsetOf(strictClosure) {
+				continue
+			}
+			// locate the base col that are not in (constant list / group by list / strict fd closure) for error show.
+			baseCols := expression.ExtractColumns(expr)
+			errShowCol := baseCols[0]
+			for _, col := range baseCols {
+				colSet := fd.NewFastIntSet(int(col.UniqueID))
+				if !colSet.SubsetOf(strictClosure) {
+					errShowCol = col
+					break
+				}
+			}
+			// Only1Zero is to judge whether it's no-group-by-items case.
+			if !fds.GroupByCols.Only1Zero() {
+				return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, errShowCol.OrigName)
+			} else {
+				return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, errShowCol.OrigName)
+			}
+		}
+		if fds.GroupByCols.Only1Zero() {
+			// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
+			projectionUniqueIDs := fd.NewFastIntSet()
+			for _, expr := range proj.Exprs {
+				switch x := expr.(type) {
+				case *expression.Column:
+					projectionUniqueIDs.Insert(int(x.UniqueID))
+				case *expression.ScalarFunction:
+					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+					if !ok {
+						panic("selected expr must have been registered, shouldn't be here")
+					}
+					projectionUniqueIDs.Insert(scalarUniqueID)
+				}
+			}
+			fds.MaxOneRow(projectionUniqueIDs)
+		}
+	}
 	return proj, proj.Exprs, oldLen, nil
 }
 

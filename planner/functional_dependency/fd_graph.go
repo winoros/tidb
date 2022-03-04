@@ -32,6 +32,14 @@ type FDSet struct {
 	// ID quite like the unique ID bounded with column. It's mainly used to add the expr
 	// to the fdSet as an extended column. <NOT CONCURRENT SAFE FOR NOW>
 	HashCodeToUniqueID map[string]int
+	// GroupByCols is used to record columns / expressions that under the group by phrase.
+	GroupByCols FastIntSet
+	HasAggBuilt bool
+}
+
+// ClosureOfStrict is exported for outer usage.
+func (s *FDSet) ClosureOfStrict(colSet FastIntSet) FastIntSet {
+	return s.closureOfStrict(colSet)
 }
 
 // closureOfStrict is to find strict fd closure of X with respect to F.
@@ -60,6 +68,11 @@ func (s *FDSet) closureOfStrict(colSet FastIntSet) FastIntSet {
 		}
 	}
 	return resultSet
+}
+
+// ClosureOfLax is exported for outer usage.
+func (s *FDSet) ClosureOfLax(colSet FastIntSet) FastIntSet {
+	return s.closureOfLax(colSet)
 }
 
 // ClosureOfLax is used to find lax fd closure of X with respect to F.
@@ -586,6 +599,10 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 			s.HashCodeToUniqueID[k] = v
 		}
 	}
+	for i, ok := fds.GroupByCols.Next(0); ok; i, ok = fds.GroupByCols.Next(i + 1) {
+		s.GroupByCols.Insert(i)
+	}
+	s.HasAggBuilt = fds.HasAggBuilt
 }
 
 // MaxOneRow will regard every column in the fdSet as a constant. Since constant is stronger that strict FD, it will
@@ -845,4 +862,22 @@ func (s *FDSet) IsHashCodeRegistered(hashCode string) (int, bool) {
 		return uniqueID, true
 	}
 	return -1, false
+}
+
+func (s FDSet) FindUniqueKeys() []*FastIntSet {
+	res := make([]*FastIntSet, 0)
+	allCols := s.AllCols()
+	for i := 0; i < len(s.fdEdges); i++ {
+		fd := s.fdEdges[i]
+		// Since we haven't maintained the key column, let's traverse every strict FD to judge with.
+		if fd.strict && !fd.equiv {
+			closure := s.closureOfStrict(fd.from)
+			if allCols.SubsetOf(closure) {
+				uniq := NewFastIntSet()
+				uniq.CopyFrom(fd.from)
+				res = append(res, &uniq)
+			}
+		}
+	}
+	return res
 }

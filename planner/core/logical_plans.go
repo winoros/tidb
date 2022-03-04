@@ -476,7 +476,8 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	// apply operator's characteristic's FD setting.
 	// since the distinct attribute is built as firstRow agg func, we don't need to think about it here.
 	fds.MakeNotNull(notnullColsUniqueIDs)
-	fds.ProjectCols(outputColsUniqueIDs)
+	// select max(a) from t group by b, we should project both `a` & `b` to maintain the FD down here, even if select-fields only contain `a`.
+	fds.ProjectCols(outputColsUniqueIDs.Union(fds.GroupByCols))
 	// just trace it down in every operator for test checking.
 	p.fdSet = fds
 	return fds
@@ -614,17 +615,51 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 		}
 	}
 
+	// Some details:
+	// For now, select max(a) from t group by c, tidb will see `max(a)` as Max aggDes and `a,b,c` as firstRow aggDes,
+	// and keep them all in the schema columns before projection does the pruning. If we build the fake FD eg: {c} ~~> {b}
+	// here since we have seen b as firstRow aggDes, for the upper layer projection of `select max(a), b from t group by c`,
+	// it will take b as valid projection field of group by statement since it has existed in the FD with {c} ~~> {b}.
+	//
+	// and since any_value will be push down to agg schema, which means every firstRow aggDes in the agg logical operator is
+	// meaningless to build the FD with. Let's store the only derived FD down: {group by items} ~~> {real aggDes}
+	realAggFuncUniqueID := fd.NewFastIntSet()
+	for i, aggDes := range la.AggFuncs {
+		if aggDes.Name != "firstrow" {
+			realAggFuncUniqueID.Insert(int(la.schema.Columns[i].UniqueID))
+		}
+	}
+
 	// apply operator's characteristic's FD setting.
 	if len(la.GroupByItems) == 0 {
-		fds.MaxOneRow(outputColsUniqueIDs.Union(groupByColsOutputCols))
+		// 1: as the details shown above, output cols (normal column seen as firstrow) of group by are not validated.
+		// we couldn't merge them as constant FD with origin constant FD together before projection done.
+		// fds.MaxOneRow(outputColsUniqueIDs.Union(groupByColsOutputCols))
+		//
+		// 2: for the convenience of later judgement, when there is no group by items, we will store a FD: {0} -> {real aggDes}
+		// 0 unique id is only used for here.
+		groupByColsUniqueIDs.Insert(0)
+		for i, ok := realAggFuncUniqueID.Next(0); ok; i, ok = realAggFuncUniqueID.Next(i + 1) {
+			fds.AddStrictFunctionalDependency(groupByColsUniqueIDs, fd.NewFastIntSet(i))
+		}
 	} else {
 		// eliminating input columns that are un-projected.
 		fds.ProjectCols(outputColsUniqueIDs.Union(groupByColsOutputCols).Union(groupByColsUniqueIDs))
 
-		fds.AddLaxFunctionalDependency(groupByColsUniqueIDs, outputColsUniqueIDs)
+		// note: {a} --> {b,c} is not same with {a} --> {b} and {a} --> {c}
+		for i, ok := realAggFuncUniqueID.Next(0); ok; i, ok = realAggFuncUniqueID.Next(i + 1) {
+			// group by phrase always produce strict FD.
+			// 1: it can always distinguish and group the all-null/part-null group column rows.
+			// 2: the rows with all/part null group column are unique row after group operation.
+			// 3: there won't be two same group key with different agg values, so strict FD secured.
+			fds.AddStrictFunctionalDependency(groupByColsUniqueIDs, fd.NewFastIntSet(i))
+		}
+
 		// agg funcDes has been tag not null flag when building aggregation.
 		fds.MakeNotNull(notnullColsUniqueIDs)
 	}
+	fds.GroupByCols = groupByColsUniqueIDs
+	fds.HasAggBuilt = true
 	// just trace it down in every operator for test checking.
 	la.fdSet = fds
 	return fds
