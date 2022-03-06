@@ -621,8 +621,8 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	// here since we have seen b as firstRow aggDes, for the upper layer projection of `select max(a), b from t group by c`,
 	// it will take b as valid projection field of group by statement since it has existed in the FD with {c} ~~> {b}.
 	//
-	// and since any_value will be push down to agg schema, which means every firstRow aggDes in the agg logical operator is
-	// meaningless to build the FD with. Let's store the only derived FD down: {group by items} ~~> {real aggDes}
+	// and since any_value will NOT be pushed down to agg schema, which means every firstRow aggDes in the agg logical operator
+	// is meaningless to build the FD with. Let's only store the non-firstRow FD down: {group by items} ~~> {real aggDes}
 	realAggFuncUniqueID := fd.NewFastIntSet()
 	for i, aggDes := range la.AggFuncs {
 		if aggDes.Name != "firstrow" {
