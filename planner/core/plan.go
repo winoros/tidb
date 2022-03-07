@@ -385,7 +385,7 @@ func (p *baseLogicalPlan) ExtractFD() *fd.FDSet {
 	if p.fdSet != nil {
 		return p.fdSet
 	}
-	fds := &fd.FDSet{}
+	fds := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
 	for _, ch := range p.children {
 		fds.AddFrom(ch.ExtractFD())
 	}
