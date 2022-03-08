@@ -453,6 +453,13 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 				ok             bool
 				scalarUniqueID int
 			)
+			// If this function is not deterministic, we skip it since it not a stable value.
+			if expression.CheckNonDeterministic(x) {
+				if scalarUniqueID, ok = fds.IsHashCodeRegistered(hashCode); !ok {
+					fds.RegisterUniqueID(hashCode, scalarUniqueID)
+				}
+				continue
+			}
 			if scalarUniqueID, ok = fds.IsHashCodeRegistered(hashCode); !ok {
 				scalarUniqueID = outputColsUniqueIDsArray[idx]
 				fds.RegisterUniqueID(hashCode, scalarUniqueID)
