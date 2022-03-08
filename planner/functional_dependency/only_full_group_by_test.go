@@ -40,9 +40,29 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	// test case 4
 	tk.MustExec("drop table if exists t1")
 	tk.MustExec("drop table if exists t2")
-	tk.MustExec("drop view if exists v1")
+	tk.MustExec("drop view if exists v2")
 	tk.MustExec("CREATE TABLE t1 ( col_varchar_10_utf8 VARCHAR(10) CHARACTER SET utf8,  col_int_key INT,  pk INT PRIMARY KEY);")
 	tk.MustExec("CREATE TABLE t2 ( col_varchar_10_utf8 VARCHAR(10) CHARACTER SET utf8 DEFAULT NULL, col_int_key INT DEFAULT NULL,  pk INT PRIMARY KEY);")
 	tk.MustExec("CREATE ALGORITHM=MERGE definer='root'@'localhost' VIEW v2 AS SELECT t2.pk, COALESCE(t2.pk, 3) AS coa FROM t1 LEFT JOIN t2 ON 0;")
 	tk.MustQuery("SELECT v2.pk, v2.coa FROM t1 LEFT JOIN v2 AS v2 ON 0 GROUP BY v2.pk;")
+
+	// test case 5
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("CREATE TABLE t ( a INT, c INT GENERATED ALWAYS AS (a+2), d INT GENERATED ALWAYS AS (c+2) )")
+	tk.MustQuery("SELECT c FROM t GROUP BY a")
+
+	// test case 6
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("CREATE TABLE t ( a INT, c INT GENERATED ALWAYS AS (a+2), d INT GENERATED ALWAYS AS (c+2) );")
+	tk.MustQuery("SELECT c FROM t GROUP BY a;")
+	tk.MustQuery("SELECT d FROM t GROUP BY c;")
+	tk.MustQuery("SELECT d FROM t GROUP BY a;")
+	tk.MustQuery("SELECT 1+c FROM t GROUP BY a;")
+	tk.MustQuery("SELECT 1+d FROM t GROUP BY c;")
+	tk.MustQuery("SELECT 1+d FROM t GROUP BY a;")
+	tk.MustQuery("SELECT t1.d FROM t as t1, t as t2 WHERE t2.d=t1.c GROUP BY t2.a;")
+	_, err = tk.Exec("SELECT t1.d FROM t as t1, t as t2 WHERE t2.d>t1.c GROUP BY t2.a;")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.d' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+
 }

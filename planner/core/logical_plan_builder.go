@@ -4403,6 +4403,23 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 				fds.AddEquivalence(equiv[0], equiv[1])
 			}
 		}
+		// build the dependency for generated columns.
+		// the generated column is sequentially dependent on the forward column.
+		// a int, b int as (a+1), c int as (b+1), here we can build the strict FD down:
+		// {a} -> {b}, {b} -> {c}, put the maintenance of the dependencies between generated columns to the FD graph.
+		for _, col := range ds.TblCols {
+			if col.VirtualExpr != nil {
+				dependencies := fd.NewFastIntSet()
+				dependencies.Insert(int(col.UniqueID))
+				// dig out just for 1 level.
+				directBaseCol := expression.ExtractColumns(col.VirtualExpr)
+				determinant := fd.NewFastIntSet()
+				for _, col := range directBaseCol {
+					determinant.Insert(int(col.UniqueID))
+				}
+				fds.AddStrictFunctionalDependency(determinant, dependencies)
+			}
+		}
 		ds.fdSet = fds
 	}
 	return ds.fdSet
