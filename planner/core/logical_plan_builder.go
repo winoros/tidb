@@ -1335,7 +1335,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 				case *expression.Column:
 					item.Insert(int(x.UniqueID))
 				case *expression.ScalarFunction:
-					if x.FuncName.L == "any_value" {
+					if expression.CheckFuncInExpr(x, ast.AnyValue) {
 						continue
 					}
 					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
