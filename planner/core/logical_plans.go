@@ -231,6 +231,22 @@ func (p *LogicalJoin) extractFDForInnerJoin() *fd.FDSet {
 	for _, equiv := range equivUniqueIDs {
 		fds.AddEquivalence(equiv[0], equiv[1])
 	}
+	// merge the not-null-cols/registered-map from both side together.
+	fds.NotNullCols.UnionWith(rightFD.NotNullCols)
+	if fds.HashCodeToUniqueID == nil {
+		fds.HashCodeToUniqueID = rightFD.HashCodeToUniqueID
+	} else {
+		for k, v := range rightFD.HashCodeToUniqueID {
+			if _, ok := fds.HashCodeToUniqueID[k]; ok {
+				panic("shouldn't be here, children has same expr while registered not only once")
+			}
+			fds.HashCodeToUniqueID[k] = v
+		}
+	}
+	for i, ok := rightFD.GroupByCols.Next(0); ok; i, ok = rightFD.GroupByCols.Next(i + 1) {
+		fds.GroupByCols.Insert(i)
+	}
+	fds.HasAggBuilt = fds.HasAggBuilt || rightFD.HasAggBuilt
 	p.fdSet = fds
 	return fds
 }

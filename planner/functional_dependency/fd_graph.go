@@ -653,6 +653,23 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	if ok1 && ok2 {
 		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false)
 	}
+	// Rule #5, merge the not-null-cols/registered-map from both side together.
+	s.NotNullCols.UnionWith(innerFDs.NotNullCols)
+	s.NotNullCols.UnionWith(filterFDs.NotNullCols)
+	if s.HashCodeToUniqueID == nil {
+		s.HashCodeToUniqueID = innerFDs.HashCodeToUniqueID
+	} else {
+		for k, v := range innerFDs.HashCodeToUniqueID {
+			if _, ok := s.HashCodeToUniqueID[k]; ok {
+				panic("shouldn't be here, children has same expr while registered not only once")
+			}
+			s.HashCodeToUniqueID[k] = v
+		}
+	}
+	for i, ok := innerFDs.GroupByCols.Next(0); ok; i, ok = innerFDs.GroupByCols.Next(i + 1) {
+		s.GroupByCols.Insert(i)
+	}
+	s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 }
 
 func (s FDSet) FindPrimaryKey() (*FastIntSet, bool) {
