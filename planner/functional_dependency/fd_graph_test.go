@@ -236,7 +236,7 @@ func TestFDSet_AddConstant(t *testing.T) {
 	ass.Equal("(4)", fd.fdEdges[1].from.String()) // determinant 3 reduced as constant, leaving FD {d} --> {f,g}.
 	ass.Equal("(5,6)", fd.fdEdges[1].to.String())
 
-	fd.AddLaxFunctionalDependency(NewFastIntSet(7), NewFastIntSet(5, 6)) // {g} ~~> {e,f}
+	fd.AddLaxFunctionalDependency(NewFastIntSet(7), NewFastIntSet(5, 6), false) // {g} ~~> {e,f}
 	ass.Equal(len(fd.fdEdges), 3)
 	ass.False(fd.fdEdges[2].strict)
 	ass.False(fd.fdEdges[2].equiv)
@@ -257,25 +257,25 @@ func TestFDSet_LaxImplies(t *testing.T) {
 	ass := assert.New(t)
 
 	fd := FDSet{}
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2, 3))
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2))
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2, 3), false)
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2), false)
 	// lax FD won't imply each other once they have the different to side.
 	ass.Equal("(1)~~>(2,3), (1)~~>(2)", fd.String())
 
 	fd = FDSet{}
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2))
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2, 3))
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2), false)
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(2, 3), false)
 	ass.Equal("(1)~~>(2), (1)~~>(2,3)", fd.String())
 
 	fd = FDSet{}
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(3))
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1, 2), NewFastIntSet(3))
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(3), false)
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1, 2), NewFastIntSet(3), false)
 	// lax FD can imply each other once they have the same to side. {1,2} ~~> {3} implies {1} ~~> {3}
 	ass.Equal("(1)~~>(3)", fd.String())
 
 	fd = FDSet{}
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(3, 4))
-	fd.AddLaxFunctionalDependency(NewFastIntSet(1, 2), NewFastIntSet(3))
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1), NewFastIntSet(3, 4), false)
+	fd.AddLaxFunctionalDependency(NewFastIntSet(1, 2), NewFastIntSet(3), false)
 	// lax FD won't imply each other once they have the different to side. {1,2} ~~> {3} implies {1} ~~> {3}
 	ass.Equal("(1)~~>(3,4), (1,2)~~>(3)", fd.String())
 }

@@ -17,6 +17,12 @@ type fdEdge struct {
 	// And if there's a functional dependency `const` -> `column` exists. We would let the from side be empty.
 	strict bool
 	equiv  bool
+	// unique is flag used to distinguish unique lax FD and non-unique lax FD, the difference is as below:
+	// 1: for unique lax FD: the determinant's normal value can't be repeatable, only the null value can be multiple.
+	//		which means: only limitation of not-null attribute to its determinant side can strengthen it as strict one.
+	// 2: for non-unique lax FD: the determinant's normal value and null value can be repeatable.
+	// 		which means: we need both side of not-null attribute to strengthen it as strict one.
+	uniLax bool
 }
 
 // FDSet is the main portal of functional dependency, it stores the relationship between (extended table/ physical table)'s
@@ -180,12 +186,12 @@ func (s *FDSet) ReduceCols(colSet FastIntSet) FastIntSet {
 
 // AddStrictFunctionalDependency is to add `STRICT` functional dependency to the fdGraph.
 func (s *FDSet) AddStrictFunctionalDependency(from, to FastIntSet) {
-	s.addFunctionalDependency(from, to, true, false)
+	s.addFunctionalDependency(from, to, true, false, false)
 }
 
 // AddLaxFunctionalDependency is to add `LAX` functional dependency to the fdGraph.
-func (s *FDSet) AddLaxFunctionalDependency(from, to FastIntSet) {
-	s.addFunctionalDependency(from, to, false, false)
+func (s *FDSet) AddLaxFunctionalDependency(from, to FastIntSet, laxUnique bool) {
+	s.addFunctionalDependency(from, to, false, false, laxUnique)
 }
 
 // addFunctionalDependency will add strict/lax functional dependency to the fdGraph.
@@ -196,7 +202,7 @@ func (s *FDSet) AddLaxFunctionalDependency(from, to FastIntSet) {
 //
 // To reduce the edge number, we limit the functional dependency when we insert into the
 // set. The key code of insert is like the following codes.
-func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool) {
+func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv, laxUni bool) {
 	// trivial FD, refused.
 	if to.SubsetOf(from) {
 		return
@@ -215,6 +221,7 @@ func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool)
 		to:     to,
 		strict: strict,
 		equiv:  equiv,
+		uniLax: laxUni,
 	}
 
 	swapPointer := 0
@@ -230,8 +237,9 @@ func (s *FDSet) addFunctionalDependency(from, to FastIntSet, strict, equiv bool)
 			}
 			fd.from = from
 			fd.to = to
-			fd.strict = true
-			fd.equiv = false
+			fd.strict = strict
+			fd.equiv = equiv
+			fd.uniLax = laxUni
 			added = true
 		} else if !added {
 			// There's a strong one. No need to add.
@@ -486,13 +494,24 @@ func (s *FDSet) MakeNotNull(notNullCols FastIntSet) {
 		if fd.strict {
 			continue
 		}
-		// lax can be made strict if all determinant & dependency columns are not null.
-		if fd.from.SubsetOf(notNullColsSet) && fd.to.SubsetOf(notNullColsSet) {
-			// we don't need to clean the old lax FD because when adding the corresponding strict one, the lax
-			// one will be implied by that and itself is removed.
-			s.AddStrictFunctionalDependency(fd.from, fd.to)
-			// add strict FDs will cause reconstruction of FDSet, re-traverse it.
-			i = -1
+		if fd.uniLax {
+			// unique lax can be made strict only if determinant are not null.
+			if fd.from.SubsetOf(notNullColsSet) {
+				// we don't need to clean the old lax FD because when adding the corresponding strict one, the lax
+				// one will be implied by that and itself is removed.
+				s.AddStrictFunctionalDependency(fd.from, fd.to)
+				// add strict FDs will cause reconstruction of FDSet, re-traverse it.
+				i = -1
+			}
+		} else {
+			// lax can be made strict if all determinant & dependency columns are not null.
+			if fd.from.SubsetOf(notNullColsSet) && fd.to.SubsetOf(notNullColsSet) {
+				// we don't need to clean the old lax FD because when adding the corresponding strict one, the lax
+				// one will be implied by that and itself is removed.
+				s.AddStrictFunctionalDependency(fd.from, fd.to)
+				// add strict FDs will cause reconstruction of FDSet, re-traverse it.
+				i = -1
+			}
 		}
 	}
 	s.NotNullCols = notNullColsSet
@@ -612,7 +631,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		}
 		// Rule #2.1, lax FD can be kept after the left join.
 		if !edge.strict {
-			s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv)
+			s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
 			continue
 		}
 		// Rule #2.1, strict FD can be kept when determinant contains not null column, otherwise, downgraded to the lax one.
@@ -624,10 +643,10 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		if edge.from.Intersects(innerFDs.NotNullCols) {
 			// One of determinant are not null column, strict FD are kept.
 			// According knowledge #2, we can't take use of right filter's not null attribute.
-			s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv)
+			s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
 		} else {
 			// Otherwise, the strict FD are downgraded to a lax one.
-			s.addFunctionalDependency(edge.from, edge.to, false, edge.equiv)
+			s.addFunctionalDependency(edge.from, edge.to, false, edge.equiv, edge.uniLax)
 		}
 	}
 	for _, edge := range filterFDs.fdEdges {
@@ -643,7 +662,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 			// need to break down the superset of equivalence, adding each lax FD of them.
 			for i, ok := laxFDFrom.Next(0); ok; i, ok = laxFDFrom.Next(i + 1) {
 				for j, ok := laxFDTo.Next(0); ok; j, ok = laxFDTo.Next(j + 1) {
-					s.addFunctionalDependency(NewFastIntSet(i), NewFastIntSet(j), false, false)
+					s.addFunctionalDependency(NewFastIntSet(i), NewFastIntSet(j), false, false, true)
 				}
 			}
 		}
@@ -651,7 +670,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	}
 	// Rule #4, add new FD {left key + right key} -> {all columns} if it could.
 	if ok1 && ok2 {
-		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false)
+		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false, false)
 	}
 	// Rule #5, merge the not-null-cols/registered-map from both side together.
 	s.NotNullCols.UnionWith(innerFDs.NotNullCols)
@@ -713,7 +732,7 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 		} else if fd.strict {
 			s.AddStrictFunctionalDependency(fd.from, fd.to)
 		} else {
-			s.AddLaxFunctionalDependency(fd.from, fd.to)
+			s.AddLaxFunctionalDependency(fd.from, fd.to, fd.uniLax)
 		}
 	}
 	s.NotNullCols.UnionWith(fds.NotNullCols)
@@ -916,7 +935,7 @@ func (s *FDSet) ProjectCols(cols FastIntSet) {
 		} else if fd.strict {
 			s.AddStrictFunctionalDependency(fd.from, fd.to)
 		} else {
-			s.AddLaxFunctionalDependency(fd.from, fd.to)
+			s.AddLaxFunctionalDependency(fd.from, fd.to, fd.uniLax)
 		}
 	}
 }

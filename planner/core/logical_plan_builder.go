@@ -1322,6 +1322,9 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
+		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT a,b,c FROM t WHERE a IS NOT NULL GROUP BY a,b") {
+			fmt.Println(1)
+		}
 		fds := proj.ExtractFD()
 		// Projection -> Children -> ...
 		// Let the projection itself to evaluate the whole FD, which will build the connection
@@ -4379,10 +4382,17 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 					fds.AddStrictFunctionalDependency(keyCols, allCols)
 					fds.MakeNotNull(keyCols)
 				} else {
-					fds.AddLaxFunctionalDependency(keyCols, allCols)
+					// unique index:
+					// 1: normal value should be unique
+					// 2: null value can be multiple
+					// for this kind of lax to be strict, we need to make the determinant not-null.
+					fds.AddLaxFunctionalDependency(keyCols, allCols, true)
 				}
 			} else {
-				fds.AddLaxFunctionalDependency(keyCols, allCols)
+				// 1: normal value can be multiple
+				// 2: null value can be multiple
+				// for this kind of lax to be strict, we need to make both the determinant and dependency not-null.
+				fds.AddLaxFunctionalDependency(keyCols, allCols, false)
 			}
 		}
 		// handle the datasource conditions (maybe pushed down from upper layer OP)
@@ -4418,6 +4428,9 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 					determinant.Insert(int(col.UniqueID))
 				}
 				fds.AddStrictFunctionalDependency(determinant, dependencies)
+			}
+			if mysql.HasNotNullFlag(col.RetType.Flag) {
+
 			}
 		}
 		ds.fdSet = fds
