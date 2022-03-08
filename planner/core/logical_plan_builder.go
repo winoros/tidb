@@ -1395,6 +1395,8 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 				}
 				fds.MaxOneRow(projectionUniqueIDs)
 			}
+			// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
+			fds.HasAggBuilt = false
 		}
 	}
 	return proj, proj.Exprs, oldLen, nil
