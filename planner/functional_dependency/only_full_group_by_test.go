@@ -107,6 +107,22 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #3 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
 
+	// test case 8
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("drop table if exists t3")
+	tk.MustExec("CREATE TABLE t1 (a INT, b INT);")
+	tk.MustExec("CREATE TABLE t2 (b INT);")
+	tk.MustExec("CREATE TABLE t3 (b INT NULL, c INT NULL, d INT NULL, e INT NULL, UNIQUE KEY (b,d,e));")
+	tk.MustQuery("SELECT * FROM t1, t2, t3 WHERE t2.b = t1.b AND t2.b = t3.b AND t3.d = 1 AND t3.e = 1 AND t3.d IS NOT NULL AND t1.a = 2 GROUP BY t1.b;")
+
+	// test case 9
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1(a int, b int not null, c int not null, d int, unique key(b,c), unique key(b,d));")
+	_, err = tk.Exec("select (select sin(a)) as z from t1 group by d,b;")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'z' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+
 	// test case 17
 	tk.MustExec("drop table if exists customer1")
 	tk.MustExec("drop table if exists customer2")

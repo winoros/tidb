@@ -1322,7 +1322,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
-		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select customer.pk, customer.b from customer group by customer.pk") {
+		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select (select sin(a)) as z from t1 group by d,b") {
 			fmt.Println(1)
 		}
 		fds := proj.ExtractFD()
@@ -1374,11 +1374,15 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 						break
 					}
 				}
+				name := errShowCol.OrigName
+				if name == "" {
+					name = proj.names[offset].String()
+				}
 				// Only1Zero is to judge whether it's no-group-by-items case.
 				if !fds.GroupByCols.Only1Zero() {
-					return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, errShowCol.OrigName)
+					return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
 				} else {
-					return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, errShowCol.OrigName)
+					return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
 				}
 			}
 			if fds.GroupByCols.Only1Zero() {
