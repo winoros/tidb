@@ -1322,7 +1322,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
-		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT a,b,c FROM t WHERE NOT(a IN (3,4)) GROUP BY a,b") {
+		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select customer.pk, customer.b from customer group by customer.pk") {
 			fmt.Println(1)
 		}
 		fds := proj.ExtractFD()

@@ -219,12 +219,13 @@ func (p *LogicalJoin) extractFDForInnerJoin() *fd.FDSet {
 	fds.MakeCartesianProduct(rightFD)
 
 	eqCondSlice := expression.ScalarFuncs2Exprs(p.EqualConditions)
+	// some join eq conditions are stored in the OtherConditions.
 	allConds := append(eqCondSlice, p.OtherConditions...)
 	notNullColsFromFilters := extractNotNullFromConds(allConds, p)
 
-	constUniqueIDs := extractConstantCols(eqCondSlice, p.SCtx(), fds)
+	constUniqueIDs := extractConstantCols(allConds, p.SCtx(), fds)
 
-	equivUniqueIDs := extractEquivalenceCols(eqCondSlice, p.SCtx(), fds)
+	equivUniqueIDs := extractEquivalenceCols(allConds, p.SCtx(), fds)
 
 	fds.MakeNotNull(notNullColsFromFilters)
 	fds.AddConstants(constUniqueIDs)

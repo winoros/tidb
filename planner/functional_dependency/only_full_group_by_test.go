@@ -107,4 +107,13 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #3 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
 
+	// test case 17
+	tk.MustExec("drop table if exists customer1")
+	tk.MustExec("drop table if exists customer2")
+	tk.MustExec("drop view if exists customer")
+	tk.MustExec("create table customer1(pk int primary key, a int);")
+	tk.MustExec("create table customer2(pk int primary key, b int);")
+	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 JOIN customer2 USING (pk);")
+	tk.MustQuery("select customer.pk, customer.b from customer group by customer.pk;")
+	tk.MustQuery("select customer1.a, count(*) from customer1 left join customer2 on customer1.a=customer2.b where customer2.pk in (7,9) group by customer2.b;")
 }
