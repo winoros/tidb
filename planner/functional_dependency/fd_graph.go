@@ -601,7 +601,7 @@ func (s *FDSet) MakeApply(inner *FDSet) {
 //
 //          above all: constant FD are lost
 //
-//		<3> equivalence FD: let's see equivalence FD as double-directed strict FD from join equal conditions, and we  only keep the
+//		<3.1> equivalence FD: let's see equivalence FD as double-directed strict FD from join equal conditions, and we  only keep the
 //			rhs ~~> lhs.
 //			a  b  |  c     d     e
 //			------+----------------
@@ -613,12 +613,34 @@ func (s *FDSet) MakeApply(inner *FDSet) {
 //			because two same determinant key {1} can point to different dependency {1} & {NULL}. But in return, FD like {c} -> {a}
 //			are degraded to the corresponding lax one.
 //
+//		<3.2> equivalence FD: when the determinant and dependencies from a equivalence FD of join condition are each covering a strict
+//			FD of the left / right side. The left side strict FD's dependencies can be extended to all cols after join result.
+//			a  b  |  c     d     e
+//			------+----------------
+//		 	1  1  |  1    NULL   1
+//		    2  2  | NULL  NULL  NULL
+//		    3  1  | NULL  NULL  NULL
+//			left join with (a,b) * (c,d,e) on (a=c and b=1). Supposing that left `a` are strict Key and right `c` are strict Key too.
+//			Key means the strict FD can determine all cols from that table.
+//			case 1: left join matched
+//				one left row match one / multi rows from right side, since `c` is strict determine all cols from right table, so
+//              {a} == {b} --> {all cols in right}, according to the transitive rule of strict FD, we get {a} --> {all cols in right}
+//			case 2: left join miss match
+//				miss matched rows from left side are unique originally, even appended with NULL value from right side, they are still
+//				strictly determine themselves and even the all rows after left join.
+//			conclusion combined:
+//				equivalence with both strict Key from right and left, the left side's strict FD can be extended to all rows after left join.
+//
 // 4: the new formed FD {left key, right key} -> {all columns} are preserved in spite of the null-supplied rows.
 //
 func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet) {
 	//  copy down the left PK and right PK before the s has changed for later usage.
 	leftPK, ok1 := s.FindPrimaryKey()
 	rightPK, ok2 := innerFDs.FindPrimaryKey()
+	copyLeftFDSet := &FDSet{}
+	copyLeftFDSet.AddFrom(s)
+	copyRightFDSet := &FDSet{}
+	copyRightFDSet.AddFrom(innerFDs)
 
 	for _, edge := range innerFDs.fdEdges {
 		// Rule #2.2, constant FD are removed from right side of left join.
@@ -657,9 +679,22 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		// Rule #3.3, we only keep the lax FD from right side pointing the left side.
 		if edge.equiv {
 			// equivalence: {superset} --> {superset}, either `from` or `to` side is ok here.
-			laxFDFrom := edge.from.Intersection(innerCols)
-			laxFDTo := edge.from.Intersection(outerCols)
+			// Rule 3.3.2
+			equivColsRight := edge.from.Intersection(innerCols)
+			equivColsLeft := edge.from.Intersection(outerCols)
+			rightAllCols := copyRightFDSet.AllCols()
+			leftAllCols := copyLeftFDSet.AllCols()
+			coveringStrictKeyRight := rightAllCols.SubsetOf(copyRightFDSet.ClosureOfStrict(equivColsRight))
+			coveringStrictKeyLeft := leftAllCols.SubsetOf(copyLeftFDSet.closureOfStrict(equivColsLeft))
+			if coveringStrictKeyLeft && coveringStrictKeyRight {
+				// find the minimum strict Key set, and add
+				s.addFunctionalDependency(copyLeftFDSet.ReduceCols(equivColsLeft), rightAllCols.Union(leftAllCols), true, false, false)
+			}
+
+			// Rule 3.3.1
 			// need to break down the superset of equivalence, adding each lax FD of them.
+			laxFDFrom := equivColsRight
+			laxFDTo := equivColsLeft
 			for i, ok := laxFDFrom.Next(0); ok; i, ok = laxFDFrom.Next(i + 1) {
 				for j, ok := laxFDTo.Next(0); ok; j, ok = laxFDTo.Next(j + 1) {
 					s.addFunctionalDependency(NewFastIntSet(i), NewFastIntSet(j), false, false, true)

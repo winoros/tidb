@@ -275,9 +275,9 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 
 	filterFD := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
 
-	constUniqueIDs := extractConstantCols(eqCondSlice, p.SCtx(), filterFD)
+	constUniqueIDs := extractConstantCols(allConds, p.SCtx(), filterFD)
 
-	equivUniqueIDs := extractEquivalenceCols(eqCondSlice, p.SCtx(), filterFD)
+	equivUniqueIDs := extractEquivalenceCols(allConds, p.SCtx(), filterFD)
 
 	filterFD.AddConstants(constUniqueIDs)
 	for _, equiv := range equivUniqueIDs {

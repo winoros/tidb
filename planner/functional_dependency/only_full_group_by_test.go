@@ -116,4 +116,8 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 JOIN customer2 USING (pk);")
 	tk.MustQuery("select customer.pk, customer.b from customer group by customer.pk;")
 	tk.MustQuery("select customer1.a, count(*) from customer1 left join customer2 on customer1.a=customer2.b where customer2.pk in (7,9) group by customer2.b;")
+	tk.MustExec("drop view if exists customer")
+	// this left join can extend left pk to all cols.
+	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 LEFT JOIN customer2 USING (pk);")
+	tk.MustQuery("select customer.pk, customer.b from customer group by customer.pk;")
 }
