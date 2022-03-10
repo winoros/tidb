@@ -601,17 +601,34 @@ func (s *FDSet) MakeApply(inner *FDSet) {
 //
 //          above all: constant FD are lost
 //
-//		<3.1> equivalence FD: let's see equivalence FD as double-directed strict FD from join equal conditions, and we  only keep the
-//			rhs ~~> lhs.
+//		<3.1> equivalence FD: when the left join conditions only contain equivalence FD (EFD for short below) across left and right
+//			cols and no other `LEFT` condition on (left cols - RED's from) to filter the left join results. We can maintain the strict
+//			FD from EFD's `from` side to EFD's `to` side over the left join result.
 //			a  b  |  c     d     e
 //			------+----------------
 //		 	1  1  |  1    NULL   1
 //		    1  2  | NULL  NULL  NULL
 //		    2  1  | NULL  NULL  NULL
-//			left join with (a,b) * (c,d,e) on (a=c and b=1). From the join equivalence condition can derive a new FD {ac} == {ac}.
-//			while since there are some supplied null value in the c column, we don't guarantee {ac} == {ac} yet, so do {a} -> {c}
-//			because two same determinant key {1} can point to different dependency {1} & {NULL}. But in return, FD like {c} -> {a}
-//			are degraded to the corresponding lax one.
+//			Neg eg: left join with (a,b) * (c,d,e) on (a=c and b=1), other b=1 will filter the result, causing the left row (1, 2)
+//			miss matched with right row (1, null 1) by a=c, consequently leading the left row appended as (1,2,null,null,null), which
+//			will break the FD: {a} -> {c} for key a=1 with different c=1/null.
+//			a  b  |  c     d     e
+//			------+----------------
+//		 	1  1  | NULL  NULL  NULL
+//		    2  1  | NULL  NULL  NULL
+//			Pos eg: if the filter is on EFD's `from` cols, it's ok. Let's say: (a,b) * (c,d,e) on (a=c and a=2), a=2 only won't leading
+//			same key a with matched c and mismatched NULL, neg case result is changed as above, so strict FD {a} -> {c} can exist.
+//			a  b  |  c     d     e
+//			------+----------------
+//		 	1  1  |  1    NULL   1
+//		    1  2  | NULL  NULL  NULL
+//			2  1  | NULL  NULL  NULL
+//			Neg eg: left join with (a,b) * (c,d,e) on (a=c and b=c), two EFD here, where b=c can also refuse some rows joined by a=c,
+//			consequently applying it with NULL as (1  2  | NULL  NULL  NULL), leading the same key a has different value 1/NULL. But
+//			macroscopically, we can combine {a,b} together as the strict FD's from side, so new FD {a,b} -> {c} is secured. For case
+//			of (a=c and b=ce), the FD is {a, b} -> {c, e}
+//
+// 			conclusion: without this kind of limited left conditions to judge the join match, we can say: FD {a} -> {c} exists.
 //
 //		<3.2> equivalence FD: when the determinant and dependencies from a equivalence FD of join condition are each covering a strict
 //			FD of the left / right side. The left side strict FD's dependencies can be extended to all cols after join result.
@@ -631,9 +648,21 @@ func (s *FDSet) MakeApply(inner *FDSet) {
 //			conclusion combined:
 //				equivalence with both strict Key from right and left, the left side's strict FD can be extended to all rows after left join.
 //
+//		<3.3> equivalence FD: let's see equivalence FD as double-directed strict FD from join equal conditions, and we  only keep the
+//			rhs ~~> lhs.
+//			a  b  |  c     d     e
+//			------+----------------
+//		 	1  1  |  1    NULL   1
+//		    1  2  | NULL  NULL  NULL
+//		    2  1  | NULL  NULL  NULL
+//			left join with (a,b) * (c,d,e) on (a=c and b=1). From the join equivalence condition can derive a new FD {ac} == {ac}.
+//			while since there are some supplied null value in the c column, we don't guarantee {ac} == {ac} yet, so do {a} -> {c}
+//			because two same determinant key {1} can point to different dependency {1} & {NULL}. But in return, FD like {c} -> {a}
+//			are degraded to the corresponding lax one.
+//
 // 4: the new formed FD {left key, right key} -> {all columns} are preserved in spite of the null-supplied rows.
 //
-func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet) {
+func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet, opt *ArgOpts) {
 	//  copy down the left PK and right PK before the s has changed for later usage.
 	leftPK, ok1 := s.FindPrimaryKey()
 	rightPK, ok2 := innerFDs.FindPrimaryKey()
@@ -671,6 +700,8 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 			s.addFunctionalDependency(edge.from, edge.to, false, edge.equiv, edge.uniLax)
 		}
 	}
+	leftCombinedFDFrom := NewFastIntSet()
+	leftCombinedFDTo := NewFastIntSet()
 	for _, edge := range filterFDs.fdEdges {
 		// Rule #3.2, constant FD are removed from right side of left join.
 		if edge.isConstant() {
@@ -679,6 +710,21 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		// Rule #3.3, we only keep the lax FD from right side pointing the left side.
 		if edge.equiv {
 			// equivalence: {superset} --> {superset}, either `from` or `to` side is ok here.
+			// Rule 3.3.1
+			if !opt.SkipFDRule331 {
+				leftCover := edge.from.Intersection(outerCols)
+				rightCover := edge.from.Intersection(innerCols)
+				if leftCover.Len() > 0 && rightCover.Len() > 0 {
+					if opt.TypeFDRule331 == CombinedFD {
+						leftCombinedFDFrom.UnionWith(leftCover)
+						leftCombinedFDTo.UnionWith(rightCover)
+					} else {
+						// singleFD case.
+						s.addFunctionalDependency(leftCover, rightCover, true, false, false)
+					}
+				}
+			}
+
 			// Rule 3.3.2
 			equivColsRight := edge.from.Intersection(innerCols)
 			equivColsLeft := edge.from.Intersection(outerCols)
@@ -691,7 +737,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 				s.addFunctionalDependency(copyLeftFDSet.ReduceCols(equivColsLeft), rightAllCols.Union(leftAllCols), true, false, false)
 			}
 
-			// Rule 3.3.1
+			// Rule 3.3.3
 			// need to break down the superset of equivalence, adding each lax FD of them.
 			laxFDFrom := equivColsRight
 			laxFDTo := equivColsLeft
@@ -703,6 +749,11 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		}
 		// Rule #3.1, filters won't produce any strict/lax FDs.
 	}
+	// Rule #3.3.1 combinedFD case
+	if !opt.SkipFDRule331 && opt.TypeFDRule331 == CombinedFD {
+		s.addFunctionalDependency(leftCombinedFDFrom, leftCombinedFDTo, true, false, false)
+	}
+
 	// Rule #4, add new FD {left key + right key} -> {all columns} if it could.
 	if ok1 && ok2 {
 		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false, false)
@@ -725,6 +776,18 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	}
 	s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 }
+
+type ArgOpts struct {
+	SkipFDRule331 bool
+	TypeFDRule331 TypeFilterFD331
+}
+
+type TypeFilterFD331 byte
+
+const (
+	SingleFD   TypeFilterFD331 = 0
+	CombinedFD TypeFilterFD331 = 1
+)
 
 func (s FDSet) FindPrimaryKey() (*FastIntSet, bool) {
 	allCols := s.AllCols()

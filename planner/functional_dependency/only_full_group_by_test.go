@@ -1,8 +1,10 @@
 package functional_dependency_test
 
 import (
+	"fmt"
 	"testing"
 
+	fd "github.com/pingcap/tidb/planner/functional_dependency"
 	"github.com/pingcap/tidb/testkit"
 	"github.com/stretchr/testify/require"
 )
@@ -123,10 +125,23 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'z' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
 
-	// test case 10
+	// test case 10 & 11
 	tk.MustExec("drop table if exists t1")
 	tk.MustExec("create table t1(a int, b int not null, c int not null, d int, unique key(b,c), unique key(b,d));")
 	tk.MustExec("select t3.a from t1, t1 as t2, t1 as t3 where  t3.b=t2.b and t3.c=t1.d and  t2.b=t1.b and t2.c=t1.c group by t1.b,t1.c")
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t3")
+	tk.MustExec("create table t1(a int, b int not null, c int not null, d int, unique key(b,c), unique key(b,d));")
+	tk.MustExec("create table t3(pk int primary key, b int);")
+	tk.MustQuery("select t3.b from  t1,t1 as t2,t3  where t3.pk=t2.d and t2.b=t1.b and t2.c=t1.a  group by t1.b,t1.c;")
+
+	// test case 12
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("create table t1(a int,b int not null,c int not null,d int, unique key(b,c), unique key(b,d));")
+	tk.MustExec("create table t2 like t1")
+	tk.MustQuery("select t1.a,t2.c from t1 left join t2 on t1.a=t2.c and cos(t2.c+t2.b)>0.5 and sin(t1.a+t2.d)<0.9 group by t1.a;")
+	tk.MustQuery("select t1.a,t2.d from t1 left join t2 on t1.a=t2.c and t1.d=t2.b and cos(t2.c+t2.b)>0.5 and sin(t1.a+t2.d)<0.9 group by t1.a,t1.d;")
 
 	// test case 17
 	tk.MustExec("drop table if exists customer1")
@@ -141,4 +156,8 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	// this left join can extend left pk to all cols.
 	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 LEFT JOIN customer2 USING (pk);")
 	tk.MustQuery("select customer.pk, customer.b from customer group by customer.pk;")
+
+	a := fd.NewFastIntSet()
+	a.Insert(1)
+	fmt.Println("cao", fd.NewFastIntSet().SubsetOf(a))
 }

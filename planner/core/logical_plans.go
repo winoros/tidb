@@ -280,13 +280,54 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	equivUniqueIDs := extractEquivalenceCols(allConds, p.SCtx(), filterFD)
 
 	filterFD.AddConstants(constUniqueIDs)
+	equivLeftUniqueIDs := fd.NewFastIntSet()
+	equivAcrossNum := 0
 	for _, equiv := range equivUniqueIDs {
 		filterFD.AddEquivalence(equiv[0], equiv[1])
+		if equiv[0].SubsetOf(outerCols) && equiv[1].SubsetOf(innerCols) {
+			equivLeftUniqueIDs.UnionWith(equiv[0])
+			equivAcrossNum++
+			continue
+		}
+		if equiv[0].SubsetOf(innerCols) && equiv[1].SubsetOf(outerCols) {
+			equivLeftUniqueIDs.UnionWith(equiv[1])
+			equivAcrossNum++
+		}
 	}
 	filterFD.MakeNotNull(notNullColsFromFilters)
 
+	// pre-perceive the filters for the convenience judgement of 3.3.1.
+	var opt fd.ArgOpts
+	if equivAcrossNum > 0 {
+		// find the equivalence FD across left and right cols.
+		var leftConditionCols []*expression.Column
+		if len(p.LeftConditions) != 0 {
+			leftConditionCols = append(leftConditionCols, expression.ExtractColumnsFromExpressions(nil, p.LeftConditions, nil)...)
+		}
+		if len(p.OtherConditions) != 0 {
+			// other condition may contain right side cols, it doesn't affect the judgement of intersection of non-left-equiv cols.
+			leftConditionCols = append(leftConditionCols, expression.ExtractColumnsFromExpressions(nil, p.OtherConditions, nil)...)
+		}
+		leftConditionUniqueIDs := fd.NewFastIntSet()
+		for _, col := range leftConditionCols {
+			leftConditionUniqueIDs.Insert(int(col.UniqueID))
+		}
+		// judge whether left filters is on non-left-equiv cols.
+		if leftConditionUniqueIDs.Intersects(outerCols.Difference(equivLeftUniqueIDs)) {
+			opt.SkipFDRule331 = true
+		}
+		if equivAcrossNum > 1 {
+			opt.TypeFDRule331 = fd.CombinedFD
+		} else {
+			opt.TypeFDRule331 = fd.SingleFD
+		}
+	} else {
+		// if there is none across equivalence condition, skip rule 3.3.1.
+		opt.SkipFDRule331 = true
+	}
+
 	fds := outerFD
-	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols)
+	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt)
 	p.fdSet = fds
 	return fds
 }
