@@ -849,7 +849,8 @@ func (s *FDSet) ProjectCols(cols FastIntSet) {
 		if !fd.to.SubsetOf(cols) {
 			// equivalence FD has been the closure as {superset} == {superset}.
 			if !fd.equiv && fd.strict {
-				fd.to = s.closureOfStrict(fd.to)
+				// extended the `to` as it's complete closure, in case of missing some transitive FDs.
+				fd.to = s.closureOfStrict(fd.to.Union(fd.from))
 				fd.to.DifferenceWith(fd.from)
 			}
 		}
@@ -988,7 +989,7 @@ func (s *FDSet) makeEquivMap(detCols, projectedCols FastIntSet) map[int]int {
 			if equivMap == nil {
 				equivMap = make(map[int]int)
 			}
-			id, _ := closure.Next(0)
+			id, _ := closure.Next(0) // 不应该只记录一个
 			equivMap[i] = id
 		}
 	}

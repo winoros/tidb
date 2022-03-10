@@ -1322,7 +1322,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
-		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select (select sin(a)) as z from t1 group by d,b") {
+		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select t3.a from t1, t1 as t2, t1 as t3 where  t3.b=t2.b and t3.c=t1.d and  t2.b=t1.b and t2.c=t1.c group by t1.b,t1.c") {
 			fmt.Println(1)
 		}
 		fds := proj.ExtractFD()
