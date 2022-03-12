@@ -1158,10 +1158,16 @@ func (b *PlanBuilder) buildProjectionField(ctx context.Context, p LogicalPlan, f
 	if expr == nil {
 		return nil, name, nil
 	}
+	// invalid unique id
+	correlatedColUniqueID := int64(0)
+	if cc, ok := expr.(*expression.CorrelatedColumn); ok {
+		correlatedColUniqueID = cc.UniqueID
+	}
 	// for expr projection, we should record the map relationship <hashcode, uniqueID> down.
 	newCol := &expression.Column{
-		UniqueID: b.ctx.GetSessionVars().AllocPlanColumnID(),
-		RetType:  expr.GetType(),
+		UniqueID:              b.ctx.GetSessionVars().AllocPlanColumnID(),
+		RetType:               expr.GetType(),
+		CorrelatedColUniqueID: correlatedColUniqueID,
 	}
 	if b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol == nil {
 		b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol = make(map[string]int, 1)
@@ -1322,9 +1328,6 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
-		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select t1.a,t2.c from t1 left join t2 on t1.a=t2.c and cos(t2.c+t2.b)>0.5 and sin(t1.a+t2.d)<0.9 group by t1.a") {
-			fmt.Println(1)
-		}
 		fds := proj.ExtractFD()
 		// Projection -> Children -> ...
 		// Let the projection itself to evaluate the whole FD, which will build the connection
@@ -4698,6 +4701,30 @@ func (b *PlanBuilder) buildApplyWithJoinType(outerPlan, innerPlan LogicalPlan, t
 	}
 	for i := outerPlan.Schema().Len(); i < ap.Schema().Len(); i++ {
 		ap.names[i] = types.EmptyName
+	}
+	// build the join correlated equal condition for apply join, this equal condition is used for deriving the transitive FD between outer and inner side.
+	correlatedCols := ExtractCorrelatedCols4LogicalPlan(innerPlan)
+	deduplicateCorrelatedCols := make(map[int64]*expression.CorrelatedColumn)
+	for _, cc := range correlatedCols {
+		if _, ok := deduplicateCorrelatedCols[cc.UniqueID]; !ok {
+			deduplicateCorrelatedCols[cc.UniqueID] = cc
+		}
+	}
+	// for case like select (select t1.a from t2) from t1. <t1.a> will be assigned with new UniqueID after sub query projection is built.
+	// we should distinguish them out, building the equivalence relationship from inner <t1.a> == outer <t1.a> in the apply-join for FD derivation.
+	for _, cc := range deduplicateCorrelatedCols {
+		// for every correlated column, find the connection with the inner newly built column.
+		for _, col := range innerPlan.Schema().Columns {
+			if cc.UniqueID == col.CorrelatedColUniqueID {
+				ccc := &cc.Column
+				cond, err := expression.NewFunction(b.ctx, ast.EQ, types.NewFieldType(mysql.TypeTiny), ccc, col)
+				if err != nil {
+					// give up connection building for not interfering old logic.
+					return ap
+				}
+				ap.EqualConditions = append(ap.EqualConditions, cond.(*expression.ScalarFunction))
+			}
+		}
 	}
 	return ap
 }

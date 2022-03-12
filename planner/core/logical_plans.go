@@ -255,6 +255,7 @@ func (p *LogicalJoin) extractFDForInnerJoin() *fd.FDSet {
 func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	outerFD, innerFD := p.children[0].ExtractFD(), p.children[1].ExtractFD()
 	innerCondition := p.RightConditions
+	outerCondition := p.LeftConditions
 	outerCols, innerCols := fd.NewFastIntSet(), fd.NewFastIntSet()
 	for _, col := range p.children[0].Schema().Columns {
 		outerCols.Insert(int(col.UniqueID))
@@ -265,6 +266,7 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	if p.JoinType == RightOuterJoin {
 		innerFD, outerFD = outerFD, innerFD
 		innerCondition = p.LeftConditions
+		outerCondition = p.RightConditions
 		innerCols, outerCols = outerCols, innerCols
 	}
 
@@ -280,17 +282,17 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	equivUniqueIDs := extractEquivalenceCols(allConds, p.SCtx(), filterFD)
 
 	filterFD.AddConstants(constUniqueIDs)
-	equivLeftUniqueIDs := fd.NewFastIntSet()
+	equivOuterUniqueIDs := fd.NewFastIntSet()
 	equivAcrossNum := 0
 	for _, equiv := range equivUniqueIDs {
 		filterFD.AddEquivalence(equiv[0], equiv[1])
 		if equiv[0].SubsetOf(outerCols) && equiv[1].SubsetOf(innerCols) {
-			equivLeftUniqueIDs.UnionWith(equiv[0])
+			equivOuterUniqueIDs.UnionWith(equiv[0])
 			equivAcrossNum++
 			continue
 		}
 		if equiv[0].SubsetOf(innerCols) && equiv[1].SubsetOf(outerCols) {
-			equivLeftUniqueIDs.UnionWith(equiv[1])
+			equivOuterUniqueIDs.UnionWith(equiv[1])
 			equivAcrossNum++
 		}
 	}
@@ -300,26 +302,27 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	var opt fd.ArgOpts
 	if equivAcrossNum > 0 {
 		// find the equivalence FD across left and right cols.
-		var leftConditionCols []*expression.Column
-		if len(p.LeftConditions) != 0 {
-			leftConditionCols = append(leftConditionCols, expression.ExtractColumnsFromExpressions(nil, p.LeftConditions, nil)...)
+		var outConditionCols []*expression.Column
+		if len(outerCondition) != 0 {
+			outConditionCols = append(outConditionCols, expression.ExtractColumnsFromExpressions(nil, p.LeftConditions, nil)...)
 		}
 		if len(p.OtherConditions) != 0 {
 			// other condition may contain right side cols, it doesn't affect the judgement of intersection of non-left-equiv cols.
-			leftConditionCols = append(leftConditionCols, expression.ExtractColumnsFromExpressions(nil, p.OtherConditions, nil)...)
+			outConditionCols = append(outConditionCols, expression.ExtractColumnsFromExpressions(nil, p.OtherConditions, nil)...)
 		}
-		leftConditionUniqueIDs := fd.NewFastIntSet()
-		for _, col := range leftConditionCols {
-			leftConditionUniqueIDs.Insert(int(col.UniqueID))
+		outerConditionUniqueIDs := fd.NewFastIntSet()
+		for _, col := range outConditionCols {
+			outerConditionUniqueIDs.Insert(int(col.UniqueID))
 		}
 		// judge whether left filters is on non-left-equiv cols.
-		if leftConditionUniqueIDs.Intersects(outerCols.Difference(equivLeftUniqueIDs)) {
+		if outerConditionUniqueIDs.Intersects(outerCols.Difference(equivOuterUniqueIDs)) {
 			opt.SkipFDRule331 = true
-		}
-		if equivAcrossNum > 1 {
-			opt.TypeFDRule331 = fd.CombinedFD
 		} else {
-			opt.TypeFDRule331 = fd.SingleFD
+			if equivAcrossNum > 1 {
+				opt.TypeFDRule331 = fd.CombinedFD
+			} else {
+				opt.TypeFDRule331 = fd.SingleFD
+			}
 		}
 	} else {
 		// if there is none across equivalence condition, skip rule 3.3.1.
@@ -491,6 +494,7 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 			// t1(a,b,c), t2(m,n)
 			// select a, (select c from t2 where m=b) from t1;
 			// take c as constant column here.
+			continue
 		case *expression.Constant:
 			hashCode := string(x.HashCode(p.ctx.GetSessionVars().StmtCtx))
 			var (

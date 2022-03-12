@@ -21,7 +21,7 @@ type fdEdge struct {
 	// 1: for unique lax FD: the determinant's normal value can't be repeatable, only the null value can be multiple.
 	//		which means: only limitation of not-null attribute to its determinant side can strengthen it as strict one.
 	// 2: for non-unique lax FD: the determinant's normal value and null value can be repeatable.
-	// 		which means: we need both side of not-null attribute to strengthen it as strict one.
+	// 		which means: we have to strength both side of not-null attribute to strengthen it as strict one.
 	uniLax bool
 }
 
@@ -758,7 +758,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	if ok1 && ok2 {
 		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false, false)
 	}
-	// Rule #5, merge the not-null-cols/registered-map from both side together.
+	// merge the not-null-cols/registered-map from both side together.
 	s.NotNullCols.UnionWith(innerFDs.NotNullCols)
 	s.NotNullCols.UnionWith(filterFDs.NotNullCols)
 	if s.HashCodeToUniqueID == nil {

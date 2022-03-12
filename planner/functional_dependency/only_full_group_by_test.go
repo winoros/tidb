@@ -1,10 +1,8 @@
 package functional_dependency_test
 
 import (
-	"fmt"
 	"testing"
 
-	fd "github.com/pingcap/tidb/planner/functional_dependency"
 	"github.com/pingcap/tidb/testkit"
 	"github.com/stretchr/testify/require"
 )
@@ -157,7 +155,22 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 LEFT JOIN customer2 USING (pk);")
 	tk.MustQuery("select customer.pk, customer.b from customer group by customer.pk;")
 
-	a := fd.NewFastIntSet()
-	a.Insert(1)
-	fmt.Println("cao", fd.NewFastIntSet().SubsetOf(a))
+	// test case 18
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("create table t1(pk int primary key, a int);")
+	tk.MustExec("create table t2(pk int primary key, b int);")
+	tk.MustQuery("select t1.pk, t2.b from t1 join t2 on t1.pk=t2.pk group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t1 join t2 using(pk) group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t1 natural join t2 group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t1 left join t2 using(pk) group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t1 natural left join t2 group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t2 right join t1 using(pk) group by t1.pk;")
+	tk.MustQuery("select t1.pk, t2.b from t2 natural right join t1 group by t1.pk;")
+
+	// test case 19
+	tk.MustExec("drop table t1")
+	tk.MustExec("create table t1(pk int primary key, a int);")
+	tk.MustQuery("select t3.a from t1 left join (t1 as t2 left join t1 as t3 on 1) on 1 group by t3.pk;")
+	tk.MustQuery("select (select t1.a from t1 as t2 limit 1) from t1 group by pk;")
 }
