@@ -168,7 +168,7 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	tk.MustQuery("select t1.pk, t2.b from t2 right join t1 using(pk) group by t1.pk;")
 	tk.MustQuery("select t1.pk, t2.b from t2 natural right join t1 group by t1.pk;")
 
-	// test case 19
+	// test case 20
 	tk.MustExec("drop table t1")
 	tk.MustExec("create table t1(pk int primary key, a int);")
 	tk.MustQuery("select t3.a from t1 left join (t1 as t2 left join t1 as t3 on 1) on 1 group by t3.pk;")
