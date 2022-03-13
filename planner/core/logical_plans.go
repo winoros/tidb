@@ -329,6 +329,8 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 		opt.SkipFDRule331 = true
 	}
 
+	opt.OnlyInnerFilter = len(eqCondSlice) == 0 && len(outerCondition) == 0
+
 	fds := outerFD
 	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt)
 	p.fdSet = fds

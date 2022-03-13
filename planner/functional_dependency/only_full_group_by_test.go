@@ -173,4 +173,24 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	tk.MustExec("create table t1(pk int primary key, a int);")
 	tk.MustQuery("select t3.a from t1 left join (t1 as t2 left join t1 as t3 on 1) on 1 group by t3.pk;")
 	tk.MustQuery("select (select t1.a from t1 as t2 limit 1) from t1 group by pk;")
+
+	// test case 21
+	tk.MustExec("drop table if exists t1, t2")
+	tk.MustExec("create table t1(a int, b int);")
+	// TODO: to be fixed.
+	//tk.MustExec("drop view if exists v1;")
+	//tk.MustExec("create view v1 as select a as a, 2*a as b, coalesce(a,3) as c from t1;")
+	//err = tk.ExecToErr("select v1.b from t1 left join v1 on 1 group by v1.a")
+	//require.NotNil(t, err)
+	//require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'z' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+	tk.MustExec("create table t2(c int, d int);")
+	err = tk.ExecToErr("select t4.d from t1 left join (t2 as t3 join t2 as t4 on t4.d=3) on t1.a=10 group by \"\";")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t2.d' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+	tk.MustExec("select t4.d from t1 join (t2 as t3 left join t2 as t4 on t4.d=3) on t1.a=10 group by \"\";")
+	//tk.MustExec("drop table t1")
+	//tk.MustExec("drop view v1")
+	//tk.MustExec("create table t1(a int not null, b int)")
+	//tk.MustExec("create view v1 as select a as a, 2*a as b, coalesce(a,3) as c from t1")
+	//tk.MustExec("select v1.b from t1 left join v1 on 1 group by v1.a")
 }

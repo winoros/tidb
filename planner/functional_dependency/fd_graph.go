@@ -528,7 +528,7 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 		fd := rhs.fdEdges[i]
 		if fd.isConstant() {
 			// both from or to side is ok since {superset} --> {superset}.
-			s.AddConstants(fd.from)
+			s.AddConstants(fd.to)
 		} else {
 			s.fdEdges = append(s.fdEdges, fd)
 		}
@@ -661,6 +661,10 @@ func (s *FDSet) MakeApply(inner *FDSet) {
 //			are degraded to the corresponding lax one.
 //
 // 4: the new formed FD {left key, right key} -> {all columns} are preserved in spite of the null-supplied rows.
+// 5: When there's no join key and no filters from the outer side. The join case is a cartesian product. In this case,
+//    the strict equivalence classes is still exists.
+//      - If the right side has no row, we would supply null-extended rows, then the value of any column is NULL, the equivalence class exists.
+//      - If the right side has rows, no row is filtered out after the filters since no row of the outer side is filtered out. Hence, the equivalence class is still remained.
 //
 func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet, opt *ArgOpts) {
 	//  copy down the left PK and right PK before the s has changed for later usage.
@@ -758,6 +762,22 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	if ok1 && ok2 {
 		s.addFunctionalDependency(leftPK.Union(*rightPK), outerCols.Union(innerCols), true, false, false)
 	}
+
+	// Rule #5, adding the strict equiv edges if there's no join key and no filters from outside.
+	if opt.OnlyInnerFilter {
+		for _, edge := range filterFDs.fdEdges {
+			if edge.strict && (edge.equiv || edge.from.IsEmpty()) {
+				s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
+			}
+		}
+		// TODO: This will break the check of #9 in TestOnlyFullGroupByOldCases
+		//for _, edge := range innerFDs.fdEdges {
+		//	if edge.strict && (edge.equiv || edge.from.IsEmpty() || edge.from.SubsetOf(innerFDs.NotNullCols)) {
+		//		s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
+		//	}
+		//}
+	}
+
 	// merge the not-null-cols/registered-map from both side together.
 	s.NotNullCols.UnionWith(innerFDs.NotNullCols)
 	s.NotNullCols.UnionWith(filterFDs.NotNullCols)
@@ -778,8 +798,9 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 }
 
 type ArgOpts struct {
-	SkipFDRule331 bool
-	TypeFDRule331 TypeFilterFD331
+	SkipFDRule331   bool
+	TypeFDRule331   TypeFilterFD331
+	OnlyInnerFilter bool
 }
 
 type TypeFilterFD331 byte
