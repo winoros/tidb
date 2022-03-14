@@ -4404,6 +4404,7 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 		// the generated column is sequentially dependent on the forward column.
 		// a int, b int as (a+1), c int as (b+1), here we can build the strict FD down:
 		// {a} -> {b}, {b} -> {c}, put the maintenance of the dependencies between generated columns to the FD graph.
+		notNullCols := fd.NewFastIntSet()
 		for _, col := range ds.TblCols {
 			if col.VirtualExpr != nil {
 				dependencies := fd.NewFastIntSet()
@@ -4417,9 +4418,10 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 				fds.AddStrictFunctionalDependency(determinant, dependencies)
 			}
 			if mysql.HasNotNullFlag(col.RetType.Flag) {
-
+				notNullCols.Insert(int(col.UniqueID))
 			}
 		}
+		fds.MakeNotNull(notNullCols)
 		ds.fdSet = fds
 	}
 	return ds.fdSet

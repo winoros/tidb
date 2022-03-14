@@ -303,7 +303,7 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 		// find the equivalence FD across left and right cols.
 		var outConditionCols []*expression.Column
 		if len(outerCondition) != 0 {
-			outConditionCols = append(outConditionCols, expression.ExtractColumnsFromExpressions(nil, p.LeftConditions, nil)...)
+			outConditionCols = append(outConditionCols, expression.ExtractColumnsFromExpressions(nil, outerCondition, nil)...)
 		}
 		if len(p.OtherConditions) != 0 {
 			// other condition may contain right side cols, it doesn't affect the judgement of intersection of non-left-equiv cols.
@@ -329,6 +329,19 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	}
 
 	opt.OnlyInnerFilter = len(eqCondSlice) == 0 && len(outerCondition) == 0
+	if opt.OnlyInnerFilter {
+		// if one of the inner condition is constant false, the inner side are all null, left make constant all of that.
+		for _, one := range innerCondition {
+			if c, ok := one.(*expression.Constant); ok {
+				if isTrue, err := c.Value.ToBool(p.ctx.GetSessionVars().StmtCtx); err == nil {
+					if isTrue == 0 {
+						// c is false
+						opt.InnerIsFalse = true
+					}
+				}
+			}
+		}
+	}
 
 	fds := outerFD
 	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt)
@@ -482,9 +495,6 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	for _, one := range p.Schema().Columns {
 		outputColsUniqueIDs.Insert(int(one.UniqueID))
 		outputColsUniqueIDsArray = append(outputColsUniqueIDsArray, int(one.UniqueID))
-		if mysql.HasNotNullFlag(one.RetType.Flag) {
-			notnullColsUniqueIDs.Insert(int(one.UniqueID))
-		}
 	}
 	// map the expr hashCode with its unique ID.
 	for idx, expr := range p.Exprs {
@@ -533,18 +543,36 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 			}
 			determinants := fd.NewFastIntSet()
 			extractedColumns := expression.ExtractColumns(x)
+			extractedCorColumns := expression.ExtractCorColumns(x)
 			for _, one := range extractedColumns {
 				determinants.Insert(int(one.UniqueID))
 				// the dependent columns in scalar function should be also considered as output columns as well.
 				outputColsUniqueIDs.Insert(int(one.UniqueID))
 				outputColsUniqueIDsArray = append(outputColsUniqueIDsArray, int(one.UniqueID))
 			}
-			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(outputColsUniqueIDsArray[idx]))
+			for _, one := range extractedCorColumns {
+				determinants.Insert(int(one.UniqueID))
+				// the dependent columns in scalar function should be also considered as output columns as well.
+				outputColsUniqueIDs.Insert(int(one.UniqueID))
+				outputColsUniqueIDsArray = append(outputColsUniqueIDsArray, int(one.UniqueID))
+			}
+			nullable := false
+			result := expression.EvaluateExprWithNull(p.ctx, p.schema, x)
+			con, ok := result.(*expression.Constant)
+			if !ok || con.Value.IsNull() {
+				// if x can be nullable when referred columns are null, the extended column can be nullable.
+				nullable = true
+			}
+			if !nullable || determinants.SubsetOf(fds.NotNullCols) {
+				notnullColsUniqueIDs.Insert(scalarUniqueID)
+			}
+			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(scalarUniqueID))
 		}
 	}
 
 	// apply operator's characteristic's FD setting.
 	// since the distinct attribute is built as firstRow agg func, we don't need to think about it here.
+	// let the fds itself to trace the not null, because after the outer join, some not null column can be nullable.
 	fds.MakeNotNull(notnullColsUniqueIDs)
 	// select max(a) from t group by b, we should project both `a` & `b` to maintain the FD down here, even if select-fields only contain `a`.
 	fds.ProjectCols(outputColsUniqueIDs.Union(fds.GroupByCols))
@@ -633,9 +661,6 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	// it as normal column.
 	for _, one := range la.Schema().Columns {
 		outputColsUniqueIDs.Insert(int(one.UniqueID))
-		if mysql.HasNotNullFlag(one.RetType.Flag) {
-			notnullColsUniqueIDs.Insert(int(one.UniqueID))
-		}
 	}
 	// For one like sum(a), we don't need to build functional dependency from a --> sum(a), cause it's only determined by the
 	// group-by-item (group-by-item --> sum(a)).
@@ -667,7 +692,12 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 			}
 			determinants := fd.NewFastIntSet()
 			extractedColumns := expression.ExtractColumns(x)
+			extractedCorColumns := expression.ExtractCorColumns(x)
 			for _, one := range extractedColumns {
+				determinants.Insert(int(one.UniqueID))
+				groupByColsOutputCols.Insert(int(one.UniqueID))
+			}
+			for _, one := range extractedCorColumns {
 				determinants.Insert(int(one.UniqueID))
 				groupByColsOutputCols.Insert(int(one.UniqueID))
 			}
@@ -678,7 +708,7 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 				// if x can be nullable when referred columns are null, the extended column can be nullable.
 				nullable = true
 			}
-			if !nullable {
+			if !nullable || determinants.SubsetOf(fds.NotNullCols) {
 				notnullColsUniqueIDs.Insert(scalarUniqueID)
 			}
 			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(scalarUniqueID))
@@ -932,9 +962,6 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	notnullColsUniqueIDs := fd.NewFastIntSet()
 	for _, one := range p.Schema().Columns {
 		outputColsUniqueIDs.Insert(int(one.UniqueID))
-		if mysql.HasNotNullFlag(one.RetType.Flag) {
-			notnullColsUniqueIDs.Insert(int(one.UniqueID))
-		}
 	}
 
 	// extract the not null attributes from selection conditions.
@@ -945,6 +972,19 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 
 	// extract equivalence cols.
 	equivUniqueIDs := extractEquivalenceCols(p.Conditions, p.SCtx(), fds)
+
+	// after left join, according to rule 3.3.3, it may create a lax FD from inner equivalence
+	// cols pointing to outer equivalence cols.  eg: t left join t1 on t.a = t1.b, leading a
+	// lax FD from t1.b ~> t.a, this lax attribute is coming from supplied null value to all
+	// left rows, once there is a null-refusing predicate on the inner side on upper layer, this
+	// can be equivalence again. (the outer rows left are all coming from equal matching)
+	//
+	// why not just makeNotNull of them, because even a non-equiv-related inner col can also
+	// refuse supplied null values.
+	if fds.Rule333Equiv.InnerCols.Len() != 0 && notnullColsUniqueIDs.Intersects(fds.Rule333Equiv.InnerCols) {
+		// restore/re-strength FDs from rule 333
+		fds.MakeRestoreRule333()
+	}
 
 	// apply operator's characteristic's FD setting.
 	fds.MakeNotNull(notnullColsUniqueIDs)

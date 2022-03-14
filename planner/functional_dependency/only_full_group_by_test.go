@@ -36,6 +36,7 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 
 	// test case 3
 	// need to resolve the name resolver problem first (view and base table's column can not refer each other)
+	// see some cases in 21
 
 	// test case 4
 	tk.MustExec("drop table if exists t1")

@@ -41,6 +41,18 @@ type FDSet struct {
 	// GroupByCols is used to record columns / expressions that under the group by phrase.
 	GroupByCols FastIntSet
 	HasAggBuilt bool
+	// after left join, according to rule 3.3.3, it may create a lax FD from inner equivalence
+	// cols pointing to outer equivalence cols.  eg: t left join t1 on t.a = t1.b, leading a
+	// lax FD from t1.b ~> t.a, this lax attribute is coming from supplied null value to all
+	// left rows, once there is a null-refusing predicate on the inner side on upper layer, this
+	// can be equivalence again. (the outer rows left are all coming from equal matching)
+	//
+	// why not just makeNotNull of them, because even a non-equiv-related inner col can also
+	// refuse supplied null values.
+	Rule333Equiv struct {
+		Edges     []*fdEdge
+		InnerCols FastIntSet
+	}
 }
 
 // ClosureOfStrict is exported for outer usage.
@@ -517,6 +529,11 @@ func (s *FDSet) MakeNotNull(notNullCols FastIntSet) {
 	s.NotNullCols = notNullColsSet
 }
 
+// MakeNullable make the fd's NotNullCols to be cleaned, after the both side fds are handled it can be nullable.
+func (s *FDSet) MakeNullable(nullableCols FastIntSet) {
+	s.NotNullCols.DifferenceWith(nullableCols)
+}
+
 // MakeCartesianProduct records fdSet after the impact of Cartesian Product of (T1 x T2) is made.
 // 1: left FD is reserved.
 // 2: right FD is reserved.
@@ -750,6 +767,13 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 					s.addFunctionalDependency(NewFastIntSet(i), NewFastIntSet(j), false, false, true)
 				}
 			}
+			s.Rule333Equiv.Edges = append(s.Rule333Equiv.Edges, &fdEdge{
+				from:   laxFDFrom,
+				to:     laxFDTo,
+				strict: true,
+				equiv:  true,
+			})
+			s.Rule333Equiv.InnerCols = innerCols
 		}
 		// Rule #3.1, filters won't produce any strict/lax FDs.
 	}
@@ -765,22 +789,27 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 
 	// Rule #5, adding the strict equiv edges if there's no join key and no filters from outside.
 	if opt.OnlyInnerFilter {
-		for _, edge := range filterFDs.fdEdges {
-			if edge.strict && (edge.equiv || edge.from.IsEmpty()) {
+		if opt.InnerIsFalse {
+			s.AddConstants(innerCols)
+		} else {
+			for _, edge := range filterFDs.fdEdges {
+				// keep filterFD's constant and equivalence.
+				if edge.strict && (edge.equiv || edge.from.IsEmpty()) {
+					s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
+				}
+			}
+			// keep all FDs from inner side.
+			for _, edge := range innerFDs.fdEdges {
 				s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
 			}
 		}
-		// TODO: This will break the check of #9 in TestOnlyFullGroupByOldCases
-		//for _, edge := range innerFDs.fdEdges {
-		//	if edge.strict && (edge.equiv || edge.from.IsEmpty() || edge.from.SubsetOf(innerFDs.NotNullCols)) {
-		//		s.addFunctionalDependency(edge.from, edge.to, edge.strict, edge.equiv, edge.uniLax)
-		//	}
-		//}
 	}
 
 	// merge the not-null-cols/registered-map from both side together.
 	s.NotNullCols.UnionWith(innerFDs.NotNullCols)
 	s.NotNullCols.UnionWith(filterFDs.NotNullCols)
+	// inner cols can be nullable since then.
+	s.NotNullCols.DifferenceWith(innerCols)
 	if s.HashCodeToUniqueID == nil {
 		s.HashCodeToUniqueID = innerFDs.HashCodeToUniqueID
 	} else {
@@ -797,10 +826,19 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 }
 
+func (s *FDSet) MakeRestoreRule333() {
+	for _, eg := range s.Rule333Equiv.Edges {
+		s.AddEquivalence(eg.from, eg.to)
+	}
+	s.Rule333Equiv.Edges = nil
+	s.Rule333Equiv.InnerCols.Clear()
+}
+
 type ArgOpts struct {
 	SkipFDRule331   bool
 	TypeFDRule331   TypeFilterFD331
 	OnlyInnerFilter bool
+	InnerIsFalse    bool
 }
 
 type TypeFilterFD331 byte
@@ -869,6 +907,7 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 		s.GroupByCols.Insert(i)
 	}
 	s.HasAggBuilt = fds.HasAggBuilt
+	s.Rule333Equiv = fds.Rule333Equiv
 }
 
 // MaxOneRow will regard every column in the fdSet as a constant. Since constant is stronger that strict FD, it will
