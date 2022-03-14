@@ -272,6 +272,7 @@ func (p *LogicalJoin) extractFDForOuterJoin() *fd.FDSet {
 	eqCondSlice := expression.ScalarFuncs2Exprs(p.EqualConditions)
 	allConds := append(eqCondSlice, p.OtherConditions...)
 	allConds = append(allConds, innerCondition...)
+	allConds = append(allConds, outerCondition...)
 	notNullColsFromFilters := extractNotNullFromConds(allConds, p)
 
 	filterFD := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}

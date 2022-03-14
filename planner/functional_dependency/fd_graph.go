@@ -726,6 +726,13 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	for _, edge := range filterFDs.fdEdges {
 		// Rule #3.2, constant FD are removed from right side of left join.
 		if edge.isConstant() {
+			s.Rule333Equiv.Edges = append(s.Rule333Equiv.Edges, &fdEdge{
+				from:   edge.from,
+				to:     edge.to,
+				strict: edge.strict,
+				equiv:  edge.equiv,
+			})
+			s.Rule333Equiv.InnerCols = innerCols
 			continue
 		}
 		// Rule #3.3, we only keep the lax FD from right side pointing the left side.
@@ -828,7 +835,11 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 
 func (s *FDSet) MakeRestoreRule333() {
 	for _, eg := range s.Rule333Equiv.Edges {
-		s.AddEquivalence(eg.from, eg.to)
+		if eg.isConstant() {
+			s.AddConstants(eg.to)
+		} else {
+			s.AddEquivalence(eg.from, eg.to)
+		}
 	}
 	s.Rule333Equiv.Edges = nil
 	s.Rule333Equiv.InnerCols.Clear()
