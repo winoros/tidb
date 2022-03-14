@@ -1312,6 +1312,9 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView {
+		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT * FROM t2 AS _tmp_1 JOIN (SELECT max(_tmp_3.f2) AS _tmp_4,min(_tmp_3.i2) AS _tmp_5 FROM t2 AS _tmp_3 WHERE _tmp_3.f2>=_tmp_3.c2 GROUP BY _tmp_3.c2 ORDER BY _tmp_3.i2) AS _tmp_2 WHERE _tmp_2._tmp_5=100") {
+			fmt.Println(1)
+		}
 		fds := proj.ExtractFD()
 		// Projection -> Children -> ...
 		// Let the projection itself to evaluate the whole FD, which will build the connection
@@ -1361,9 +1364,16 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 						break
 					}
 				}
-				name := errShowCol.OrigName
+				// better use the schema alias name firstly if any.
+				name := ""
+				for idx, schemaCol := range proj.Schema().Columns {
+					if schemaCol.UniqueID == errShowCol.UniqueID {
+						name = proj.names[idx].String()
+						break
+					}
+				}
 				if name == "" {
-					name = proj.names[offset].String()
+					name = errShowCol.OrigName
 				}
 				// Only1Zero is to judge whether it's no-group-by-items case.
 				if !fds.GroupByCols.Only1Zero() {
