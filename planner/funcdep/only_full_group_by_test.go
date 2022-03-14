@@ -208,7 +208,7 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #3 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test._tmp_3.i2' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
 
-	// test issue #22301
+	// test issue #22301 and #33056
 	tk.MustExec("drop table if exists t1, t2")
 	tk.MustExec("create table t1 (a int);")
 	tk.MustExec("create table t2 (a int, b int);")
