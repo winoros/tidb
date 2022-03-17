@@ -349,9 +349,6 @@ func TestFDSet_MakeOuterJoin(t *testing.T) {
 	ctx := context.TODO()
 	is := testGetIS(ass, tk.Session())
 	for i, tt := range tests {
-		if i == 0 {
-			fmt.Println(1)
-		}
 		comment := fmt.Sprintf("case:%v sql:%s", i, tt.sql)
 		stmt, err := par.ParseOneStmt(tt.sql, "", "")
 		ass.Nil(err, comment)
