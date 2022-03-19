@@ -15,6 +15,7 @@
 package core
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/pingcap/tidb/expression"
@@ -198,6 +199,11 @@ func (p *LogicalJoin) extractFDForSemiJoin(filtersFromApply []expression.Express
 	// 1: since semi join will keep the part or all rows of the outer table, it's outer FD can be saved.
 	// 2: the un-projected column will be left for the upper layer projection or already be pruned from bottom up.
 	outerFD, _ := p.children[0].ExtractFD(), p.children[1].ExtractFD()
+	outerAcrossBlock := p.SelectBlockOffset() != p.children[0].SelectBlockOffset()
+	if outerAcrossBlock {
+		outerFD.HasAggBuilt = false
+		outerFD.GroupByCols.Clear()
+	}
 	fds := outerFD
 
 	eqCondSlice := expression.ScalarFuncs2Exprs(p.EqualConditions)
@@ -215,6 +221,11 @@ func (p *LogicalJoin) extractFDForSemiJoin(filtersFromApply []expression.Express
 
 func (p *LogicalJoin) extractFDForInnerJoin(filtersFromApply []expression.Expression) *fd.FDSet {
 	leftFD, rightFD := p.children[0].ExtractFD(), p.children[1].ExtractFD()
+	leftAcrossBlock, rightAcrossBlock := p.SelectBlockOffset() != p.children[0].SelectBlockOffset(), p.SelectBlockOffset() != p.children[1].SelectBlockOffset()
+	if leftAcrossBlock {
+		leftFD.HasAggBuilt = false
+		leftFD.GroupByCols.Clear()
+	}
 	fds := leftFD
 	fds.MakeCartesianProduct(rightFD)
 
@@ -245,16 +256,19 @@ func (p *LogicalJoin) extractFDForInnerJoin(filtersFromApply []expression.Expres
 			fds.HashCodeToUniqueID[k] = v
 		}
 	}
-	for i, ok := rightFD.GroupByCols.Next(0); ok; i, ok = rightFD.GroupByCols.Next(i + 1) {
-		fds.GroupByCols.Insert(i)
+	if !rightAcrossBlock {
+		for i, ok := rightFD.GroupByCols.Next(0); ok; i, ok = rightFD.GroupByCols.Next(i + 1) {
+			fds.GroupByCols.Insert(i)
+		}
+		fds.HasAggBuilt = fds.HasAggBuilt || rightFD.HasAggBuilt
 	}
-	fds.HasAggBuilt = fds.HasAggBuilt || rightFD.HasAggBuilt
 	p.fdSet = fds
 	return fds
 }
 
 func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expression) *fd.FDSet {
 	outerFD, innerFD := p.children[0].ExtractFD(), p.children[1].ExtractFD()
+	outerAcrossBlock, innerAcrossBlock := p.SelectBlockOffset() != p.children[0].SelectBlockOffset(), p.SelectBlockOffset() != p.children[1].SelectBlockOffset()
 	innerCondition := p.RightConditions
 	outerCondition := p.LeftConditions
 	outerCols, innerCols := fd.NewFastIntSet(), fd.NewFastIntSet()
@@ -266,6 +280,7 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 	}
 	if p.JoinType == RightOuterJoin {
 		innerFD, outerFD = outerFD, innerFD
+		outerAcrossBlock, innerAcrossBlock = innerAcrossBlock, outerAcrossBlock
 		innerCondition = p.LeftConditions
 		outerCondition = p.RightConditions
 		innerCols, outerCols = outerCols, innerCols
@@ -346,9 +361,12 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 			}
 		}
 	}
-
+	if outerAcrossBlock {
+		outerFD.HasAggBuilt = false
+		outerFD.GroupByCols.Clear()
+	}
 	fds := outerFD
-	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt)
+	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt, innerAcrossBlock)
 	p.fdSet = fds
 	return fds
 }
@@ -966,7 +984,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// join's schema will miss t2.a while join.full schema has. since selection
 	// itself doesn't contain schema, extracting schema should tell them apart.
 	var columns []*expression.Column
-	if join, ok := p.children[0].(*LogicalJoin); ok {
+	if join, ok := p.children[0].(*LogicalJoin); ok && join.fullSchema != nil {
 		columns = join.fullSchema.Columns
 	} else {
 		columns = p.Schema().Columns
@@ -1059,11 +1077,30 @@ func (la *LogicalApply) ExtractFD() *fd.FDSet {
 			}
 		}
 	}
+	// select (select t1.a from t1 where t1.rid = t2.id), count(t2.b) from t2 group by (t2.id)
+	// for correlated scalar sub-query, the whole sub-query will be projected as a new column for example X here.
+	// while for every same t2.id, this sub-query's scalar output must be the same, actually it's a kind of strict FD here.
+	applyStrictDetermine := fd.NewFastIntSet()
+	applyStrictDependency := fd.NewFastIntSet()
+	if innerPlan.Schema().Len() == 1 {
+		// single column in apply join inner side will be output directly.
+		for _, cc := range deduplicateCorrelatedCols {
+			applyStrictDetermine.Insert(int(cc.UniqueID))
+		}
+		applyStrictDependency.Insert(int(innerPlan.Schema().Columns[0].UniqueID))
+
+	} else {
+		// multi columns will be wrapped as a new row func, actually errors like: Operand should contain 1 column(s)
+	}
+
 	switch la.JoinType {
 	case InnerJoin:
 		return la.extractFDForInnerJoin(eqCond)
 	case LeftOuterJoin, RightOuterJoin:
-		return la.extractFDForOuterJoin(eqCond)
+		fds := la.extractFDForOuterJoin(eqCond)
+		fds.AddStrictFunctionalDependency(applyStrictDetermine, applyStrictDependency)
+		fmt.Println("cao: from", applyStrictDetermine.String(), "to", applyStrictDependency)
+		return fds
 	case SemiJoin:
 		return la.extractFDForSemiJoin(eqCond)
 	default:

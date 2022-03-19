@@ -1236,7 +1236,7 @@ func findColFromNaturalUsingJoin(p LogicalPlan, col *expression.Column) (name *t
 
 // buildProjection returns a Projection plan and non-aux columns length.
 func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *ast.SelectStmt, mapper map[*ast.AggregateFuncExpr]int,
-	windowMapper map[*ast.WindowFuncExpr]int, considerWindow bool, expandGenerateColumn bool) (LogicalPlan, []*util.ByItems, int, error) {
+	windowMapper map[*ast.WindowFuncExpr]int, orderMapper map[*ast.AggregateFuncExpr]int, considerWindow bool, expandGenerateColumn bool) (LogicalPlan, []*util.ByItems, int, error) {
 	fields := sel.Fields.Fields
 	err := b.preprocessUserVarTypes(ctx, p, fields, mapper)
 	if err != nil {
@@ -1423,9 +1423,6 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 			// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
 			fds.HasAggBuilt = false
 		}
-		if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT DISTINCT t1.a FROM t as t1 ORDER BY t1.d LIMIT 1") {
-			fmt.Println(1)
-		}
 		if sel.OrderBy != nil {
 			selectExprsUniqueIDs := fd.NewFastIntSet()
 			for _, expr := range proj.Exprs[:oldLen] {
@@ -1442,7 +1439,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 				}
 			}
 			// check only-full-group-by 4 order-by clause with group-by clause
-			orderByItemExprs, err = b.buildOrderByItems(ctx, proj, sel.OrderBy.Items, mapper, windowMapper, proj.Exprs, oldLen, sel.Distinct)
+			orderByItemExprs, err = b.buildOrderByItems(ctx, proj, sel.OrderBy.Items, orderMapper, windowMapper, proj.Exprs, oldLen, sel.Distinct)
 			if err != nil {
 				return nil, nil, 0, err
 			}
@@ -1453,11 +1450,15 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 					case *expression.Column:
 						item.Insert(int(x.UniqueID))
 					case *expression.ScalarFunction:
+						// order by item may not be projected as a column in projection, allocated a new one
 						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
 						if !ok {
-							panic("selected expr must have been registered, shouldn't be here")
+							// panic("selected expr must have been registered, shouldn't be here")
+							scalarUniqueID = int(b.ctx.GetSessionVars().AllocPlanColumnID())
 						}
 						item.Insert(scalarUniqueID)
+					case *expression.Constant:
+						// order by null/false/true can always be ok, let item be empty.
 					default:
 					}
 					// Step#1: whether order by item is in the origin select field list
@@ -1482,6 +1483,21 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 					}
 					// locate the base col that are not in (constant list / group by list / strict fd closure) for error show.
 					baseCols := expression.ExtractColumns(odrItem.Expr)
+					if len(baseCols) == 0 {
+						// order by item has no reference of base col, like order by abs(1) and rand()
+						continue
+					}
+					// GROUP BY t1.a, t2.b ORDER BY COALESCE(MIN(t.c), t2.b), agg min is determined by group-col definitely.
+					baseColsUniqueIDs := fd.NewFastIntSet()
+					for _, bc := range baseCols {
+						baseColsUniqueIDs.Insert(int(bc.UniqueID))
+					}
+					if baseColsUniqueIDs.SubsetOf(strictClosureOfGroupByCols) {
+						continue
+					}
+					if baseColsUniqueIDs.SubsetOf(strictClosureOfSelectCols) {
+						continue
+					}
 					errShowCol := baseCols[0]
 					for _, col := range baseCols {
 						colSet := fd.NewFastIntSet(int(col.UniqueID))
@@ -1514,9 +1530,11 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 					case *expression.Column:
 						item.Insert(int(x.UniqueID))
 					case *expression.ScalarFunction:
+						// order by item may not be projected as a column in projection, allocated a new one
 						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
 						if !ok {
-							panic("selected expr must have been registered, shouldn't be here")
+							// panic("selected expr must have been registered, shouldn't be here")
+							scalarUniqueID = int(b.ctx.GetSessionVars().AllocPlanColumnID())
 						}
 						item.Insert(scalarUniqueID)
 					default:
@@ -1527,6 +1545,10 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 					}
 					// Rule #2
 					baseCols := expression.ExtractColumns(odrItem.Expr)
+					if len(baseCols) == 0 {
+						// order by item has no reference of base col, like order by abs(1) and rand()
+						continue
+					}
 					colSet := fd.NewFastIntSet()
 					for _, col := range baseCols {
 						colSet.Insert(int(col.UniqueID))
@@ -4123,7 +4145,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	var oldLen int
 	// According to https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html,
 	// we can only process window functions after having clause, so `considerWindow` is false now.
-	p, orderByItems, oldLen, err = b.buildProjection(ctx, p, sel, totalMap, nil, false, sel.OrderBy != nil)
+	p, orderByItems, oldLen, err = b.buildProjection(ctx, p, sel, totalMap, nil, orderMap, false, sel.OrderBy != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -4161,7 +4183,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		// In such case plan `p` is not changed, so we don't have to build another projection.
 		if hasWindowFuncField {
 			// Now we build the window function fields.
-			p, orderByItems, oldLen, err = b.buildProjection(ctx, p, sel, windowAggMap, windowMapper, true, false)
+			p, orderByItems, oldLen, err = b.buildProjection(ctx, p, sel, windowAggMap, windowMapper, orderMap, true, false)
 			if err != nil {
 				return nil, err
 			}

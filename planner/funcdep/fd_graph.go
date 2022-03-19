@@ -57,6 +57,7 @@ type FDSet struct {
 	//
 	// why not just makeNotNull of them, because even a non-equiv-related inner col can also
 	// refuse supplied null values.
+	// todo: when multi join and across select block, this may need to be maintained more precisely.
 	Rule333Equiv struct {
 		Edges     []*fdEdge
 		InnerCols FastIntSet
@@ -672,14 +673,14 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //      - If the right side has no row, we would supply null-extended rows, then the value of any column is NULL, the equivalence class exists.
 //      - If the right side has rows, no row is filtered out after the filters since no row of the outer side is filtered out. Hence, the equivalence class is still remained.
 //
-func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet, opt *ArgOpts) {
+func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet, opt *ArgOpts, innerAcrossBlock bool) {
 	//  copy down the left PK and right PK before the s has changed for later usage.
 	leftPK, ok1 := s.FindPrimaryKey()
 	rightPK, ok2 := innerFDs.FindPrimaryKey()
 	copyLeftFDSet := &FDSet{}
-	copyLeftFDSet.AddFrom(s)
+	copyLeftFDSet.AddFrom(s, false)
 	copyRightFDSet := &FDSet{}
-	copyRightFDSet.AddFrom(innerFDs)
+	copyRightFDSet.AddFrom(innerFDs, false)
 
 	for _, edge := range innerFDs.fdEdges {
 		// Rule #2.2, constant FD are removed from right side of left join.
@@ -816,10 +817,12 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 			s.HashCodeToUniqueID[k] = v
 		}
 	}
-	for i, ok := innerFDs.GroupByCols.Next(0); ok; i, ok = innerFDs.GroupByCols.Next(i + 1) {
-		s.GroupByCols.Insert(i)
+	if !innerAcrossBlock {
+		for i, ok := innerFDs.GroupByCols.Next(0); ok; i, ok = innerFDs.GroupByCols.Next(i + 1) {
+			s.GroupByCols.Insert(i)
+		}
+		s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 	}
-	s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 }
 
 func (s *FDSet) MakeRestoreRule333() {
@@ -879,7 +882,7 @@ func (s FDSet) AllCols() FastIntSet {
 // AddFrom merges two FD sets by adding each FD from the given set to this set.
 // Since two different tables may have some column ID overlap, we better use
 // column unique ID to build the FDSet instead.
-func (s *FDSet) AddFrom(fds *FDSet) {
+func (s *FDSet) AddFrom(fds *FDSet, acrossBlock bool) {
 	for i := range fds.fdEdges {
 		fd := fds.fdEdges[i]
 		if fd.equiv {
@@ -903,10 +906,12 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 			s.HashCodeToUniqueID[k] = v
 		}
 	}
-	for i, ok := fds.GroupByCols.Next(0); ok; i, ok = fds.GroupByCols.Next(i + 1) {
-		s.GroupByCols.Insert(i)
+	if !acrossBlock {
+		for i, ok := fds.GroupByCols.Next(0); ok; i, ok = fds.GroupByCols.Next(i + 1) {
+			s.GroupByCols.Insert(i)
+		}
+		s.HasAggBuilt = fds.HasAggBuilt
 	}
-	s.HasAggBuilt = fds.HasAggBuilt
 	s.Rule333Equiv = fds.Rule333Equiv
 }
 
