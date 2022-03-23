@@ -1321,6 +1321,8 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 		}
 	}
 	proj.SetChildren(p)
+	var resultP LogicalPlan
+	resultP = proj
 	// delay the only-full-group-by-check in create view statement to later query.
 	var orderByItemExprs []*util.ByItems
 	if !b.isCreateView {
@@ -1438,8 +1440,11 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 				default:
 				}
 			}
+			if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT SUM(a) FROM t1  ORDER BY (SELECT") {
+				fmt.Println(1)
+			}
 			// check only-full-group-by 4 order-by clause with group-by clause
-			orderByItemExprs, err = b.buildOrderByItems(ctx, proj, sel.OrderBy.Items, orderMapper, windowMapper, proj.Exprs, oldLen, sel.Distinct)
+			resultP, orderByItemExprs, err = b.buildOrderByItems(ctx, proj, sel.OrderBy.Items, orderMapper, windowMapper, proj.Exprs, oldLen, sel.Distinct)
 			if err != nil {
 				return nil, nil, 0, err
 			}
@@ -1586,7 +1591,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 			}
 		}
 	}
-	return proj, orderByItemExprs, oldLen, nil
+	return resultP, orderByItemExprs, oldLen, nil
 }
 
 func (b *PlanBuilder) buildDistinct(child LogicalPlan, length int) (*LogicalAggregation, error) {
@@ -1986,7 +1991,7 @@ func (b *PlanBuilder) buildSort(ctx context.Context, p LogicalPlan, byItems []*a
 }
 
 func (b *PlanBuilder) buildOrderByItems(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int,
-	windowMapper map[*ast.WindowFuncExpr]int, projExprs []expression.Expression, oldLen int, hasDistinct bool) ([]*util.ByItems, error) {
+	windowMapper map[*ast.WindowFuncExpr]int, projExprs []expression.Expression, oldLen int, hasDistinct bool) (LogicalPlan, []*util.ByItems, error) {
 	exprs := make([]*util.ByItems, 0, len(byItems))
 	transformer := &itemTransformer{}
 	for _, item := range byItems {
@@ -1994,7 +1999,7 @@ func (b *PlanBuilder) buildOrderByItems(ctx context.Context, p LogicalPlan, byIt
 		item.Expr = newExpr.(ast.ExprNode)
 		it, np, err := b.rewriteWithPreprocess(ctx, item.Expr, p, aggMapper, windowMapper, true, nil)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		// check whether ORDER BY items show up in SELECT DISTINCT fields, see #12442
@@ -2008,7 +2013,7 @@ func (b *PlanBuilder) buildOrderByItems(ctx context.Context, p LogicalPlan, byIt
 		p = np
 		exprs = append(exprs, &util.ByItems{Expr: it, Desc: item.Desc})
 	}
-	return exprs, nil
+	return p, exprs, nil
 }
 
 func (b *PlanBuilder) buildSortWithCheck(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int, windowMapper map[*ast.WindowFuncExpr]int,
@@ -3368,7 +3373,7 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 	} else {
 		// check only-full-group-by 4 order-by clause without group-by clause
 		// Step1: judge whether this query is an aggregated query.
-		// Step2: there is a agg in order by while sql is not an aggregated query, errors.
+		// Step2: there is an agg in order by while sql is not an aggregated query, errors.
 		// Since here doesn't require FD to check, this can take place as soon as possible.
 		// Step1:
 		isNonAggregatedQuery := false
