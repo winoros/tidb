@@ -15,7 +15,6 @@
 package core
 
 import (
-	"fmt"
 	"math"
 
 	"github.com/pingcap/tidb/expression"
@@ -596,6 +595,13 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	fds.MakeNotNull(notnullColsUniqueIDs)
 	// select max(a) from t group by b, we should project both `a` & `b` to maintain the FD down here, even if select-fields only contain `a`.
 	fds.ProjectCols(outputColsUniqueIDs.Union(fds.GroupByCols))
+	if fds.HasAggBuilt && fds.GroupByCols.Only1Zero() && p.baseLogicalPlan.FDChecked {
+		// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
+		fds.MaxOneRow(outputColsUniqueIDs)
+		// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
+		fds.HasAggBuilt = false
+		fds.GroupByCols.Clear()
+	}
 	// just trace it down in every operator for test checking.
 	p.fdSet = fds
 	return fds
@@ -1078,19 +1084,16 @@ func (la *LogicalApply) ExtractFD() *fd.FDSet {
 		}
 	}
 	// select (select t1.a from t1 where t1.rid = t2.id), count(t2.b) from t2 group by (t2.id)
-	// for correlated scalar sub-query, the whole sub-query will be projected as a new column for example X here.
+	// for correlated scalar sub-query, the whole sub-query will be projected as a new column for example here.
 	// while for every same t2.id, this sub-query's scalar output must be the same, actually it's a kind of strict FD here.
 	applyStrictDetermine := fd.NewFastIntSet()
 	applyStrictDependency := fd.NewFastIntSet()
-	if innerPlan.Schema().Len() == 1 {
+	if innerPlan.Schema().Len() == 1 && len(deduplicateCorrelatedCols) > 0 {
 		// single column in apply join inner side will be output directly.
 		for _, cc := range deduplicateCorrelatedCols {
 			applyStrictDetermine.Insert(int(cc.UniqueID))
 		}
 		applyStrictDependency.Insert(int(innerPlan.Schema().Columns[0].UniqueID))
-
-	} else {
-		// multi columns will be wrapped as a new row func, actually errors like: Operand should contain 1 column(s)
 	}
 
 	switch la.JoinType {
@@ -1099,7 +1102,6 @@ func (la *LogicalApply) ExtractFD() *fd.FDSet {
 	case LeftOuterJoin, RightOuterJoin:
 		fds := la.extractFDForOuterJoin(eqCond)
 		fds.AddStrictFunctionalDependency(applyStrictDetermine, applyStrictDependency)
-		fmt.Println("cao: from", applyStrictDetermine.String(), "to", applyStrictDependency)
 		return fds
 	case SemiJoin:
 		return la.extractFDForSemiJoin(eqCond)
