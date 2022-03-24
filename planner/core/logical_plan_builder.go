@@ -1440,9 +1440,6 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *a
 				default:
 				}
 			}
-			if strings.HasPrefix(b.ctx.GetSessionVars().StmtCtx.OriginalSQL, "SELECT SUM(a) FROM t1  ORDER BY (SELECT") {
-				fmt.Println(1)
-			}
 			// check only-full-group-by 4 order-by clause with group-by clause
 			resultP, orderByItemExprs, err = b.buildOrderByItems(ctx, proj, sel.OrderBy.Items, orderMapper, windowMapper, proj.Exprs, oldLen, sel.Distinct)
 			if err != nil {
@@ -3377,38 +3374,60 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 		// Since here doesn't require FD to check, this can take place as soon as possible.
 		// Step1:
 		isNonAggregatedQuery := false
-		resolver := colResolverForOnlyFullGroupBy{
+		resolver1 := colResolverForOnlyFullGroupBy{
 			firstOrderByAggColIdx: -1,
 		}
-		resolver.curClause = fieldList
+		resolver1.curClause = fieldList
 		for idx, field := range sel.Fields.Fields {
-			resolver.exprIdx = idx
-			field.Accept(&resolver)
+			resolver1.exprIdx = idx
+			field.Accept(&resolver1)
 		}
 		if sel.Having != nil {
-			sel.Having.Expr.Accept(&resolver)
+			sel.Having.Expr.Accept(&resolver1)
 		}
-		if !resolver.hasAggFunc {
+		if !resolver1.hasAggFunc {
 			isNonAggregatedQuery = true
 		}
 
 		// Step2:
 		if sel.OrderBy != nil && isNonAggregatedQuery {
+			// Temporarily solve the case like: SELECT a FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);
+			// We need to detect the correlated agg in order by clause, and report error in the outer query.
+			resolver2 := &correlatedAggregateResolver{
+				ctx:                ctx,
+				b:                  b,
+				outerPlan:          p,
+				correlatedAggFuncs: make([]*ast.AggregateFuncExpr, 0, len(sel.OrderBy.Items)),
+			}
 			// YES: SQL like `select a from t where a = 1 order by count(b)` is illegal.
 			// NO: SELECT t1.a FROM t1 GROUP BY t1.a HAVING t1.a IN (SELECT t2.a FROM t2 ORDER BY SUM(t1.b)) is ok.
 			// judge whether the aggregated func in order by item is referred to outer schema.
-			resolver.curClause = orderByClause
-			resolver.orderByAggMap = make(map[*ast.AggregateFuncExpr]int, len(sel.OrderBy.Items))
+			resolver1.curClause = orderByClause
+			resolver1.orderByAggMap = make(map[*ast.AggregateFuncExpr]int, len(sel.OrderBy.Items))
 			for idx, byItem := range sel.OrderBy.Items {
-				resolver.exprIdx = idx
-				byItem.Expr.Accept(&resolver)
+				resolver1.exprIdx = idx
+				byItem.Expr.Accept(&resolver1)
+
+				// detect the correlated agg in sub query.
+				_, ok := byItem.Expr.Accept(resolver2)
+				if !ok {
+					return resolver2.err
+				}
+				if len(resolver2.correlatedAggFuncs) > 0 {
+					for _, one := range resolver2.correlatedAggFuncs {
+						if _, ok := resolver1.orderByAggMap[one]; !ok {
+							resolver1.orderByAggMap[one] = idx
+						}
+					}
+					resolver2.correlatedAggFuncs = resolver2.correlatedAggFuncs[:0]
+				}
 			}
 			// has no order-by agg.
-			if len(resolver.orderByAggMap) == 0 {
+			if len(resolver1.orderByAggMap) == 0 {
 				return nil
 			}
 			// has some order-by agg.
-			for k, v := range resolver.orderByAggMap {
+			for k, v := range resolver1.orderByAggMap {
 				var cols []*expression.Column
 				for _, arg := range k.Args {
 					newArg, np, err := b.rewrite(ctx, arg, p, nil, true)
@@ -3424,6 +3443,39 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 				}
 				// use logical query block cols --- invalid
 				return ErrAggregateOrderNonAggQuery.GenWithStackByArgs(v + 1)
+			}
+		}
+		// we need extract all current-level-correlated columns from order by sub-query item to select fields if it has.
+		if sel.OrderBy != nil {
+			for _, byItem := range sel.OrderBy.Items {
+				if _, ok := byItem.Expr.(*ast.SubqueryExpr); ok {
+					// correlated agg will be extracted completely latter.
+					_, np, err := b.rewrite(ctx, byItem.Expr, p, nil, true)
+					if err != nil {
+						return err
+					}
+					correlatedCols := ExtractCorrelatedCols4LogicalPlan(np)
+					for _, cone := range correlatedCols {
+						for idx, pone := range p.Schema().Columns {
+							if cone.UniqueID == pone.UniqueID {
+								pname := p.OutputNames()[idx]
+								colName := &ast.ColumnName{
+									Schema: pname.DBName,
+									Table:  pname.TblName,
+									Name:   pname.ColName,
+								}
+								sel.Fields.Fields = append(sel.Fields.Fields, &ast.SelectField{
+									Auxiliary:         true,
+									AuxiliaryColInAgg: true,
+									Expr:              &ast.ColumnNameExpr{Name: colName},
+								})
+							}
+						}
+					}
+					// p = np, don't construct apply and substitute p here once there is a sub-query
+					// Because here is just like a pre-procession of pulling correlated column from sub-query to outer select fields.
+					// don't change the basic plan
+				}
 			}
 		}
 	}

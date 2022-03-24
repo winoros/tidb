@@ -230,4 +230,18 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	err = tk.ExecToErr("select b from t1 group by a")
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+
+	// fix issue 30025
+	tk.MustExec("drop table if exists t1,t2;")
+	tk.MustExec("CREATE TABLE t1(a INTEGER);")
+	tk.MustExec("INSERT INTO t1 VALUES (1), (2);")
+	err = tk.ExecToErr("SELECT a FROM t1 ORDER BY (SELECT COUNT(t1.a) FROM t1 AS t2);")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[planner:3029]Expression #1 of ORDER BY contains aggregate function and applies to the result of a non-aggregated query")
+	// from sql standard and what postgres does, this query should report more-than-one-row error in execution phase.
+	// but mysql has done a special check for it, since outer query has exactly only one row, group by clause can be eliminated (so order-by scalar sub-query check is bypassed)
+	err = tk.QueryToErr("SELECT SUM(a) FROM t1 ORDER BY (SELECT COUNT(t1.a) FROM t1 AS t2);")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[executor:1242]Subquery returns more than 1 row")
+	tk.MustQuery("SELECT SUM(a) FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);")
 }
