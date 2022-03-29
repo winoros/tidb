@@ -387,7 +387,7 @@ func (p *baseLogicalPlan) ExtractFD() *fd.FDSet {
 		return p.fdSet
 	}
 	fds := &fd.FDSet{HashCodeToUniqueID: make(map[string]int)}
-	// isolation between different logical selection blocks.
+	// isolation between different logical query blocks.
 	acrossBlock := false
 	for _, ch := range p.children {
 		if p.SelectBlockOffset() != ch.SelectBlockOffset() {
