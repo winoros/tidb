@@ -882,6 +882,11 @@ func (s FDSet) AllCols() FastIntSet {
 // AddFrom merges two FD sets by adding each FD from the given set to this set.
 // Since two different tables may have some column ID overlap, we better use
 // column unique ID to build the FDSet instead.
+//
+// AddFrom is commonly used to pull underlining FD up to current operator. Since
+// some ancillary factors for FD like hasAggBuild and GroupCols is strictly limited
+// into an exact scope --- that logical query block, but FD doesn't. So we should
+// clean that stuff when pulling FD across logical query blocks.
 func (s *FDSet) AddFrom(fds *FDSet, acrossBlock bool) {
 	for i := range fds.fdEdges {
 		fd := fds.fdEdges[i]
