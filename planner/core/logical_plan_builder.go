@@ -3325,18 +3325,18 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 		// Since here doesn't require FD to check, this can take place as soon as possible.
 		// Step1:
 		isNonAggregatedQuery := false
-		resolver1 := colResolverForOnlyFullGroupBy{
+		resolver4AggDetect := colResolverForOnlyFullGroupBy{
 			firstOrderByAggColIdx: -1,
 		}
-		resolver1.curClause = fieldList
+		resolver4AggDetect.curClause = fieldList
 		for idx, field := range sel.Fields.Fields {
-			resolver1.exprIdx = idx
-			field.Accept(&resolver1)
+			resolver4AggDetect.exprIdx = idx
+			field.Accept(&resolver4AggDetect)
 		}
 		if sel.Having != nil {
-			sel.Having.Expr.Accept(&resolver1)
+			sel.Having.Expr.Accept(&resolver4AggDetect)
 		}
-		if !resolver1.hasAggFunc {
+		if !resolver4AggDetect.hasAggFunc {
 			isNonAggregatedQuery = true
 		}
 
@@ -3344,7 +3344,7 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 		if sel.OrderBy != nil && isNonAggregatedQuery {
 			// Temporarily solve the case like: SELECT a FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);
 			// We need to detect the correlated agg in order by clause, and report error in the outer query.
-			resolver2 := &correlatedAggregateResolver{
+			resolver4CorAggDetect := &correlatedAggregateResolver{
 				ctx:                ctx,
 				b:                  b,
 				outerPlan:          p,
@@ -3353,47 +3353,45 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 			// YES: SQL like `select a from t where a = 1 order by count(b)` is illegal.
 			// NO: SELECT t1.a FROM t1 GROUP BY t1.a HAVING t1.a IN (SELECT t2.a FROM t2 ORDER BY SUM(t1.b)) is ok.
 			// judge whether the aggregated func in order by item is referred to outer schema.
-			resolver1.curClause = orderByClause
-			resolver1.orderByAggMap = make(map[*ast.AggregateFuncExpr]int, len(sel.OrderBy.Items))
+			resolver4AggDetect.curClause = orderByClause
+			resolver4AggDetect.orderByAggMap = make(map[*ast.AggregateFuncExpr]int, len(sel.OrderBy.Items))
 			for idx, byItem := range sel.OrderBy.Items {
-				resolver1.exprIdx = idx
-				byItem.Expr.Accept(&resolver1)
+				resolver4AggDetect.exprIdx = idx
+				byItem.Expr.Accept(&resolver4AggDetect)
 
 				// detect the correlated agg in sub query.
-				_, ok := byItem.Expr.Accept(resolver2)
+				_, ok := byItem.Expr.Accept(resolver4CorAggDetect)
 				if !ok {
-					return resolver2.err
+					return resolver4CorAggDetect.err
 				}
-				if len(resolver2.correlatedAggFuncs) > 0 {
-					for _, one := range resolver2.correlatedAggFuncs {
-						if _, ok := resolver1.orderByAggMap[one]; !ok {
-							resolver1.orderByAggMap[one] = idx
+				if len(resolver4CorAggDetect.correlatedAggFuncs) > 0 {
+					for _, one := range resolver4CorAggDetect.correlatedAggFuncs {
+						if _, ok := resolver4AggDetect.orderByAggMap[one]; !ok {
+							resolver4AggDetect.orderByAggMap[one] = idx
 						}
 					}
-					resolver2.correlatedAggFuncs = resolver2.correlatedAggFuncs[:0]
+					resolver4CorAggDetect.correlatedAggFuncs = resolver4CorAggDetect.correlatedAggFuncs[:0]
 				}
-			}
-			// has no order-by agg.
-			if len(resolver1.orderByAggMap) == 0 {
-				return nil
 			}
 			// has some order-by agg.
-			for k, v := range resolver1.orderByAggMap {
-				var cols []*expression.Column
-				for _, arg := range k.Args {
-					newArg, np, err := b.rewrite(ctx, arg, p, nil, true)
-					if err != nil {
-						return err
+			if len(resolver4AggDetect.orderByAggMap) != 0 {
+				for k, v := range resolver4AggDetect.orderByAggMap {
+					var cols []*expression.Column
+					for _, arg := range k.Args {
+						newArg, np, err := b.rewrite(ctx, arg, p, nil, true)
+						if err != nil {
+							return err
+						}
+						p = np
+						cols = append(cols, expression.ExtractColumns(newArg)...)
 					}
-					p = np
-					cols = append(cols, expression.ExtractColumns(newArg)...)
+					// use outer logical query block correlated cols --- valid
+					if len(cols) == 0 {
+						continue
+					}
+					// use logical query block cols --- invalid
+					return ErrAggregateOrderNonAggQuery.GenWithStackByArgs(v + 1)
 				}
-				// use outer logical query block correlated cols --- valid
-				if len(cols) == 0 {
-					continue
-				}
-				// use logical query block cols --- invalid
-				return ErrAggregateOrderNonAggQuery.GenWithStackByArgs(v + 1)
 			}
 		}
 		// we need extract all current-level-correlated columns from order by sub-query item to select fields if it has.
@@ -3416,7 +3414,8 @@ func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt
 									Name:   pname.ColName,
 								}
 								sel.Fields.Fields = append(sel.Fields.Fields, &ast.SelectField{
-									Auxiliary:         true,
+									Auxiliary: true,
+									// todo: not sure here, it should be unified with correlatedAggExtractor!
 									AuxiliaryColInAgg: true,
 									Expr:              &ast.ColumnNameExpr{Name: colName},
 								})
@@ -4153,7 +4152,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	var oldLen int
 	// According to https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html,
 	// we can only process window functions after having clause, so `considerWindow` is false now.
-	proj, oldLen, err = b.buildProjection(ctx, p, sel, totalMap, nil, orderMap, false, sel.OrderBy != nil)
+	proj, oldLen, err = b.buildProjection(ctx, p, sel, totalMap, nil, false, sel.OrderBy != nil)
 	p = proj
 	if err != nil {
 		return nil, err
@@ -4192,7 +4191,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		// In such case plan `p` is not changed, so we don't have to build another projection.
 		if hasWindowFuncField {
 			// Now we build the window function fields.
-			proj, oldLen, err = b.buildProjection(ctx, p, sel, windowAggMap, windowMapper, orderMap, true, false)
+			proj, oldLen, err = b.buildProjection(ctx, p, sel, windowAggMap, windowMapper, true, false)
 			p = proj
 			if err != nil {
 				return nil, err
