@@ -244,4 +244,12 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[executor:1242]Subquery returns more than 1 row")
 	tk.MustQuery("SELECT SUM(a) FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);")
+
+	// fix issue 26945
+	tk.MustExec("drop table if exists t1,t2")
+	tk.MustExec("create table t1(a int, b int)")
+	tk.MustExec("create table t2(a int, b int)")
+	tk.MustExec("insert into t1 values(1,1)")
+	tk.MustExec("insert into t2 values(1,1)")
+	tk.MustQuery("select one.a from t1 one order by (select two.b from t2 two where two.a = one.b)").Check(testkit.Rows("1"))
 }
