@@ -1235,11 +1235,12 @@ func findColFromNaturalUsingJoin(p LogicalPlan, col *expression.Column) (name *t
 }
 
 // buildProjection returns a Projection plan and non-aux columns length.
-func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields []*ast.SelectField, mapper map[*ast.AggregateFuncExpr]int,
-	windowMapper map[*ast.WindowFuncExpr]int, considerWindow bool, expandGenerateColumn bool) (LogicalPlan, []expression.Expression, int, error) {
+func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, sel *ast.SelectStmt, mapper map[*ast.AggregateFuncExpr]int,
+	windowMapper map[*ast.WindowFuncExpr]int, considerWindow bool, expandGenerateColumn bool) (LogicalPlan, int, error) {
+	fields := sel.Fields.Fields
 	err := b.preprocessUserVarTypes(ctx, p, fields, mapper)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, 0, err
 	}
 	b.optFlag |= flagEliminateProjection
 	b.curClause = fieldList
@@ -1269,7 +1270,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 			proj.Exprs = append(proj.Exprs, expr)
 			col, name, err := b.buildProjectionField(ctx, p, field, expr)
 			if err != nil {
-				return nil, nil, 0, err
+				return nil, 0, err
 			}
 			schema.Append(col)
 			newNames = append(newNames, name)
@@ -1277,7 +1278,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 		}
 		newExpr, np, err := b.rewriteWithPreprocess(ctx, field.Expr, p, mapper, windowMapper, true, nil)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, 0, err
 		}
 
 		// For window functions in the order by clause, we will append an field for it.
@@ -1293,7 +1294,7 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 
 		col, name, err := b.buildProjectionField(ctx, p, field, newExpr)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, 0, err
 		}
 		schema.Append(col)
 		newNames = append(newNames, name)
@@ -1396,33 +1397,15 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 				}
 				// Only1Zero is to judge whether it's no-group-by-items case.
 				if !fds.GroupByCols.Only1Zero() {
-					return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
+					return nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
 				} else {
-					return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
+					return nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
 				}
 			}
-			if fds.GroupByCols.Only1Zero() {
-				// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
-				projectionUniqueIDs := fd.NewFastIntSet()
-				for _, expr := range proj.Exprs {
-					switch x := expr.(type) {
-					case *expression.Column:
-						projectionUniqueIDs.Insert(int(x.UniqueID))
-					case *expression.ScalarFunction:
-						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
-						if !ok {
-							panic("selected expr must have been registered, shouldn't be here")
-						}
-						projectionUniqueIDs.Insert(scalarUniqueID)
-					}
-				}
-				fds.MaxOneRow(projectionUniqueIDs)
-			}
-			// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
-			fds.HasAggBuilt = false
 		}
+		proj.FDChecked = true
 	}
-	return proj, proj.Exprs, oldLen, nil
+	return proj, oldLen, nil
 }
 
 func (b *PlanBuilder) buildDistinct(child LogicalPlan, length int) (*LogicalAggregation, error) {
@@ -1817,42 +1800,214 @@ func (t *itemTransformer) Leave(inNode ast.Node) (ast.Node, bool) {
 	return inNode, false
 }
 
-func (b *PlanBuilder) buildSort(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int, windowMapper map[*ast.WindowFuncExpr]int) (*LogicalSort, error) {
-	return b.buildSortWithCheck(ctx, p, byItems, aggMapper, windowMapper, nil, 0, false)
+func (b *PlanBuilder) buildOrderByItems(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int,
+	windowMapper map[*ast.WindowFuncExpr]int) (LogicalPlan, []*util.ByItems, error) {
+	exprs := make([]*util.ByItems, 0, len(byItems))
+	transformer := &itemTransformer{}
+	for _, item := range byItems {
+		newExpr, _ := item.Expr.Accept(transformer)
+		item.Expr = newExpr.(ast.ExprNode)
+		it, np, err := b.rewriteWithPreprocess(ctx, item.Expr, p, aggMapper, windowMapper, true, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		p = np
+		exprs = append(exprs, &util.ByItems{Expr: it, Desc: item.Desc})
+	}
+	return p, exprs, nil
 }
 
-func (b *PlanBuilder) buildSortWithCheck(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int, windowMapper map[*ast.WindowFuncExpr]int,
-	projExprs []expression.Expression, oldLen int, hasDistinct bool) (*LogicalSort, error) {
+func (b *PlanBuilder) buildSort(ctx context.Context, p LogicalPlan, byItems []*ast.ByItem, aggMapper map[*ast.AggregateFuncExpr]int, windowMapper map[*ast.WindowFuncExpr]int) (*LogicalSort, error) {
 	if _, isUnion := p.(*LogicalUnionAll); isUnion {
 		b.curClause = globalOrderByClause
 	} else {
 		b.curClause = orderByClause
 	}
-	sort := LogicalSort{}.Init(b.ctx, b.getSelectOffset())
-	exprs := make([]*util.ByItems, 0, len(byItems))
-	transformer := &itemTransformer{}
-	for i, item := range byItems {
-		newExpr, _ := item.Expr.Accept(transformer)
-		item.Expr = newExpr.(ast.ExprNode)
-		it, np, err := b.rewriteWithPreprocess(ctx, item.Expr, p, aggMapper, windowMapper, true, nil)
-		if err != nil {
-			return nil, err
-		}
+	pSort := LogicalSort{}.Init(b.ctx, b.getSelectOffset())
+	p, orderByItemExprs, err := b.buildOrderByItems(ctx, p, byItems, aggMapper, windowMapper)
+	if err != nil {
+		return nil, err
+	}
+	pSort.ByItems = orderByItemExprs
+	pSort.SetChildren(p)
+	return pSort, nil
+}
 
-		// check whether ORDER BY items show up in SELECT DISTINCT fields, see #12442
-		if hasDistinct && projExprs != nil {
-			err = b.checkOrderByInDistinct(item, i, it, p, projExprs, oldLen)
-			if err != nil {
-				return nil, err
+func (b *PlanBuilder) buildSortCheck(ctx context.Context, p LogicalPlan, sel *ast.SelectStmt, proj *LogicalProjection, oldLen int, orderMapper map[*ast.AggregateFuncExpr]int, windowMapper map[*ast.WindowFuncExpr]int) (*LogicalSort, error) {
+	if _, isUnion := p.(*LogicalUnionAll); isUnion {
+		b.curClause = globalOrderByClause
+	} else {
+		b.curClause = orderByClause
+	}
+	pSort := LogicalSort{}.Init(b.ctx, b.getSelectOffset())
+	p, orderByItemExprs, err := b.buildOrderByItems(ctx, p, sel.OrderBy.Items, orderMapper, windowMapper)
+	if err != nil {
+		return nil, err
+	}
+	if !b.isCreateView {
+		// check only-full-group-by 4 order-by clause with group-by clause
+		fds := proj.ExtractFD()
+		if sel.OrderBy != nil {
+			selectExprsUniqueIDs := fd.NewFastIntSet()
+			for _, expr := range proj.Exprs[:oldLen] {
+				switch x := expr.(type) {
+				case *expression.Column:
+					selectExprsUniqueIDs.Insert(int(x.UniqueID))
+				case *expression.ScalarFunction:
+					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+					if !ok {
+						panic("selected expr must have been registered, shouldn't be here")
+					}
+					selectExprsUniqueIDs.Insert(scalarUniqueID)
+				default:
+				}
+			}
+			if sel.GroupBy != nil {
+				for offset, odrItem := range orderByItemExprs {
+					item := fd.NewFastIntSet()
+					switch x := odrItem.Expr.(type) {
+					case *expression.Column:
+						item.Insert(int(x.UniqueID))
+					case *expression.ScalarFunction:
+						// order by item may not be projected as a column in projection, allocated a new one
+						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+						if !ok {
+							// panic("selected expr must have been registered, shouldn't be here")
+							scalarUniqueID = int(b.ctx.GetSessionVars().AllocPlanColumnID())
+						}
+						item.Insert(scalarUniqueID)
+					case *expression.Constant:
+						// order by null/false/true can always be ok, let item be empty.
+					default:
+					}
+					// Step#1: whether order by item is in the origin select field list
+					if item.SubsetOf(selectExprsUniqueIDs) {
+						continue
+					}
+					// Step#2: whether order by item is in the group by list
+					if item.SubsetOf(fds.GroupByCols) {
+						continue
+					}
+					// Step#3: whether order by item is in the FD closure of group-by & select list items.
+					if item.SubsetOf(fds.ConstantCols()) {
+						continue
+					}
+					strictClosureOfGroupByCols := fds.ClosureOfStrict(fds.GroupByCols)
+					if item.SubsetOf(strictClosureOfGroupByCols) {
+						continue
+					}
+					strictClosureOfSelectCols := fds.ClosureOfStrict(selectExprsUniqueIDs)
+					if item.SubsetOf(strictClosureOfSelectCols) {
+						continue
+					}
+					// locate the base col that are not in (constant list / group by list / strict fd closure) for error show.
+					baseCols := expression.ExtractColumns(odrItem.Expr)
+					if len(baseCols) == 0 {
+						// order by item has no reference of base col, like order by abs(1) and rand()
+						continue
+					}
+					// GROUP BY t1.a, t2.b ORDER BY COALESCE(MIN(t.c), t2.b), agg min is determined by group-col definitely.
+					baseColsUniqueIDs := fd.NewFastIntSet()
+					for _, bc := range baseCols {
+						baseColsUniqueIDs.Insert(int(bc.UniqueID))
+					}
+					if baseColsUniqueIDs.SubsetOf(strictClosureOfGroupByCols) {
+						continue
+					}
+					if baseColsUniqueIDs.SubsetOf(strictClosureOfSelectCols) {
+						continue
+					}
+					errShowCol := baseCols[0]
+					for _, col := range baseCols {
+						colSet := fd.NewFastIntSet(int(col.UniqueID))
+						if !colSet.SubsetOf(strictClosureOfGroupByCols) && !colSet.SubsetOf(strictClosureOfSelectCols) {
+							errShowCol = col
+							break
+						}
+					}
+					// better use the schema alias name firstly if any.
+					name := ""
+					for idx, schemaCol := range proj.Schema().Columns {
+						if schemaCol.UniqueID == errShowCol.UniqueID {
+							name = proj.names[idx].String()
+							break
+						}
+					}
+					if name == "" {
+						name = errShowCol.OrigName
+					}
+					return nil, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInOrderBy, name)
+				}
+			}
+			if sel.Distinct {
+				// order-by with distinct case
+				// Rule #1: order by item should be in the select filed list
+				// Rule #2: the base col that order by item dependent on should be in the select field list
+				for offset, odrItem := range orderByItemExprs {
+					item := fd.NewFastIntSet()
+					switch x := odrItem.Expr.(type) {
+					case *expression.Column:
+						item.Insert(int(x.UniqueID))
+					case *expression.ScalarFunction:
+						// order by item may not be projected as a column in projection, allocated a new one
+						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+						if !ok {
+							// panic("selected expr must have been registered, shouldn't be here")
+							scalarUniqueID = int(b.ctx.GetSessionVars().AllocPlanColumnID())
+						}
+						item.Insert(scalarUniqueID)
+					default:
+					}
+					// Rule #1
+					if item.SubsetOf(selectExprsUniqueIDs) {
+						continue
+					}
+					// Rule #2
+					baseCols := expression.ExtractColumns(odrItem.Expr)
+					if len(baseCols) == 0 {
+						// order by item has no reference of base col, like order by abs(1) and rand()
+						continue
+					}
+					colSet := fd.NewFastIntSet()
+					for _, col := range baseCols {
+						colSet.Insert(int(col.UniqueID))
+					}
+					if colSet.SubsetOf(selectExprsUniqueIDs) {
+						continue
+					}
+					// find that error base col
+					errShowCol := baseCols[0]
+					for _, col := range baseCols {
+						colSet := fd.NewFastIntSet()
+						colSet.Insert(int(col.UniqueID))
+						if !colSet.SubsetOf(selectExprsUniqueIDs) {
+							errShowCol = col
+							break
+						}
+					}
+					// better use the schema alias name firstly if any.
+					name := ""
+					for idx, schemaCol := range proj.Schema().Columns {
+						if schemaCol.UniqueID == errShowCol.UniqueID {
+							name = proj.names[idx].String()
+							break
+						}
+					}
+					if name == "" {
+						name = errShowCol.OrigName
+					}
+					if _, ok := sel.OrderBy.Items[offset].Expr.(*ast.AggregateFuncExpr); ok {
+						return nil, ErrAggregateInOrderNotSelect.GenWithStackByArgs(offset+1, "DISTINCT")
+					}
+					// select distinct count(a) from t group by b order by sum(a);          ✗
+					return nil, ErrFieldInOrderNotSelect.GenWithStackByArgs(offset+1, name, "DISTINCT")
+				}
 			}
 		}
-
-		p = np
-		exprs = append(exprs, &util.ByItems{Expr: it, Desc: item.Desc})
 	}
-	sort.ByItems = exprs
-	sort.SetChildren(p)
-	return sort, nil
+	pSort.ByItems = orderByItemExprs
+	pSort.SetChildren(p)
+	return pSort, nil
 }
 
 // checkOrderByInDistinct checks whether ORDER BY has conflicts with DISTINCT, see #12442
@@ -2020,6 +2175,10 @@ func matchField(f *ast.SelectField, col *ast.ColumnNameExpr, ignoreAsName bool) 
 		}
 		return f.AsName.L == col.Name.Name.L
 	}
+	return false
+}
+
+func resolveFromOuterSchema(v *ast.ColumnNameExpr) bool {
 	return false
 }
 
@@ -3152,6 +3311,127 @@ func (b *PlanBuilder) checkOnlyFullGroupByWithGroupClause(p LogicalPlan, sel *as
 	return nil
 }
 
+func (b *PlanBuilder) checkOrderByPart1(ctx context.Context, sel *ast.SelectStmt, p LogicalPlan) error {
+	if sel.GroupBy != nil {
+		// check only-full-group-by 4 order-by clause with group-by clause
+		// Step#1: whether order by item is in the select field list
+		// Step#2: whether order by item is in the group by list
+		// Step#3: whether order by item is in the FD closure of group-by & select list items.
+		// Since FD hasn't been built yet for now, let's delay this logic to checkOrderByPart2.
+	} else {
+		// check only-full-group-by 4 order-by clause without group-by clause
+		// Step1: judge whether this query is an aggregated query.
+		// Step2: there is an agg in order by while sql is not an aggregated query, errors.
+		// Since here doesn't require FD to check, this can take place as soon as possible.
+		// Step1:
+		isNonAggregatedQuery := false
+		resolver4AggDetect := colResolverForOnlyFullGroupBy{
+			firstOrderByAggColIdx: -1,
+		}
+		resolver4AggDetect.curClause = fieldList
+		for idx, field := range sel.Fields.Fields {
+			resolver4AggDetect.exprIdx = idx
+			field.Accept(&resolver4AggDetect)
+		}
+		if sel.Having != nil {
+			sel.Having.Expr.Accept(&resolver4AggDetect)
+		}
+		if !resolver4AggDetect.hasAggFunc {
+			isNonAggregatedQuery = true
+		}
+
+		// Step2:
+		if sel.OrderBy != nil && isNonAggregatedQuery {
+			// Temporarily solve the case like: SELECT a FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);
+			// We need to detect the correlated agg in order by clause, and report error in the outer query.
+			resolver4CorAggDetect := &correlatedAggregateResolver{
+				ctx:                ctx,
+				b:                  b,
+				outerPlan:          p,
+				correlatedAggFuncs: make([]*ast.AggregateFuncExpr, 0, len(sel.OrderBy.Items)),
+			}
+			// YES: SQL like `select a from t where a = 1 order by count(b)` is illegal.
+			// NO: SELECT t1.a FROM t1 GROUP BY t1.a HAVING t1.a IN (SELECT t2.a FROM t2 ORDER BY SUM(t1.b)) is ok.
+			// judge whether the aggregated func in order by item is referred to outer schema.
+			resolver4AggDetect.curClause = orderByClause
+			resolver4AggDetect.orderByAggMap = make(map[*ast.AggregateFuncExpr]int, len(sel.OrderBy.Items))
+			for idx, byItem := range sel.OrderBy.Items {
+				resolver4AggDetect.exprIdx = idx
+				byItem.Expr.Accept(&resolver4AggDetect)
+
+				// detect the correlated agg in sub query.
+				_, ok := byItem.Expr.Accept(resolver4CorAggDetect)
+				if !ok {
+					return resolver4CorAggDetect.err
+				}
+				if len(resolver4CorAggDetect.correlatedAggFuncs) > 0 {
+					for _, one := range resolver4CorAggDetect.correlatedAggFuncs {
+						if _, ok := resolver4AggDetect.orderByAggMap[one]; !ok {
+							resolver4AggDetect.orderByAggMap[one] = idx
+						}
+					}
+					resolver4CorAggDetect.correlatedAggFuncs = resolver4CorAggDetect.correlatedAggFuncs[:0]
+				}
+			}
+			// has some order-by agg.
+			if len(resolver4AggDetect.orderByAggMap) != 0 {
+				for k, v := range resolver4AggDetect.orderByAggMap {
+					var cols []*expression.Column
+					for _, arg := range k.Args {
+						newArg, np, err := b.rewrite(ctx, arg, p, nil, true)
+						if err != nil {
+							return err
+						}
+						p = np
+						cols = append(cols, expression.ExtractColumns(newArg)...)
+					}
+					// use outer logical query block correlated cols --- valid
+					if len(cols) == 0 {
+						continue
+					}
+					// use logical query block cols --- invalid
+					return ErrAggregateOrderNonAggQuery.GenWithStackByArgs(v + 1)
+				}
+			}
+		}
+		// we need extract all current-level-correlated columns from order by sub-query item to select fields if it has.
+		if sel.OrderBy != nil {
+			for _, byItem := range sel.OrderBy.Items {
+				if _, ok := byItem.Expr.(*ast.SubqueryExpr); ok {
+					// correlated agg will be extracted completely latter.
+					_, np, err := b.rewrite(ctx, byItem.Expr, p, nil, true)
+					if err != nil {
+						return err
+					}
+					correlatedCols := ExtractCorrelatedCols4LogicalPlan(np)
+					for _, cone := range correlatedCols {
+						for idx, pone := range p.Schema().Columns {
+							if cone.UniqueID == pone.UniqueID {
+								pname := p.OutputNames()[idx]
+								colName := &ast.ColumnName{
+									Schema: pname.DBName,
+									Table:  pname.TblName,
+									Name:   pname.ColName,
+								}
+								sel.Fields.Fields = append(sel.Fields.Fields, &ast.SelectField{
+									Auxiliary: true,
+									// todo: not sure here, it should be unified with correlatedAggExtractor!
+									AuxiliaryColInAgg: true,
+									Expr:              &ast.ColumnNameExpr{Name: colName},
+								})
+							}
+						}
+					}
+					// p = np, don't construct apply and substitute p here once there is a sub-query
+					// Because here is just like a pre-procession of pulling correlated column from sub-query to outer select fields.
+					// don't change the basic plan
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (b *PlanBuilder) checkOnlyFullGroupByWithOutGroupClause(p LogicalPlan, sel *ast.SelectStmt) error {
 	resolver := colResolverForOnlyFullGroupBy{
 		firstOrderByAggColIdx: -1,
@@ -3177,7 +3457,7 @@ func (b *PlanBuilder) checkOnlyFullGroupByWithOutGroupClause(p LogicalPlan, sel 
 		// SQL like `select a from t where a = 1 order by count(b)` is illegal.
 		return ErrAggregateOrderNonAggQuery.GenWithStackByArgs(resolver.firstOrderByAggColIdx + 1)
 	}
-	if !resolver.hasAggFuncOrAnyValue || len(resolver.nonAggCols) == 0 {
+	if !(resolver.hasAggFunc || resolver.hasAnyValue) || len(resolver.nonAggCols) == 0 {
 		return nil
 	}
 	singleValueColNames := make(map[*types.FieldName]struct{}, len(sel.Fields.Fields))
@@ -3223,23 +3503,25 @@ type colResolverForOnlyFullGroupBy struct {
 	nonAggCols            []*ast.ColumnName
 	exprIdx               int
 	nonAggColIdxs         []int
-	hasAggFuncOrAnyValue  bool
+	hasAggFunc            bool
+	hasAnyValue           bool
 	firstOrderByAggColIdx int
 	curClause             clauseCode
+	orderByAggMap         map[*ast.AggregateFuncExpr]int
 }
 
 func (c *colResolverForOnlyFullGroupBy) Enter(node ast.Node) (ast.Node, bool) {
 	switch t := node.(type) {
 	case *ast.AggregateFuncExpr:
-		c.hasAggFuncOrAnyValue = true
+		c.hasAggFunc = true
 		if c.curClause == orderByClause {
-			c.firstOrderByAggColIdx = c.exprIdx
+			c.orderByAggMap[t] = c.exprIdx
 		}
 		return node, true
 	case *ast.FuncCallExpr:
 		// enable function `any_value` in aggregation even `ONLY_FULL_GROUP_BY` is set
 		if t.FnName.L == ast.AnyValue {
-			c.hasAggFuncOrAnyValue = true
+			c.hasAnyValue = true
 			return node, true
 		}
 	case *ast.ColumnNameExpr:
@@ -3721,7 +4003,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		windowAggMap                  map[*ast.AggregateFuncExpr]int
 		correlatedAggMap              map[*ast.AggregateFuncExpr]int
 		gbyCols                       []expression.Expression
-		projExprs                     []expression.Expression
+		proj                          LogicalPlan
 	)
 
 	// set for update read to true before building result set node
@@ -3760,6 +4042,11 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 			return nil, err
 		}
 		originalFields = sel.Fields.Fields
+	}
+
+	// basic order-by checking, nothing to do with only-full-group-by mode
+	if err := b.checkOrderByPart1(ctx, sel, p); err != nil {
+		return nil, err
 	}
 
 	if sel.GroupBy != nil {
@@ -3865,7 +4152,8 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	var oldLen int
 	// According to https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html,
 	// we can only process window functions after having clause, so `considerWindow` is false now.
-	p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, totalMap, nil, false, sel.OrderBy != nil)
+	proj, oldLen, err = b.buildProjection(ctx, p, sel, totalMap, nil, false, sel.OrderBy != nil)
+	p = proj
 	if err != nil {
 		return nil, err
 	}
@@ -3903,7 +4191,8 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		// In such case plan `p` is not changed, so we don't have to build another projection.
 		if hasWindowFuncField {
 			// Now we build the window function fields.
-			p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, windowAggMap, windowMapper, true, false)
+			proj, oldLen, err = b.buildProjection(ctx, p, sel, windowAggMap, windowMapper, true, false)
+			p = proj
 			if err != nil {
 				return nil, err
 			}
@@ -3919,7 +4208,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 
 	if sel.OrderBy != nil {
 		if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
-			p, err = b.buildSortWithCheck(ctx, p, sel.OrderBy.Items, orderMap, windowMapper, projExprs, oldLen, sel.Distinct)
+			p, err = b.buildSortCheck(ctx, p, sel, proj.(*LogicalProjection), oldLen, orderMap, windowMapper)
 		} else {
 			p, err = b.buildSort(ctx, p, sel.OrderBy.Items, orderMap, windowMapper)
 		}

@@ -72,13 +72,13 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t1.c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
 	_, err = tk.Exec("SELECT DISTINCT t1.a FROM t as t1 ORDER BY t1.d LIMIT 1;")
 	require.NotNil(t, err)
-	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t.d' which is not in SELECT list; this is incompatible with DISTINCT")
+	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t1.d' which is not in SELECT list; this is incompatible with DISTINCT")
 	_, err = tk.Exec("SELECT DISTINCT t1.a FROM t as t1 ORDER BY t1.d LIMIT 1;")
 	require.NotNil(t, err)
-	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t.d' which is not in SELECT list; this is incompatible with DISTINCT")
+	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t1.d' which is not in SELECT list; this is incompatible with DISTINCT")
 	_, err = tk.Exec("SELECT (SELECT DISTINCT t1.a FROM t as t1 ORDER BY t1.d LIMIT 1) FROM t as t2;")
 	require.NotNil(t, err)
-	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t.d' which is not in SELECT list; this is incompatible with DISTINCT")
+	require.Equal(t, err.Error(), "[planner:3065]Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t1.d' which is not in SELECT list; this is incompatible with DISTINCT")
 
 	// test case 7
 	tk.MustExec("drop table if exists t")
@@ -153,6 +153,7 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	// classic cases
 	tk.MustQuery("select customer1.a, count(*) from customer1 left join customer2 on customer1.a=customer2.b where customer2.pk in (7,9) group by customer2.b;")
 	tk.MustQuery("select customer1.a, count(*) from customer1 left join customer2 on customer1.a=1 where customer2.pk in (7,9) group by customer2.b;")
+	tk.MustQuery("select c1.a, count(*) from customer2 c3 left join (customer1 c1 left join customer2 c2 on c1.a=c2.b) on c3.b=c1.a where c2.pk in (7,9) group by c2.b;")
 	tk.MustExec("drop view if exists customer")
 	// this left join can extend left pk to all cols.
 	tk.MustExec("CREATE algorithm=merge definer='root'@'localhost' VIEW customer as SELECT pk,a,b FROM customer1 LEFT JOIN customer2 USING (pk);")
@@ -230,4 +231,26 @@ func TestOnlyFullGroupByOldCases(t *testing.T) {
 	err = tk.ExecToErr("select b from t1 group by a")
 	require.NotNil(t, err)
 	require.Equal(t, err.Error(), "[planner:1055]Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by")
+
+	// fix issue 30025
+	tk.MustExec("drop table if exists t1,t2;")
+	tk.MustExec("CREATE TABLE t1(a INTEGER);")
+	tk.MustExec("INSERT INTO t1 VALUES (1), (2);")
+	err = tk.ExecToErr("SELECT a FROM t1 ORDER BY (SELECT COUNT(t1.a) FROM t1 AS t2);")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[planner:3029]Expression #1 of ORDER BY contains aggregate function and applies to the result of a non-aggregated query")
+	// from sql standard and what postgres does, this query should report more-than-one-row error in execution phase.
+	// but mysql has done a special check for it, since outer query has exactly only one row, group by clause can be eliminated (so order-by scalar sub-query check is bypassed)
+	err = tk.QueryToErr("SELECT SUM(a) FROM t1 ORDER BY (SELECT COUNT(t1.a) FROM t1 AS t2);")
+	require.NotNil(t, err)
+	require.Equal(t, err.Error(), "[executor:1242]Subquery returns more than 1 row")
+	tk.MustQuery("SELECT SUM(a) FROM t1 ORDER BY (SELECT COUNT(t2.a) FROM t1 AS t2);")
+
+	// fix issue 26945
+	tk.MustExec("drop table if exists t1,t2")
+	tk.MustExec("create table t1(a int, b int)")
+	tk.MustExec("create table t2(a int, b int)")
+	tk.MustExec("insert into t1 values(1,1)")
+	tk.MustExec("insert into t2 values(1,1)")
+	tk.MustQuery("select one.a from t1 one order by (select two.b from t2 two where two.a = one.b)").Check(testkit.Rows("1"))
 }
