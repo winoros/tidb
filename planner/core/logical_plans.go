@@ -15,7 +15,9 @@
 package core
 
 import (
+	"fmt"
 	"math"
+	"strings"
 
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
@@ -365,6 +367,10 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 		outerFD.GroupByCols.Clear()
 	}
 	fds := outerFD
+
+	if strings.HasPrefix(p.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select c1.a, count(*) from customer2 c3 left join (customer1 c1 left join customer2 c2 on c1.a=c2.b) on c3.b=c1.a where c2.pk in (7,9) group by c2.b") {
+		fmt.Println(1)
+	}
 	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt, innerAcrossBlock)
 	p.fdSet = fds
 	return fds
@@ -1007,19 +1013,6 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 
 	// extract equivalence cols.
 	equivUniqueIDs := extractEquivalenceCols(p.Conditions, p.SCtx(), fds)
-
-	// after left join, according to rule 3.3.3, it may create a lax FD from inner equivalence
-	// cols pointing to outer equivalence cols.  eg: t left join t1 on t.a = t1.b, leading a
-	// lax FD from t1.b ~> t.a, this lax attribute is coming from supplied null value to all
-	// left rows, once there is a null-refusing predicate on the inner side on upper layer, this
-	// can be equivalence again. (the outer rows left are all coming from equal matching)
-	//
-	// why not just makeNotNull of them, because even a non-equiv-related inner col can also
-	// refuse supplied null values.
-	if fds.Rule333Equiv.InnerCols.Len() != 0 && notnullColsUniqueIDs.Intersects(fds.Rule333Equiv.InnerCols) {
-		// restore/re-strength FDs from rule 333
-		fds.MakeRestoreRule333()
-	}
 
 	// apply operator's characteristic's FD setting.
 	fds.MakeNotNull(notnullColsUniqueIDs)
