@@ -15,10 +15,6 @@
 package core
 
 import (
-	"fmt"
-	"math"
-	"strings"
-
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/infoschema"
@@ -36,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/ranger"
 	"go.uber.org/zap"
+	"math"
 )
 
 var (
@@ -368,9 +365,6 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 	}
 	fds := outerFD
 
-	if strings.HasPrefix(p.ctx.GetSessionVars().StmtCtx.OriginalSQL, "select c1.a, count(*) from customer2 c3 left join (customer1 c1 left join customer2 c2 on c1.a=c2.b) on c3.b=c1.a where c2.pk in (7,9) group by c2.b") {
-		fmt.Println(1)
-	}
 	fds.MakeOuterJoin(innerFD, filterFD, outerCols, innerCols, &opt, innerAcrossBlock)
 	p.fdSet = fds
 	return fds

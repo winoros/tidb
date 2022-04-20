@@ -1107,9 +1107,12 @@ func (s *FDSet) ProjectCols(cols FastIntSet) {
 					continue
 				}
 			}
-			if fd.removeColumnsToSide(fd.from) {
-				// fd.to side is empty, remove this FD.
-				continue
+			// from and to side of equiv are same, don't do trivial elimination.
+			if !fd.isEquivalence() {
+				if fd.removeColumnsToSide(fd.from) {
+					// fd.to side is empty, remove this FD.
+					continue
+				}
 			}
 		}
 
