@@ -239,8 +239,9 @@ func (p *LogicalJoin) extractFDForInnerJoin(filtersFromApply []expression.Expres
 		fds.HashCodeToUniqueID = rightFD.HashCodeToUniqueID
 	} else {
 		for k, v := range rightFD.HashCodeToUniqueID {
+			// If there's same constant in the different subquery, we might go into this IF branch.
 			if _, ok := fds.HashCodeToUniqueID[k]; ok {
-				panic("shouldn't be here, children has same expr while registered not only once")
+				continue
 			}
 			fds.HashCodeToUniqueID[k] = v
 		}
@@ -320,12 +321,6 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 		// judge whether left filters is on non-left-equiv cols.
 		if outerConditionUniqueIDs.Intersects(outerCols.Difference(equivOuterUniqueIDs)) {
 			opt.SkipFDRule331 = true
-		} else {
-			if equivAcrossNum > 1 {
-				opt.TypeFDRule331 = fd.CombinedFD
-			} else {
-				opt.TypeFDRule331 = fd.SingleFD
-			}
 		}
 	} else {
 		// if there is none across equivalence condition, skip rule 3.3.1.
@@ -336,7 +331,7 @@ func (p *LogicalJoin) extractFDForOuterJoin(filtersFromApply []expression.Expres
 	if opt.OnlyInnerFilter {
 		// if one of the inner condition is constant false, the inner side are all null, left make constant all of that.
 		for _, one := range innerCondition {
-			if c, ok := one.(*expression.Constant); ok {
+			if c, ok := one.(*expression.Constant); ok && c.DeferredExpr == nil && c.ParamMarker == nil {
 				if isTrue, err := c.Value.ToBool(p.ctx.GetSessionVars().StmtCtx); err == nil {
 					if isTrue == 0 {
 						// c is false
@@ -558,14 +553,8 @@ func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 				// the dependent columns in scalar function should be also considered as output columns as well.
 				outputColsUniqueIDs.Insert(int(one.UniqueID))
 			}
-			nullable := false
-			result := expression.EvaluateExprWithNull(p.ctx, p.schema, x)
-			con, ok := result.(*expression.Constant)
-			if !ok || con.Value.IsNull() {
-				// if x can be nullable when referred columns are null, the extended column can be nullable.
-				nullable = true
-			}
-			if !nullable || determinants.SubsetOf(fds.NotNullCols) {
+			notnull := isNullRejected(p.ctx, p.schema, x)
+			if notnull || determinants.SubsetOf(fds.NotNullCols) {
 				notnullColsUniqueIDs.Insert(scalarUniqueID)
 			}
 			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(scalarUniqueID))
@@ -703,14 +692,8 @@ func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 				determinants.Insert(int(one.UniqueID))
 				groupByColsOutputCols.Insert(int(one.UniqueID))
 			}
-			nullable := false
-			result := expression.EvaluateExprWithNull(la.ctx, la.schema, x)
-			con, ok := result.(*expression.Constant)
-			if !ok || con.Value.IsNull() {
-				// if x can be nullable when referred columns are null, the extended column can be nullable.
-				nullable = true
-			}
-			if !nullable || determinants.SubsetOf(fds.NotNullCols) {
+			notnull := isNullRejected(la.ctx, la.schema, x)
+			if notnull || determinants.SubsetOf(fds.NotNullCols) {
 				notnullColsUniqueIDs.Insert(scalarUniqueID)
 			}
 			fds.AddStrictFunctionalDependency(determinants, fd.NewFastIntSet(scalarUniqueID))
@@ -856,9 +839,6 @@ type LogicalSelection struct {
 	// but after we converted to CNF(Conjunctive normal form), it can be
 	// split into a list of AND conditions.
 	Conditions []expression.Expression
-
-	// having selection can't be pushed down, because it must above the aggregation.
-	buildByHaving bool
 }
 
 func extractNotNullFromConds(Conditions []expression.Expression, p LogicalPlan) fd.FastIntSet {
@@ -956,6 +936,7 @@ func extractEquivalenceCols(Conditions []expression.Expression, sctx sessionctx.
 	return equivUniqueIDs
 }
 
+// ExtractFD implements the LogicalPlan interface.
 func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
 	fds := p.baseLogicalPlan.ExtractFD()
@@ -966,7 +947,7 @@ func (p *LogicalSelection) ExtractFD() *fd.FDSet {
 	// join's schema will miss t2.a while join.full schema has. since selection
 	// itself doesn't contain schema, extracting schema should tell them apart.
 	var columns []*expression.Column
-	if join, ok := p.children[0].(*LogicalJoin); ok {
+	if join, ok := p.children[0].(*LogicalJoin); ok && join.fullSchema != nil {
 		columns = join.fullSchema.Columns
 	} else {
 		columns = p.Schema().Columns
@@ -1036,6 +1017,7 @@ func (la *LogicalApply) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
 	return corCols
 }
 
+// ExtractFD implements the LogicalPlan interface.
 func (la *LogicalApply) ExtractFD() *fd.FDSet {
 	innerPlan := la.children[1]
 	// build the join correlated equal condition for apply join, this equal condition is used for deriving the transitive FD between outer and inner side.
@@ -1870,15 +1852,19 @@ type CTEClass struct {
 	LimitBeg  uint64
 	LimitEnd  uint64
 	IsInApply bool
+	// pushDownPredicates may be push-downed by different references.
+	pushDownPredicates []expression.Expression
+	ColumnMap          map[string]*expression.Column
 }
 
 // LogicalCTE is for CTE.
 type LogicalCTE struct {
 	logicalSchemaProducer
 
-	cte       *CTEClass
-	cteAsName model.CIStr
-	seedStat  *property.StatsInfo
+	cte            *CTEClass
+	cteAsName      model.CIStr
+	seedStat       *property.StatsInfo
+	isOuterMostCTE bool
 }
 
 // LogicalCTETable is for CTE table

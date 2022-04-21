@@ -57,6 +57,7 @@ import (
 	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/plancodec"
 	"github.com/pingcap/tidb/util/set"
 )
@@ -976,7 +977,7 @@ func (b *PlanBuilder) buildSelection(ctx context.Context, p LogicalPlan, where a
 
 	conditions := splitWhere(where)
 	expressions := make([]expression.Expression, 0, len(conditions))
-	selection := LogicalSelection{buildByHaving: aggMapper != nil}.Init(b.ctx, b.getSelectOffset())
+	selection := LogicalSelection{}.Init(b.ctx, b.getSelectOffset())
 	for _, cond := range conditions {
 		expr, np, err := b.rewrite(ctx, cond, p, aggMapper, false)
 		if err != nil {
@@ -1163,10 +1164,12 @@ func (b *PlanBuilder) buildProjectionField(ctx context.Context, p LogicalPlan, f
 		RetType:               expr.GetType(),
 		CorrelatedColUniqueID: correlatedColUniqueID,
 	}
-	if b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol == nil {
-		b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol = make(map[string]int, 1)
+	if b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck {
+		if b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol == nil {
+			b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol = make(map[string]int, 1)
+		}
+		b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol[string(expr.HashCode(b.ctx.GetSessionVars().StmtCtx))] = int(newCol.UniqueID)
 	}
-	b.ctx.GetSessionVars().MapHashCode2UniqueID4ExtendedCol[string(expr.HashCode(b.ctx.GetSessionVars().StmtCtx))] = int(newCol.UniqueID)
 	newCol.SetCoercibility(expr.Coercibility())
 	return newCol, name, nil
 }
@@ -1321,14 +1324,14 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	}
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
-	if !b.isCreateView {
+	if !b.isCreateView && b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck && b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
 		fds := proj.ExtractFD()
 		// Projection -> Children -> ...
 		// Let the projection itself to evaluate the whole FD, which will build the connection
 		// 1: from select-expr to registered-expr
 		// 2: from base-column to select-expr
 		// After that
-		if p.SCtx().GetSessionVars().SQLMode.HasOnlyFullGroupBy() && fds.HasAggBuilt {
+		if fds.HasAggBuilt {
 			for offset, expr := range proj.Exprs[:len(fields)] {
 				// skip the auxiliary column in agg appended to select fields, which mainly comes from two kind of cases:
 				// 1: having agg(t.a), this will append t.a to the select fields, if it isn't here.
@@ -1346,7 +1349,8 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 					}
 					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
 					if !ok {
-						panic("selected expr must have been registered, shouldn't be here")
+						logutil.BgLogger().Warn("Error occurred while maintaining the functional dependency")
+						continue
 					}
 					item.Insert(scalarUniqueID)
 				default:
@@ -1397,9 +1401,8 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 				// Only1Zero is to judge whether it's no-group-by-items case.
 				if !fds.GroupByCols.Only1Zero() {
 					return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
-				} else {
-					return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
 				}
+				return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
 			}
 			if fds.GroupByCols.Only1Zero() {
 				// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
@@ -1411,7 +1414,8 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 					case *expression.ScalarFunction:
 						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
 						if !ok {
-							panic("selected expr must have been registered, shouldn't be here")
+							logutil.BgLogger().Warn("Error occurred while maintaining the functional dependency")
+							continue
 						}
 						projectionUniqueIDs.Insert(scalarUniqueID)
 					}
@@ -2102,34 +2106,6 @@ func (a *havingWindowAndOrderbyExprResolver) Enter(n ast.Node) (node ast.Node, s
 	return n, false
 }
 
-func dfsResolveFromInsideJoin(v *ast.ColumnNameExpr, p LogicalPlan) ([]*expression.Column, types.NameSlice, int, error) {
-	// For SQL like `select t2.a from t1 join t2 using(a) where t2.a > 0
-	// order by t2.a`, the query plan will be `join->selection->sort`. The
-	// schema of selection will be `[t1.a]`, thus we need to recursively
-	// retrieve the `t2.a` from the underlying join.
-	idx, err := expression.FindFieldName(p.OutputNames(), v.Name)
-	if err != nil {
-		return nil, nil, -1, err
-	}
-	if idx >= 0 {
-		return p.Schema().Columns, p.OutputNames(), idx, err
-	}
-	switch x := p.(type) {
-	case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow:
-		return dfsResolveFromInsideJoin(v, p.Children()[0])
-	case *LogicalJoin:
-		if len(x.fullNames) != 0 {
-			idx, err = expression.FindFieldName(x.fullNames, v.Name)
-			schemaCols, outputNames := x.fullSchema.Columns, x.fullNames
-			if err == nil && idx >= 0 {
-				return schemaCols, outputNames, idx, err
-			}
-		}
-	}
-	// -1, nil
-	return nil, nil, idx, err
-}
-
 func (a *havingWindowAndOrderbyExprResolver) resolveFromPlan(v *ast.ColumnNameExpr, p LogicalPlan) (int, error) {
 	idx, err := expression.FindFieldName(p.OutputNames(), v.Name)
 	if err != nil {
@@ -2137,20 +2113,20 @@ func (a *havingWindowAndOrderbyExprResolver) resolveFromPlan(v *ast.ColumnNameEx
 	}
 	schemaCols, outputNames := p.Schema().Columns, p.OutputNames()
 	if idx < 0 {
-		// maybe the referred column is in the outer schema stack.
-		for i := len(a.outerSchemas) - 1; i >= 0; i-- {
-			outerSchema, outerName := a.outerSchemas[i], a.outerNames[i]
-			idx, err = expression.FindFieldName(outerName, v.Name)
-			if err == nil && idx >= 0 {
-				schemaCols, outputNames = outerSchema.Columns, outerName
-				break
+		// For SQL like `select t2.a from t1 join t2 using(a) where t2.a > 0
+		// order by t2.a`, the query plan will be `join->selection->sort`. The
+		// schema of selection will be `[t1.a]`, thus we need to recursively
+		// retrieve the `t2.a` from the underlying join.
+		switch x := p.(type) {
+		case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow:
+			return a.resolveFromPlan(v, p.Children()[0])
+		case *LogicalJoin:
+			if len(x.fullNames) != 0 {
+				idx, err = expression.FindFieldName(x.fullNames, v.Name)
+				schemaCols, outputNames = x.fullSchema.Columns, x.fullNames
 			}
 		}
-	}
-	if idx < 0 {
-		// maybe the referred column is in the inside join's full schema.
-		schemaCols, outputNames, idx, err = dfsResolveFromInsideJoin(v, p)
-		if idx < 0 {
+		if err != nil || idx < 0 {
 			// nowhere to be found.
 			return -1, err
 		}
@@ -2309,7 +2285,7 @@ func (a *havingWindowAndOrderbyExprResolver) Leave(n ast.Node) (node ast.Node, o
 // resolveHavingAndOrderBy will process aggregate functions and resolve the columns that don't exist in select fields.
 // If we found some columns that are not in select fields, we will append it to select fields and update the colMapper.
 // When we rewrite the order by / having expression, we will find column in map at first.
-func (b *PlanBuilder) resolveHavingAndOrderBy(sel *ast.SelectStmt, p LogicalPlan) (
+func (b *PlanBuilder) resolveHavingAndOrderBy(ctx context.Context, sel *ast.SelectStmt, p LogicalPlan) (
 	map[*ast.AggregateFuncExpr]int, map[*ast.AggregateFuncExpr]int, error) {
 	extractor := &havingWindowAndOrderbyExprResolver{
 		p:            p,
@@ -2349,6 +2325,50 @@ func (b *PlanBuilder) resolveHavingAndOrderBy(sel *ast.SelectStmt, p LogicalPlan
 		}
 	}
 	sel.Fields.Fields = extractor.selectFields
+	// this part is used to fetch correlated column from sub-query item in order-by clause, and append the origin
+	// auxiliary select filed in select list, otherwise, sub-query itself won't get the name resolved in outer schema.
+	if sel.OrderBy != nil {
+		for _, byItem := range sel.OrderBy.Items {
+			if _, ok := byItem.Expr.(*ast.SubqueryExpr); ok {
+				// correlated agg will be extracted completely latter.
+				_, np, err := b.rewrite(ctx, byItem.Expr, p, nil, true)
+				if err != nil {
+					return nil, nil, errors.Trace(err)
+				}
+				correlatedCols := ExtractCorrelatedCols4LogicalPlan(np)
+				for _, cone := range correlatedCols {
+					var colName *ast.ColumnName
+					for idx, pone := range p.Schema().Columns {
+						if cone.UniqueID == pone.UniqueID {
+							pname := p.OutputNames()[idx]
+							colName = &ast.ColumnName{
+								Schema: pname.DBName,
+								Table:  pname.TblName,
+								Name:   pname.ColName,
+							}
+							break
+						}
+					}
+					if colName != nil {
+						columnNameExpr := &ast.ColumnNameExpr{Name: colName}
+						for _, field := range sel.Fields.Fields {
+							if c, ok := field.Expr.(*ast.ColumnNameExpr); ok && colMatch(c.Name, columnNameExpr.Name) {
+								// deduplicate select fields: don't append it once it already has one.
+								columnNameExpr = nil
+								break
+							}
+						}
+						if columnNameExpr != nil {
+							sel.Fields.Fields = append(sel.Fields.Fields, &ast.SelectField{
+								Auxiliary: true,
+								Expr:      columnNameExpr,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
 	return havingAggMapper, extractor.aggMapper, nil
 }
 
@@ -2503,12 +2523,9 @@ func (r *correlatedAggregateResolver) resolveSelect(sel *ast.SelectStmt) (err er
 		}
 	}
 	// collect correlated aggregate from sub-queries inside FROM clause.
-	_, err = r.collectFromTableRefs(r.ctx, sel.From)
-	if err != nil {
+	if err := r.collectFromTableRefs(sel.From); err != nil {
 		return err
 	}
-	// we cannot use cache if there are correlated aggregates inside FROM clause,
-	// since the plan we are building now is not correct and need to be rebuild later.
 	p, err := r.b.buildTableRefs(r.ctx, sel.From)
 	if err != nil {
 		return err
@@ -2532,7 +2549,7 @@ func (r *correlatedAggregateResolver) resolveSelect(sel *ast.SelectStmt) (err er
 		}
 	}
 
-	_, _, err = r.b.resolveHavingAndOrderBy(sel, p)
+	_, _, err = r.b.resolveHavingAndOrderBy(r.ctx, sel, p)
 	if err != nil {
 		return err
 	}
@@ -2569,9 +2586,9 @@ func (r *correlatedAggregateResolver) resolveSelect(sel *ast.SelectStmt) (err er
 	return nil
 }
 
-func (r *correlatedAggregateResolver) collectFromTableRefs(ctx context.Context, from *ast.TableRefsClause) (canCache bool, err error) {
+func (r *correlatedAggregateResolver) collectFromTableRefs(from *ast.TableRefsClause) error {
 	if from == nil {
-		return true, nil
+		return nil
 	}
 	subResolver := &correlatedAggregateResolver{
 		ctx: r.ctx,
@@ -2579,13 +2596,13 @@ func (r *correlatedAggregateResolver) collectFromTableRefs(ctx context.Context, 
 	}
 	_, ok := from.TableRefs.Accept(subResolver)
 	if !ok {
-		return false, subResolver.err
+		return subResolver.err
 	}
 	if len(subResolver.correlatedAggFuncs) == 0 {
-		return true, nil
+		return nil
 	}
 	r.correlatedAggFuncs = append(r.correlatedAggFuncs, subResolver.correlatedAggFuncs...)
-	return false, nil
+	return nil
 }
 
 func (r *correlatedAggregateResolver) collectFromSelectFields(p LogicalPlan, fields []*ast.SelectField) error {
@@ -2682,6 +2699,8 @@ func (b *PlanBuilder) resolveCorrelatedAggregates(ctx context.Context, sel *ast.
 				Table:  k.TblName,
 				Name:   k.ColName,
 			}
+			// Add the column referred in the agg func into the select list. So that we can resolve the agg func correctly.
+			// And we need set the AuxiliaryColInAgg to true to help our only_full_group_by checker work correctly.
 			sel.Fields.Fields = append(sel.Fields.Fields, &ast.SelectField{
 				Auxiliary:         true,
 				AuxiliaryColInAgg: true,
@@ -3740,9 +3759,6 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		}
 	}
 
-	// For sub-queries, the FROM clause may have already been built in outer query when resolving correlated aggregates.
-	// If the ResultSetNode inside FROM clause has nothing to do with correlated aggregates, we can simply get the
-	// existing ResultSetNode from the cache.
 	p, err = b.buildTableRefs(ctx, sel.From)
 	if err != nil {
 		return nil, err
@@ -3769,6 +3785,13 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		}
 	}
 
+	if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() && sel.From != nil && !b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck {
+		err = b.checkOnlyFullGroupBy(p, sel)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	hasWindowFuncField := b.detectSelectWindow(sel)
 	// Some SQL statements define WINDOW but do not use them. But we also need to check the window specification list.
 	// For example: select id from t group by id WINDOW w AS (ORDER BY uids DESC) ORDER BY id;
@@ -3786,7 +3809,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	// We must resolve having and order by clause before build projection,
 	// because when the query is "select a+1 as b from t having sum(b) < 0", we must replace sum(b) to sum(a+1),
 	// which only can be done before building projection and extracting Agg functions.
-	havingMap, orderMap, err = b.resolveHavingAndOrderBy(sel, p)
+	havingMap, orderMap, err = b.resolveHavingAndOrderBy(ctx, sel, p)
 	if err != nil {
 		return nil, err
 	}
@@ -3918,13 +3941,19 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	}
 
 	if sel.OrderBy != nil {
-		if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
-			p, err = b.buildSortWithCheck(ctx, p, sel.OrderBy.Items, orderMap, windowMapper, projExprs, oldLen, sel.Distinct)
-		} else {
-			p, err = b.buildSort(ctx, p, sel.OrderBy.Items, orderMap, windowMapper)
-		}
-		if err != nil {
-			return nil, err
+		// We need to keep the ORDER BY clause for the following cases:
+		// 1. The select is top level query, order should be honored
+		// 2. The query has LIMIT clause
+		// 3. The control flag requires keeping ORDER BY explicitly
+		if len(b.selectOffset) == 1 || sel.Limit != nil || !b.ctx.GetSessionVars().RemoveOrderbyInSubquery {
+			if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
+				p, err = b.buildSortWithCheck(ctx, p, sel.OrderBy.Items, orderMap, windowMapper, projExprs, oldLen, sel.Distinct)
+			} else {
+				p, err = b.buildSort(ctx, p, sel.OrderBy.Items, orderMap, windowMapper)
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -4091,11 +4120,15 @@ func (b *PlanBuilder) tryBuildCTE(ctx context.Context, tn *ast.TableName, asName
 				cte.cteClass = &CTEClass{IsDistinct: cte.isDistinct, seedPartLogicalPlan: cte.seedLP,
 					recursivePartLogicalPlan: cte.recurLP, IDForStorage: cte.storageID,
 					optFlag: cte.optFlag, HasLimit: hasLimit, LimitBeg: limitBeg,
-					LimitEnd: limitEnd}
+					LimitEnd: limitEnd, pushDownPredicates: make([]expression.Expression, 0), ColumnMap: make(map[string]*expression.Column)}
 			}
 			var p LogicalPlan
-			lp := LogicalCTE{cteAsName: tn.Name, cte: cte.cteClass, seedStat: cte.seedStat}.Init(b.ctx, b.getSelectOffset())
+			lp := LogicalCTE{cteAsName: tn.Name, cte: cte.cteClass, seedStat: cte.seedStat, isOuterMostCTE: !b.buildingCTE}.Init(b.ctx, b.getSelectOffset())
+			prevSchema := cte.seedLP.Schema().Clone()
 			lp.SetSchema(getResultCTESchema(cte.seedLP.Schema(), b.ctx.GetSessionVars()))
+			for i, col := range lp.schema.Columns {
+				lp.cte.ColumnMap[string(col.HashCode(nil))] = prevSchema.Columns[i]
+			}
 			p = lp
 			p.SetOutputNames(cte.seedLP.OutputNames())
 			if len(asName.String()) > 0 {
@@ -4159,6 +4192,15 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 		return b.buildMemTable(ctx, dbName, tableInfo)
 	}
 
+	tblName := *asName
+	if tblName.L == "" {
+		tblName = tn.Name
+	}
+	possiblePaths, err := getPossibleAccessPaths(b.ctx, b.TableHints(), tn.IndexHints, tbl, dbName, tblName, b.isForUpdateRead, b.is.SchemaMetaVersion())
+	if err != nil {
+		return nil, err
+	}
+
 	if tableInfo.IsView() {
 		if tn.TableSample != nil {
 			return nil, expression.ErrInvalidTableSample.GenWithStackByArgs("Unsupported TABLESAMPLE in views")
@@ -4198,14 +4240,6 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 		return nil, ErrPartitionClauseOnNonpartitioned
 	}
 
-	tblName := *asName
-	if tblName.L == "" {
-		tblName = tn.Name
-	}
-	possiblePaths, err := getPossibleAccessPaths(b.ctx, b.TableHints(), tn.IndexHints, tbl, dbName, tblName, b.isForUpdateRead, b.is.SchemaMetaVersion())
-	if err != nil {
-		return nil, err
-	}
 	// Skip storage engine check for CreateView.
 	if b.capFlag&canExpandAST == 0 {
 		possiblePaths, err = filterPathByIsolationRead(b.ctx, possiblePaths, tblName, dbName)
@@ -4421,6 +4455,7 @@ func (b *PlanBuilder) buildDataSource(ctx context.Context, tn *ast.TableName, as
 	return result, nil
 }
 
+// ExtractFD implements the LogicalPlan interface.
 func (ds *DataSource) ExtractFD() *fd.FDSet {
 	// FD in datasource (leaf node) can be cached and reused.
 	// Once the all conditions are not equal to nil, built it again.
@@ -4443,10 +4478,32 @@ func (ds *DataSource) ExtractFD() *fd.FDSet {
 			fds.AddStrictFunctionalDependency(keyCols, allCols)
 			fds.MakeNotNull(keyCols)
 		}
+		// we should check index valid while forUpdateRead, see detail in https://github.com/pingcap/tidb/pull/22152
+		var (
+			latestIndexes map[int64]*model.IndexInfo
+			changed       bool
+			err           error
+		)
+		if ds.isForUpdateRead {
+			latestIndexes, changed, err = getLatestIndexInfo(ds.ctx, ds.table.Meta().ID, 0)
+			if err != nil {
+				ds.fdSet = fds
+				return fds
+			}
+		}
 		// other indices including common handle.
 		for _, idx := range ds.tableInfo.Indices {
 			keyCols := fd.NewFastIntSet()
 			allColIsNotNull := true
+			if ds.isForUpdateRead && changed {
+				latestIndex, ok := latestIndexes[idx.ID]
+				if !ok || latestIndex.State != model.StatePublic {
+					continue
+				}
+			}
+			if idx.State != model.StatePublic {
+				continue
+			}
 			for _, idxCol := range idx.Columns {
 				// Note: even the prefix column can also be the FD. For example:
 				// unique(char_column(10)), will also guarantee the prefix to be
@@ -4632,6 +4689,8 @@ func (b *PlanBuilder) buildMemTable(_ context.Context, dbName model.CIStr, table
 			p.Extractor = &TikvRegionPeersExtractor{}
 		case infoschema.TableColumns:
 			p.Extractor = &ColumnsTableExtractor{}
+		case infoschema.TableTiKVRegionStatus:
+			p.Extractor = &TiKVRegionStatusExtractor{tablesID: make([]int64, 0)}
 		}
 	}
 	return p, nil
@@ -5466,10 +5525,10 @@ func (b *PlanBuilder) buildDelete(ctx context.Context, ds *ast.DeleteStmt) (Plan
 			tn.DBInfo = tb.DBInfo
 			tn.TableInfo = tb.TableInfo
 			if tn.TableInfo.IsView() {
-				return nil, errors.Errorf("delete view %s is not supported now.", tn.Name.O)
+				return nil, errors.Errorf("delete view %s is not supported now", tn.Name.O)
 			}
 			if tn.TableInfo.IsSequence() {
-				return nil, errors.Errorf("delete sequence %s is not supported now.", tn.Name.O)
+				return nil, errors.Errorf("delete sequence %s is not supported now", tn.Name.O)
 			}
 			if sessionVars.User != nil {
 				authErr = ErrTableaccessDenied.FastGenByArgs("DELETE", sessionVars.User.AuthUsername, sessionVars.User.AuthHostname, tb.Name.L)
@@ -5485,10 +5544,10 @@ func (b *PlanBuilder) buildDelete(ctx context.Context, ds *ast.DeleteStmt) (Plan
 				return nil, ErrNonUpdatableTable.GenWithStackByArgs(v.Name.O, "DELETE")
 			}
 			if v.TableInfo.IsView() {
-				return nil, errors.Errorf("delete view %s is not supported now.", v.Name.O)
+				return nil, errors.Errorf("delete view %s is not supported now", v.Name.O)
 			}
 			if v.TableInfo.IsSequence() {
-				return nil, errors.Errorf("delete sequence %s is not supported now.", v.Name.O)
+				return nil, errors.Errorf("delete sequence %s is not supported now", v.Name.O)
 			}
 			dbName := v.Schema.L
 			if dbName == "" {
@@ -6515,6 +6574,12 @@ func containDifferentJoinTypes(preferJoinType uint) bool {
 }
 
 func (b *PlanBuilder) buildCte(ctx context.Context, cte *ast.CommonTableExpression, isRecursive bool) (p LogicalPlan, err error) {
+	saveBuildingCTE := b.buildingCTE
+	b.buildingCTE = true
+	defer func() {
+		b.buildingCTE = saveBuildingCTE
+	}()
+
 	if isRecursive {
 		// buildingRecursivePartForCTE likes a stack. We save it before building a recursive CTE and restore it after building.
 		// We need a stack because we need to handle the nested recursive CTE. And buildingRecursivePartForCTE indicates the innermost CTE.

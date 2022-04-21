@@ -15,9 +15,10 @@
 package funcdep
 
 import (
-	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/pingcap/tidb/util/logutil"
 )
 
 type fdEdge struct {
@@ -550,19 +551,19 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 
 // MakeOuterJoin generates the records the fdSet of the outer join.
 //
-// We always take the left as the row-supplying side, and right side as the null-supplying side. (swap it if not)
-// As we know, the outer join would generate null extended rows compared with inner join.
-// So we cannot directly do the same thing with the inner join. This function deals with the special cases of the outer join.
+// We always take the left side as the row-supplying side and the right side as the null-supplying side. (swap it if not)
+// As we know, the outer join would generate null extended rows compared with the inner join.
+// So we cannot do the same thing directly with the inner join. This function deals with the special cases of the outer join.
 //
 // Knowledge:
-// 1: the filter condition related to lhs column won't filter predicate-allowed rows and refuse null rows (left rows are always exist for all)
-// 2: the filter condition related to rhs column won't filter NULL rows although filter has not null attribute on it. (null-appending happened after that)
+// 1: the filter condition related to the lhs column won't filter predicate-allowed rows and refuse null rows (left rows always remain)
+// 2: the filter condition related to the rhs column won't filter NULL rows, although the filter has the not-null attribute. (null-appending happened after that)
 //
 // Notification:
-// 1: the origin FD from left side (rows-supplying) over the result of outer join filtered are preserved, because
-//		it may be duplicated by multi matching, but actually they are same left rows (don't violate FD definition).
+// 1: the origin FD from the left side (rows-supplying) over the result of outer join filtered are preserved because
+//    it may be duplicated by multi-matching, but actually, they are the same left rows (don't violate FD definition).
 //
-// 2: the origin FD from right side (nulls-supplying) over the result of outer join filtered may not be valid anymore.
+// 2: the origin FD from the right side (nulls-supplying) over the result of outer join filtered may not be valid anymore.
 //
 //		<1> strict FD may be wakened as a lax one. But if at least one non-NULL column is part of the determinant, the
 //			strict FD can be preserved.
@@ -575,22 +576,22 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //			with null values, {d} -> {e} are degraded to a lax one {d} ~~> {e} as you see. the origin and supplied null value
 //			for d column determine different dependency.  NULL -> 1 and NULL -> NULL which breaks strict FD definition.
 //
-//			Unless the determinant contains at least a not null column for example c here, FD like {c,d} -> {e} can survive
+//			If the determinant contains at least a not null column for example c here, FD like {c,d} -> {e} can survive
 //			after the left join. Because you can not find two same key, one from the origin rows and the other one from the
 //			supplied rows.
 //
-//			for lax FD, the supplied rows of null values doesn't take effect of lax FD itself. So it can be kept.
+//			for lax FD, the supplied rows of null values don't affect lax FD itself. So we can keep it.
 //
-//		<2> constant FD should be removed, since null values may be substituted for some unmatched left rows. NULL is not a
+//		<2> The FDSet should remove constant FD since null values may be substituted for some unmatched left rows. NULL is not a
 //			constant anymore.
 //
-//      <3> equivalence FD should be removed, since substituted null value are not equal to the other substituted null value.
+//      <3> equivalence FD should be removed since substituted null values are not equal to the other substituted null value.
 //
-// 3: the newly added FD from filters, should take some considerations as below:
+// 3: the newly added FD from filters should take some consideration as below:
 //
 //	 	<1> strict/lax FD: join key filter conditions can not produce new strict/lax FD yet (knowledge: 1&2).
 //
-//		<2> constant FD from the join conditions is only used for the matching mechanism judgement.
+//		<2> constant FD from the join conditions is only used for checking other FD. We cannot keep itself.
 //			a   b  |  c     d
 //          -------+---------
 //          1   1  |  1     1
@@ -608,7 +609,7 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //          above all: constant FD are lost
 //
 //		<3.1> equivalence FD: when the left join conditions only contain equivalence FD (EFD for short below) across left and right
-//			cols and no other `LEFT` condition on (left cols - RED's from) to filter the left join results. We can maintain the strict
+//			cols and no other `LEFT` condition on the (left-side cols except the cols in EFD's from) to filter the left join results. We can maintain the strict
 //			FD from EFD's `from` side to EFD's `to` side over the left join result.
 //			a  b  |  c     d     e
 //			------+----------------
@@ -636,8 +637,8 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //
 // 			conclusion: without this kind of limited left conditions to judge the join match, we can say: FD {a} -> {c} exists.
 //
-//		<3.2> equivalence FD: when the determinant and dependencies from a equivalence FD of join condition are each covering a strict
-//			FD of the left / right side. The left side strict FD's dependencies can be extended to all cols after join result.
+//		<3.2> equivalence FD: when the determinant and dependencies from an equivalence FD of join condition are each covering a strict
+//			FD of the left / right side. After joining, we can extend the left side strict FD's dependencies to all cols.
 //			a  b  |  c     d     e
 //			------+----------------
 //		 	1  1  |  1    NULL   1
@@ -652,7 +653,7 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //				miss matched rows from left side are unique originally, even appended with NULL value from right side, they are still
 //				strictly determine themselves and even the all rows after left join.
 //			conclusion combined:
-//				equivalence with both strict Key from right and left, the left side's strict FD can be extended to all rows after left join.
+//				If there is an equivalence covering both strict Key from the right and left, we can create a new strict FD: {columns of the left side of the join in the equivalence} -> {all columns after join}.
 //
 //		<3.3> equivalence FD: let's see equivalence FD as double-directed strict FD from join equal conditions, and we  only keep the
 //			rhs ~~> lhs.
@@ -666,11 +667,11 @@ func (s *FDSet) MakeCartesianProduct(rhs *FDSet) {
 //			because two same determinant key {1} can point to different dependency {1} & {NULL}. But in return, FD like {c} -> {a}
 //			are degraded to the corresponding lax one.
 //
-// 4: the new formed FD {left key, right key} -> {all columns} are preserved in spite of the null-supplied rows.
-// 5: When there's no join key and no filters from the outer side. The join case is a cartesian product. In this case,
-//    the strict equivalence classes is still exists.
-//      - If the right side has no row, we would supply null-extended rows, then the value of any column is NULL, the equivalence class exists.
-//      - If the right side has rows, no row is filtered out after the filters since no row of the outer side is filtered out. Hence, the equivalence class is still remained.
+// 4: the new formed FD {left primary key, right primary key} -> {all columns} are preserved in spite of the null-supplied rows.
+// 5: There's no join key and no filters from the outer side. The join case is a cartesian product. In this case,
+//    the strict equivalence classes still exist.
+//      - If the right side has no row, we will supply null-extended rows, then the value of any column is NULL, and the equivalence class exists.
+//      - If the right side has rows, no row is filtered out after the filters since no row of the outer side is filtered out. Hence, the equivalence class remains.
 //
 func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols FastIntSet, opt *ArgOpts) {
 	//  copy down the left PK and right PK before the s has changed for later usage.
@@ -726,25 +727,18 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		}
 		// Rule #3.3, we only keep the lax FD from right side pointing the left side.
 		if edge.equiv {
+			equivColsRight := edge.from.Intersection(innerCols)
+			equivColsLeft := edge.from.Intersection(outerCols)
 			// equivalence: {superset} --> {superset}, either `from` or `to` side is ok here.
 			// Rule 3.3.1
 			if !opt.SkipFDRule331 {
-				leftCover := edge.from.Intersection(outerCols)
-				rightCover := edge.from.Intersection(innerCols)
-				if leftCover.Len() > 0 && rightCover.Len() > 0 {
-					if opt.TypeFDRule331 == CombinedFD {
-						leftCombinedFDFrom.UnionWith(leftCover)
-						leftCombinedFDTo.UnionWith(rightCover)
-					} else {
-						// singleFD case.
-						s.addFunctionalDependency(leftCover, rightCover, true, false)
-					}
+				if equivColsLeft.Len() > 0 && equivColsRight.Len() > 0 {
+					leftCombinedFDFrom.UnionWith(equivColsLeft)
+					leftCombinedFDTo.UnionWith(equivColsRight)
 				}
 			}
 
 			// Rule 3.3.2
-			equivColsRight := edge.from.Intersection(innerCols)
-			equivColsLeft := edge.from.Intersection(outerCols)
 			rightAllCols := copyRightFDSet.AllCols()
 			leftAllCols := copyLeftFDSet.AllCols()
 			coveringStrictKeyRight := rightAllCols.SubsetOf(copyRightFDSet.ClosureOfStrict(equivColsRight))
@@ -774,7 +768,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 		// Rule #3.1, filters won't produce any strict/lax FDs.
 	}
 	// Rule #3.3.1 combinedFD case
-	if !opt.SkipFDRule331 && opt.TypeFDRule331 == CombinedFD {
+	if !opt.SkipFDRule331 {
 		s.addFunctionalDependency(leftCombinedFDFrom, leftCombinedFDTo, true, false)
 	}
 
@@ -811,7 +805,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	} else {
 		for k, v := range innerFDs.HashCodeToUniqueID {
 			if _, ok := s.HashCodeToUniqueID[k]; ok {
-				panic("shouldn't be here, children has same expr while registered not only once")
+				logutil.BgLogger().Warn("Error occurred when building the functional dependency")
 			}
 			s.HashCodeToUniqueID[k] = v
 		}
@@ -822,6 +816,7 @@ func (s *FDSet) MakeOuterJoin(innerFDs, filterFDs *FDSet, outerCols, innerCols F
 	s.HasAggBuilt = s.HasAggBuilt || innerFDs.HasAggBuilt
 }
 
+// MakeRestoreRule333 reset the status of how we deal with this rule.
 func (s *FDSet) MakeRestoreRule333() {
 	for _, eg := range s.Rule333Equiv.Edges {
 		if eg.isConstant() {
@@ -834,20 +829,14 @@ func (s *FDSet) MakeRestoreRule333() {
 	s.Rule333Equiv.InnerCols.Clear()
 }
 
+// ArgOpts contains some arg used for FD maintenance.
 type ArgOpts struct {
 	SkipFDRule331   bool
-	TypeFDRule331   TypeFilterFD331
 	OnlyInnerFilter bool
 	InnerIsFalse    bool
 }
 
-type TypeFilterFD331 byte
-
-const (
-	SingleFD   TypeFilterFD331 = 0
-	CombinedFD TypeFilterFD331 = 1
-)
-
+// FindPrimaryKey checks whether there's a key in the current set which implies key -> all cols.
 func (s FDSet) FindPrimaryKey() (*FastIntSet, bool) {
 	allCols := s.AllCols()
 	for i := 0; i < len(s.fdEdges); i++ {
@@ -865,6 +854,7 @@ func (s FDSet) FindPrimaryKey() (*FastIntSet, bool) {
 	return nil, false
 }
 
+// AllCols returns all columns in the current set.
 func (s FDSet) AllCols() FastIntSet {
 	allCols := NewFastIntSet()
 	for i := 0; i < len(s.fdEdges); i++ {
@@ -898,7 +888,8 @@ func (s *FDSet) AddFrom(fds *FDSet) {
 	} else {
 		for k, v := range fds.HashCodeToUniqueID {
 			if _, ok := s.HashCodeToUniqueID[k]; ok {
-				panic("shouldn't be here, children has same expr while registered not only once")
+				logutil.BgLogger().Warn("Error occurred when building the functional dependency")
+				continue
 			}
 			s.HashCodeToUniqueID[k] = v
 		}
@@ -1112,7 +1103,7 @@ func (s *FDSet) makeEquivMap(detCols, projectedCols FastIntSet) map[int]int {
 			if equivMap == nil {
 				equivMap = make(map[int]int)
 			}
-			id, _ := closure.Next(0) // 不应该只记录一个
+			id, _ := closure.Next(0) // We can record more equiv columns.
 			equivMap[i] = id
 		}
 	}
@@ -1137,7 +1128,8 @@ func (e *fdEdge) String() string {
 	var b strings.Builder
 	if e.equiv {
 		if !e.strict {
-			panic(errors.New("lax equivalent columns are not supported"))
+			logutil.BgLogger().Warn("Error occurred when building the functional dependency. We don't support lax equivalent columns")
+			return "Wrong functional dependency"
 		}
 		_, _ = fmt.Fprintf(&b, "%s==%s", e.from, e.to)
 	} else {
@@ -1154,15 +1146,18 @@ func (e *fdEdge) String() string {
 func (s *FDSet) RegisterUniqueID(hashCode string, uniqueID int) {
 	if len(hashCode) == 0 {
 		// shouldn't be here.
-		panic("map empty expr hashcode to uniqueID")
+		logutil.BgLogger().Warn("Error occurred when building the functional dependency")
+		return
 	}
 	if _, ok := s.HashCodeToUniqueID[hashCode]; ok {
 		// shouldn't be here.
-		panic("hashcode has been registered")
+		logutil.BgLogger().Warn("Error occurred when building the functional dependency")
+		return
 	}
 	s.HashCodeToUniqueID[hashCode] = uniqueID
 }
 
+// IsHashCodeRegistered checks whether the given hashcode has been registered in the current set.
 func (s *FDSet) IsHashCodeRegistered(hashCode string) (int, bool) {
 	if uniqueID, ok := s.HashCodeToUniqueID[hashCode]; ok {
 		return uniqueID, true
