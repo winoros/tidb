@@ -1942,7 +1942,7 @@ func (b *PlanBuilder) buildSortCheck(ctx context.Context, p LogicalPlan, sel *as
 			if sel.Distinct {
 				// order-by with distinct case
 				// Rule #1: order by item should be in the select filed list
-				// Rule #2: the base col that order by item dependent on should be in the select field list
+				// Rule #2: the base col that order by item is dependent on should be in the select field list
 				for offset, odrItem := range orderByItemExprs {
 					item := fd.NewFastIntSet()
 					switch x := odrItem.Expr.(type) {
