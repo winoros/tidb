@@ -19,6 +19,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 	"math"
 	"reflect"
 	"sort"
@@ -400,6 +402,7 @@ func ParseBinaryFromString(s string) (bj BinaryJSON, err error) {
 	}
 	data := hack.Slice(s)
 	if !json.Valid(data) {
+		logutil.BgLogger().Warn("???", zap.ByteString("json value", data))
 		err = ErrInvalidJSONText.GenWithStackByArgs("The document root must not be followed by other values.")
 		return
 	}

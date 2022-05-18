@@ -16,6 +16,7 @@ package funcdep
 
 import (
 	"fmt"
+	"go.uber.org/zap"
 	"strings"
 
 	"github.com/pingcap/tidb/util/logutil"
@@ -1212,4 +1213,63 @@ func (s *FDSet) IsHashCodeRegistered(hashCode string) (int, bool) {
 		return uniqueID, true
 	}
 	return -1, false
+}
+
+func (s *FDSet) CopyFromWithMapping(src *FDSet, idMap map[int]int) {
+	s.fdEdges = make([]*fdEdge, 0, len(src.fdEdges))
+	for _, edge := range src.fdEdges {
+		newFrom := NewFastIntSet()
+		edge.from.ForEach(func(i int) {
+			if mapped, ok := idMap[i]; ok {
+				newFrom.Insert(mapped)
+			}
+		})
+		newTo := NewFastIntSet()
+		edge.to.ForEach(func(i int) {
+			if mapped, ok := idMap[i]; ok {
+				newTo.Insert(mapped)
+			}
+		})
+		s.fdEdges = append(s.fdEdges, &fdEdge{
+			from:   newFrom,
+			to:     newTo,
+			strict: edge.strict,
+			equiv:  edge.equiv,
+		})
+	}
+	for _, edge := range src.ncEdges {
+		newFrom := NewFastIntSet()
+		edge.from.ForEach(func(i int) {
+			if mapped, ok := idMap[i]; ok {
+				newFrom.Insert(mapped)
+			}
+		})
+		newTo := NewFastIntSet()
+		edge.to.ForEach(func(i int) {
+			if mapped, ok := idMap[i]; ok {
+				newTo.Insert(mapped)
+			}
+		})
+		newNCSet := NewFastIntSet()
+		edge.conditionNC.ForEach(func(i int) {
+			if mapped, ok := idMap[i]; ok {
+				newNCSet.Insert(mapped)
+			}
+		})
+		s.ncEdges = append(s.ncEdges, &fdEdge{
+			from:        newFrom,
+			to:          newTo,
+			strict:      edge.strict,
+			equiv:       edge.equiv,
+			conditionNC: &newNCSet,
+		})
+	}
+	newNotNullCols := NewFastIntSet()
+	src.NotNullCols.ForEach(func(i int) {
+		if mapped, ok := idMap[i]; ok {
+			newNotNullCols.Insert(mapped)
+		}
+	})
+	s.NotNullCols = newNotNullCols
+	logutil.BgLogger().Warn("???", zap.String("wtf2", s.String()))
 }

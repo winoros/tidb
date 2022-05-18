@@ -15,6 +15,7 @@
 package core
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/pingcap/tidb/expression"
@@ -487,6 +488,7 @@ type LogicalProjection struct {
 func (p *LogicalProjection) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
 	fds := p.logicalSchemaProducer.ExtractFD()
+	//return &fd.FDSet{}
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
@@ -643,6 +645,7 @@ func (la *LogicalAggregation) HasOrderBy() bool {
 func (la *LogicalAggregation) ExtractFD() *fd.FDSet {
 	// basically extract the children's fdSet.
 	fds := la.logicalSchemaProducer.ExtractFD()
+	logutil.BgLogger().Warn("extract fd for agg", zap.String("child fd", fds.String()))
 	// collect the output columns' unique ID.
 	outputColsUniqueIDs := fd.NewFastIntSet()
 	notnullColsUniqueIDs := fd.NewFastIntSet()
@@ -1899,4 +1902,22 @@ func (p *LogicalCTE) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
 		corCols = append(corCols, ExtractCorrelatedCols4LogicalPlan(p.cte.recursivePartLogicalPlan)...)
 	}
 	return corCols
+}
+
+func (p *LogicalCTE) ExtractFD() *fd.FDSet {
+	logutil.BgLogger().Warn("extract fd for cte", zap.Bool("the recursive part is nil", p.cte.recursivePartPhysicalPlan == nil))
+	if p.cte.recursivePartLogicalPlan != nil {
+		return &fd.FDSet{}
+	}
+	logutil.BgLogger().Warn("extract fd for cte", zap.String("the fd", p.cte.seedPartLogicalPlan.ExtractFD().String()))
+	idMap := make(map[int]int, p.schema.Len())
+	for i := range p.schema.Columns {
+		idMap[int(p.cte.seedPartLogicalPlan.Schema().Columns[i].UniqueID)] = int(p.schema.Columns[i].UniqueID)
+	}
+	logutil.BgLogger().Warn("extract fd for cte", zap.String("the id map", fmt.Sprintf("%v", idMap)))
+	fds := &fd.FDSet{}
+	fds.CopyFromWithMapping(p.cte.seedPartLogicalPlan.ExtractFD(), idMap)
+	p.fdSet = fds
+	logutil.BgLogger().Warn("extract fd for cte", zap.String("the final fd", fds.String()))
+	return p.fdSet
 }

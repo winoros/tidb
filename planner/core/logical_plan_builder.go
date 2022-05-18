@@ -17,6 +17,8 @@ package core
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap/tidb/util/hack"
+	"go.uber.org/zap"
 	"math"
 	"math/bits"
 	"sort"
@@ -56,7 +58,6 @@ import (
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/dbterror"
-	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mathutil"
 	"github.com/pingcap/tidb/util/plancodec"
@@ -1334,108 +1335,121 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
 	if !b.isCreateView && b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck && b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
-		fds := proj.ExtractFD()
-		// Projection -> Children -> ...
-		// Let the projection itself to evaluate the whole FD, which will build the connection
-		// 1: from select-expr to registered-expr
-		// 2: from base-column to select-expr
-		// After that
-		if fds.HasAggBuilt {
-			for offset, expr := range proj.Exprs[:len(fields)] {
-				// skip the auxiliary column in agg appended to select fields, which mainly comes from two kind of cases:
-				// 1: having agg(t.a), this will append t.a to the select fields, if it isn't here.
-				// 2: order by agg(t.a), this will append t.a to the select fields, if it isn't here.
-				if fields[offset].AuxiliaryColInAgg {
+		err := proj.CheckOnlyFullGroupBy(len(fields), fields, true)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+	}
+	return proj, proj.Exprs, oldLen, nil
+}
+
+func (proj *LogicalProjection) CheckOnlyFullGroupBy(testExprLen int, fields []*ast.SelectField, fromBuildSelect bool) error {
+	fds := proj.ExtractFD()
+	logutil.BgLogger().Warn("check fd", zap.String("the fd of the proj", fds.String()))
+	// Projection -> Children -> ...
+	// Let the projection itself to evaluate the whole FD, which will build the connection
+	// 1: from select-expr to registered-expr
+	// 2: from base-column to select-expr
+	// After that
+	if fds.HasAggBuilt {
+		for offset, expr := range proj.Exprs[:testExprLen] {
+			// skip the auxiliary column in agg appended to select fields, which mainly comes from two kind of cases:
+			// 1: having agg(t.a), this will append t.a to the select fields, if it isn't here.
+			// 2: order by agg(t.a), this will append t.a to the select fields, if it isn't here.
+			if fromBuildSelect && fields[offset].AuxiliaryColInAgg {
+				continue
+			}
+			item := fd.NewFastIntSet()
+			switch x := expr.(type) {
+			case *expression.Column:
+				item.Insert(int(x.UniqueID))
+			case *expression.ScalarFunction:
+				if expression.CheckFuncInExpr(x, ast.AnyValue) {
 					continue
 				}
-				item := fd.NewFastIntSet()
+				scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(proj.SCtx().GetSessionVars().StmtCtx))))
+				if !ok {
+					logutil.BgLogger().Warn("Error occurred while maintaining the functional dependency")
+					continue
+				}
+				item.Insert(scalarUniqueID)
+			default:
+			}
+			// Rule #1, if there are no group cols, the col in the order by shouldn't be limited.
+			if fds.GroupByCols.Only1Zero() && fromBuildSelect && fields[offset].AuxiliaryColInOrderBy {
+				continue
+			}
+
+			// Rule #2, if select fields are constant, it's ok.
+			if item.SubsetOf(fds.ConstantCols()) {
+				continue
+			}
+
+			// Rule #3, if select fields are subset of group by items, it's ok.
+			if item.SubsetOf(fds.GroupByCols) {
+				continue
+			}
+
+			// Rule #4, if select fields are dependencies of Strict FD with determinants in group-by items, it's ok.
+			// lax FD couldn't be done here, eg: for unique key (b), index key NULL & NULL are different rows with
+			// uncertain other column values.
+			strictClosure := fds.ClosureOfStrict(fds.GroupByCols)
+			if item.SubsetOf(strictClosure) {
+				continue
+			}
+			// locate the base col that are not in (constant list / group by list / strict fd closure) for error show.
+			baseCols := expression.ExtractColumns(expr)
+			errShowCol := baseCols[0]
+			for _, col := range baseCols {
+				colSet := fd.NewFastIntSet(int(col.UniqueID))
+				if !colSet.SubsetOf(strictClosure) {
+					errShowCol = col
+					break
+				}
+			}
+			// better use the schema alias name firstly if any.
+			name := ""
+			for idx, schemaCol := range proj.Schema().Columns {
+				if schemaCol.UniqueID == errShowCol.UniqueID {
+					name = proj.names[idx].String()
+					break
+				}
+			}
+			if name == "" {
+				name = errShowCol.OrigName
+			}
+			// Only1Zero is to judge whether it's no-group-by-items case.
+			if !fds.GroupByCols.Only1Zero() {
+				logutil.BgLogger().Warn("fd check failed",
+					zap.String("cur plan", ToString(proj)),
+					zap.String("the fields", fmt.Sprintf("%v", proj.Exprs[:testExprLen])),
+				)
+				return ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
+			}
+			return ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
+		}
+		if fds.GroupByCols.Only1Zero() {
+			// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
+			projectionUniqueIDs := fd.NewFastIntSet()
+			for _, expr := range proj.Exprs {
 				switch x := expr.(type) {
 				case *expression.Column:
-					item.Insert(int(x.UniqueID))
+					projectionUniqueIDs.Insert(int(x.UniqueID))
 				case *expression.ScalarFunction:
-					if expression.CheckFuncInExpr(x, ast.AnyValue) {
-						continue
-					}
-					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
+					scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(proj.SCtx().GetSessionVars().StmtCtx))))
 					if !ok {
 						logutil.BgLogger().Warn("Error occurred while maintaining the functional dependency")
 						continue
 					}
-					item.Insert(scalarUniqueID)
-				default:
+					projectionUniqueIDs.Insert(scalarUniqueID)
 				}
-				// Rule #1, if there are no group cols, the col in the order by shouldn't be limited.
-				if fds.GroupByCols.Only1Zero() && fields[offset].AuxiliaryColInOrderBy {
-					continue
-				}
-
-				// Rule #2, if select fields are constant, it's ok.
-				if item.SubsetOf(fds.ConstantCols()) {
-					continue
-				}
-
-				// Rule #3, if select fields are subset of group by items, it's ok.
-				if item.SubsetOf(fds.GroupByCols) {
-					continue
-				}
-
-				// Rule #4, if select fields are dependencies of Strict FD with determinants in group-by items, it's ok.
-				// lax FD couldn't be done here, eg: for unique key (b), index key NULL & NULL are different rows with
-				// uncertain other column values.
-				strictClosure := fds.ClosureOfStrict(fds.GroupByCols)
-				if item.SubsetOf(strictClosure) {
-					continue
-				}
-				// locate the base col that are not in (constant list / group by list / strict fd closure) for error show.
-				baseCols := expression.ExtractColumns(expr)
-				errShowCol := baseCols[0]
-				for _, col := range baseCols {
-					colSet := fd.NewFastIntSet(int(col.UniqueID))
-					if !colSet.SubsetOf(strictClosure) {
-						errShowCol = col
-						break
-					}
-				}
-				// better use the schema alias name firstly if any.
-				name := ""
-				for idx, schemaCol := range proj.Schema().Columns {
-					if schemaCol.UniqueID == errShowCol.UniqueID {
-						name = proj.names[idx].String()
-						break
-					}
-				}
-				if name == "" {
-					name = errShowCol.OrigName
-				}
-				// Only1Zero is to judge whether it's no-group-by-items case.
-				if !fds.GroupByCols.Only1Zero() {
-					return nil, nil, 0, ErrFieldNotInGroupBy.GenWithStackByArgs(offset+1, ErrExprInSelect, name)
-				}
-				return nil, nil, 0, ErrMixOfGroupFuncAndFields.GenWithStackByArgs(offset+1, name)
 			}
-			if fds.GroupByCols.Only1Zero() {
-				// maxOneRow is delayed from agg's ExtractFD logic since some details listed in it.
-				projectionUniqueIDs := fd.NewFastIntSet()
-				for _, expr := range proj.Exprs {
-					switch x := expr.(type) {
-					case *expression.Column:
-						projectionUniqueIDs.Insert(int(x.UniqueID))
-					case *expression.ScalarFunction:
-						scalarUniqueID, ok := fds.IsHashCodeRegistered(string(hack.String(x.HashCode(p.SCtx().GetSessionVars().StmtCtx))))
-						if !ok {
-							logutil.BgLogger().Warn("Error occurred while maintaining the functional dependency")
-							continue
-						}
-						projectionUniqueIDs.Insert(scalarUniqueID)
-					}
-				}
-				fds.MaxOneRow(projectionUniqueIDs)
-			}
-			// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
-			fds.HasAggBuilt = false
+			fds.MaxOneRow(projectionUniqueIDs)
 		}
+		// for select * from view (include agg), outer projection don't have to check select list with the inner group-by flag.
+		fds.HasAggBuilt = false
 	}
-	return proj, proj.Exprs, oldLen, nil
+	return nil
 }
 
 func (b *PlanBuilder) buildDistinct(child LogicalPlan, length int) (*LogicalAggregation, error) {

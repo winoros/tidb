@@ -943,9 +943,22 @@ func (er *expressionRewriter) handleInSubquery(ctx context.Context, v *ast.Patte
 			er.err = err
 			return v, true
 		}
+		aggOutputExpr := make([]expression.Expression, 0, agg.schema.Len())
+		for _, col := range agg.schema.Columns {
+			aggOutputExpr = append(aggOutputExpr, col)
+		}
+		proj := LogicalProjection{Exprs: aggOutputExpr}.Init(er.sctx, er.b.getSelectOffset())
+		proj.SetChildren(agg)
+		if !er.b.isCreateView && er.b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck && er.b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
+			err = proj.CheckOnlyFullGroupBy(agg.schema.Len(), nil, false)
+			if err != nil {
+				er.err = err
+				return v, true
+			}
+		}
 		// Build inner join above the aggregation.
 		join := LogicalJoin{JoinType: InnerJoin}.Init(er.sctx, er.b.getSelectOffset())
-		join.SetChildren(er.p, agg)
+		join.SetChildren(er.p, proj)
 		join.SetSchema(expression.MergeSchema(er.p.Schema(), agg.schema))
 		join.names = make([]*types.FieldName, er.p.Schema().Len()+agg.Schema().Len())
 		copy(join.names, er.p.OutputNames())
