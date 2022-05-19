@@ -1249,7 +1249,7 @@ func findColFromNaturalUsingJoin(p LogicalPlan, col *expression.Column) (name *t
 
 // buildProjection returns a Projection plan and non-aux columns length.
 func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields []*ast.SelectField, mapper map[*ast.AggregateFuncExpr]int,
-	windowMapper map[*ast.WindowFuncExpr]int, considerWindow bool, expandGenerateColumn bool) (LogicalPlan, []expression.Expression, int, error) {
+	windowMapper map[*ast.WindowFuncExpr]int, considerWindow bool, expandGenerateColumn bool, notNewOnlyFullGroupBy bool) (LogicalPlan, []expression.Expression, int, error) {
 	err := b.preprocessUserVarTypes(ctx, p, fields, mapper)
 	if err != nil {
 		return nil, nil, 0, err
@@ -1334,10 +1334,16 @@ func (b *PlanBuilder) buildProjection(ctx context.Context, p LogicalPlan, fields
 	}
 	proj.SetChildren(p)
 	// delay the only-full-group-by-check in create view statement to later query.
-	if !b.isCreateView && b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck && b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() {
-		err := proj.CheckOnlyFullGroupBy(len(fields), fields, true)
-		if err != nil {
-			return nil, nil, 0, err
+	if !b.isCreateView && b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() && b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck {
+		logutil.BgLogger().Warn("???", zap.Bool("not new", notNewOnlyFullGroupBy))
+		fds := proj.ExtractFD()
+		if notNewOnlyFullGroupBy {
+			fds.HasAggBuilt = false
+		} else {
+			err := proj.CheckOnlyFullGroupBy(len(fields), fields, true)
+			if err != nil {
+				return nil, nil, 0, err
+			}
 		}
 	}
 	return proj, proj.Exprs, oldLen, nil
@@ -3825,14 +3831,17 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		}
 	}
 
-	if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() && sel.From != nil && !b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck {
+	hasWindowFuncField := b.detectSelectWindow(sel)
+
+	useOldOnlyFullGroupBy := hasWindowFuncField || sel.OrderBy != nil || !b.ctx.GetSessionVars().OptimizerEnableNewOnlyFullGroupByCheck
+
+	if b.ctx.GetSessionVars().SQLMode.HasOnlyFullGroupBy() && sel.From != nil && useOldOnlyFullGroupBy {
 		err = b.checkOnlyFullGroupBy(p, sel)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	hasWindowFuncField := b.detectSelectWindow(sel)
 	// Some SQL statements define WINDOW but do not use them. But we also need to check the window specification list.
 	// For example: select id from t group by id WINDOW w AS (ORDER BY uids DESC) ORDER BY id;
 	// We don't use the WINDOW w, but if the 'uids' column is not in the table t, we still need to report an error.
@@ -3928,7 +3937,8 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	var oldLen int
 	// According to https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html,
 	// we can only process window functions after having clause, so `considerWindow` is false now.
-	p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, totalMap, nil, false, sel.OrderBy != nil)
+	logutil.BgLogger().Warn("???", zap.Bool("has window", hasWindowFuncField || sel.WindowSpecs != nil), zap.Bool("use old", useOldOnlyFullGroupBy))
+	p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, totalMap, nil, false, sel.OrderBy != nil, useOldOnlyFullGroupBy)
 	if err != nil {
 		return nil, err
 	}
@@ -3966,7 +3976,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		// In such case plan `p` is not changed, so we don't have to build another projection.
 		if hasWindowFuncField {
 			// Now we build the window function fields.
-			p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, windowAggMap, windowMapper, true, false)
+			p, projExprs, oldLen, err = b.buildProjection(ctx, p, sel.Fields.Fields, windowAggMap, windowMapper, true, false, useOldOnlyFullGroupBy)
 			if err != nil {
 				return nil, err
 			}
