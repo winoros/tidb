@@ -16,6 +16,11 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/opentracing/opentracing-go"
@@ -54,6 +59,11 @@ type Compiler struct {
 	Ctx sessionctx.Context
 }
 
+type RewriteResult struct {
+	Success bool   `json:"success"`
+	Result  *string `json:"resultSQL"`
+}
+
 // Compile compiles an ast.StmtNode to a physical plan.
 func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecStmt, err error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
@@ -72,6 +82,27 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 		err = errors.Errorf("%v", r)
 		logutil.Logger(ctx).Error("compile SQL panic", zap.String("SQL", stmtNode.Text()), zap.Stack("stack"), zap.Any("recover", r))
 	}()
+
+	if !c.Ctx.GetSessionVars().InRestrictedSQL {
+		resp, err := http.PostForm("http://127.0.0.1:12345/rewrite", url.Values{
+			"database": {c.Ctx.GetSessionVars().CurrentDB},
+			"rng": {strconv.Itoa(rand.Intn(65536))},
+			"sql": {stmtNode.Text()},
+			})
+		if err != nil {
+			logutil.BgLogger().Warn("the auto writing failed", zap.Error(err))
+		}
+		defer resp.Body.Close()
+		var rewriteResult RewriteResult
+		err = json.NewDecoder(resp.Body).Decode(&rewriteResult)
+		if err != nil {
+			logutil.BgLogger().Warn("decoding the result of auto rewriting failed", zap.Error(err))
+		}
+		logutil.BgLogger().Warn("rewriting", zap.Bool("success", rewriteResult.Success), zap.Stringp("the result", rewriteResult.Result))
+		if rewriteResult.Success && rewriteResult.Result != nil {
+			c.Ctx.GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("You can try to rewrite your SQL to the following:\n%s", *rewriteResult.Result))
+		}
+	}
 
 	c.Ctx.GetSessionVars().StmtCtx.IsReadOnly = plannercore.IsReadOnly(stmtNode, c.Ctx.GetSessionVars())
 
