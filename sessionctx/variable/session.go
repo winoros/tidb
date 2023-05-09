@@ -1325,7 +1325,14 @@ type SessionVars struct {
 
 	// EnableINLJoinInnerMultiPattern indicates whether enable multi pattern for index join inner side
 	EnableINLJoinInnerMultiPattern bool
+
+	// EnableMPPSharedCTEExecution indicates whether we enable the shared CTE execution strategy on MPP side.
+	EnableMPPSharedCTEExecution bool
 }
+
+// planReplayerSessionFinishedTaskKeyLen is used to control the max size for the finished plan replayer task key in session
+// in order to control the used memory
+const planReplayerSessionFinishedTaskKeyLen = 128
 
 // GetNewChunkWithCapacity Attempt to request memory from the chunk pool
 // thread safety
