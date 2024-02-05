@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/codec"
 	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/hack"
+	"github.com/pingcap/tidb/pkg/util/hasher"
 	"github.com/pingcap/tidb/pkg/util/intest"
 )
 
@@ -42,6 +43,7 @@ type ScalarFunction struct {
 	RetType           *types.FieldType
 	Function          builtinFunc
 	hashcode          []byte
+	hashVal           *hasher.Result
 	canonicalhashcode []byte
 }
 
@@ -482,6 +484,28 @@ func (sf *ScalarFunction) HashCode() []byte {
 	}
 	ReHashCode(sf)
 	return sf.hashcode
+}
+
+func (sf *ScalarFunction) HashByHasher(h *hasher.Hasher) (hasher.Result) {
+	if sf.hashVal != nil {
+		return *sf.hashVal
+	}
+	hashVals := make([]hasher.Result, len(sf.GetArgs()))
+	for i, arg := range sf.GetArgs() {
+		hashVals[i] = arg.HashByHasher(h)
+	}
+	h.Reset()
+	h.HashByte(scalarFunctionFlag)
+	h.HashBytes(hack.Slice(sf.FuncName.L))
+	for _, hashVal := range hashVals {
+		h.HashHashResult(hashVal)
+	}
+	if sf.FuncName.L == ast.Cast {
+		h.HashByte(byte(sf.RetType.EvalType()))
+	}
+	sf.hashVal = new(hasher.Result)
+	*sf.hashVal = h.Result()
+	return *sf.hashVal
 }
 
 // CanonicalHashCode implements Expression interface.

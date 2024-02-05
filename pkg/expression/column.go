@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/codec"
+	"github.com/pingcap/tidb/pkg/util/hasher"
 	"github.com/pingcap/tidb/pkg/util/size"
 )
 
@@ -240,6 +241,7 @@ type Column struct {
 	Index int
 
 	hashcode []byte
+	hashVal  *hasher.Result
 
 	// VirtualExpr is used to save expression for virtual column
 	VirtualExpr Expression
@@ -533,6 +535,18 @@ func (col *Column) HashCode() []byte {
 	col.hashcode = append(col.hashcode, columnFlag)
 	col.hashcode = codec.EncodeInt(col.hashcode, col.UniqueID)
 	return col.hashcode
+}
+
+func (col *Column) HashByHasher(h *hasher.Hasher) (hasher.Result) {
+	h.Reset()
+	if col.hashVal != nil {
+		return *col.hashVal
+	}
+	h.HashByte(columnFlag)
+	h.HashInt64(col.UniqueID)
+	col.hashVal = new(hasher.Result)
+	*col.hashVal = h.Result()
+	return *col.hashVal
 }
 
 // CanonicalHashCode implements Expression interface.

@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/codec"
 	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/hasher"
 	"github.com/pingcap/tidb/pkg/util/intest"
 )
 
@@ -124,6 +125,7 @@ type Constant struct {
 	// It's only used to reference a user variable provided in the `EXECUTE` statement or `COM_EXECUTE` binary protocol.
 	ParamMarker *ParamMarker
 	hashcode    []byte
+	hashVal     *hasher.Result
 
 	collationInfo
 }
@@ -448,6 +450,35 @@ func (c *Constant) Decorrelate(_ *Schema) Expression {
 // HashCode implements Expression interface.
 func (c *Constant) HashCode() []byte {
 	return c.getHashCode(false)
+}
+
+func (c *Constant) HashByHasher(h *hasher.Hasher) (hasher.Result) {
+	if c.hashVal != nil {
+		return *c.hashVal
+	}
+	if c.DeferredExpr != nil {
+		hv := c.DeferredExpr.HashByHasher(h)
+		h.Reset()
+		h.HashByte(constantFlag)
+		h.HashHashResult(hv)
+		c.hashVal = new(hasher.Result)
+		*c.hashVal = h.Result()
+		return *c.hashVal
+	}
+	h.Reset()
+	h.HashByte(constantFlag)
+	if c.ParamMarker != nil {
+		h.HashByte(parameterFlag)
+		h.HashInt64(int64(c.ParamMarker.order))
+		c.hashVal = new(hasher.Result)
+		*c.hashVal = h.Result()
+		return *c.hashVal
+	}
+	intest.Assert(c.DeferredExpr == nil && c.ParamMarker == nil)
+	h.HashDatum(&c.Value)
+	c.hashVal = new(hasher.Result)
+	*c.hashVal = h.Result()
+	return *c.hashVal
 }
 
 // CanonicalHashCode implements Expression interface.
