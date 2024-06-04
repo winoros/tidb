@@ -187,18 +187,18 @@ func ConvertConfigItem2JSON(ctx sessionctx.Context, key string, val expression.E
 	}
 	isNull := false
 	str := ""
-	switch val.GetType().EvalType() {
+	switch val.GetType(ctx.GetExprCtx().GetEvalCtx()).EvalType() {
 	case types.ETString:
 		var s string
-		s, isNull, err = val.EvalString(ctx, chunk.Row{})
+		s, isNull, err = val.EvalString(ctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 		if err == nil && !isNull {
 			str = fmt.Sprintf("%q", s)
 		}
 	case types.ETInt:
 		var i int64
-		i, isNull, err = val.EvalInt(ctx, chunk.Row{})
+		i, isNull, err = val.EvalInt(ctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 		if err == nil && !isNull {
-			if mysql.HasIsBooleanFlag(val.GetType().GetFlag()) {
+			if mysql.HasIsBooleanFlag(val.GetType(ctx.GetExprCtx().GetEvalCtx()).GetFlag()) {
 				str = "true"
 				if i == 0 {
 					str = "false"
@@ -209,13 +209,13 @@ func ConvertConfigItem2JSON(ctx sessionctx.Context, key string, val expression.E
 		}
 	case types.ETReal:
 		var f float64
-		f, isNull, err = val.EvalReal(ctx, chunk.Row{})
+		f, isNull, err = val.EvalReal(ctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 		if err == nil && !isNull {
 			str = fmt.Sprintf("%v", f)
 		}
 	case types.ETDecimal:
 		var d *types.MyDecimal
-		d, isNull, err = val.EvalDecimal(ctx, chunk.Row{})
+		d, isNull, err = val.EvalDecimal(ctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 		if err == nil && !isNull {
 			str = string(d.ToString())
 		}

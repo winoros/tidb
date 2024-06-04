@@ -217,6 +217,9 @@ type stmtSummaryByDigestElement struct {
 	// request-units
 	resourceGroupName string
 	StmtRUSummary
+
+	planCacheUnqualifiedCount int64
+	lastPlanCacheUnqualified  string // the reason why this query is unqualified for the plan cache
 }
 
 // StmtExecInfo records execution information of each statement.
@@ -229,7 +232,7 @@ type StmtExecInfo struct {
 	Digest              string
 	PrevSQL             string
 	PrevSQLDigest       string
-	PlanGenerator       func() (string, string)
+	PlanGenerator       func() (string, string, any)
 	BinaryPlanGenerator func() string
 	PlanDigest          string
 	PlanDigestGen       func() string
@@ -238,7 +241,7 @@ type StmtExecInfo struct {
 	ParseLatency        time.Duration
 	CompileLatency      time.Duration
 	StmtCtx             *stmtctx.StatementContext
-	CopTasks            *stmtctx.CopTasksDetails
+	CopTasks            *execdetails.CopTasksDetails
 	ExecDetail          *execdetails.ExecDetails
 	MemMax              int64
 	DiskMax             int64
@@ -257,6 +260,8 @@ type StmtExecInfo struct {
 	KeyspaceID        uint32
 	ResourceGroupName string
 	RUDetail          *util.RUDetails
+
+	PlanCacheUnqualified string
 }
 
 // newStmtSummaryByDigestMap creates an empty stmtSummaryByDigestMap.
@@ -597,6 +602,9 @@ func (ssbd *stmtSummaryByDigest) add(sei *StmtExecInfo, beginTime int64, interva
 		if isElementNew {
 			// If the element is new created, `ssElement.add(sei)` should be done inside the lock of `ssbd`.
 			ssElement = newStmtSummaryByDigestElement(sei, beginTime, intervalSeconds)
+			if ssElement == nil {
+				return nil, isElementNew
+			}
 			ssbd.history.PushBack(ssElement)
 		}
 
@@ -641,7 +649,10 @@ var MaxEncodedPlanSizeInBytes = 1024 * 1024
 func newStmtSummaryByDigestElement(sei *StmtExecInfo, beginTime int64, intervalSeconds int64) *stmtSummaryByDigestElement {
 	// sampleSQL / authUsers(sampleUser) / samplePlan / prevSQL / indexNames store the values shown at the first time,
 	// because it compacts performance to update every time.
-	samplePlan, planHint := sei.PlanGenerator()
+	samplePlan, planHint, e := sei.PlanGenerator()
+	if e != nil {
+		return nil
+	}
 	if len(samplePlan) > MaxEncodedPlanSizeInBytes {
 		samplePlan = plancodec.PlanDiscardedEncoded
 	}
@@ -855,6 +866,10 @@ func (ssElement *stmtSummaryByDigestElement) add(sei *StmtExecInfo, intervalSeco
 	} else {
 		ssElement.planInCache = false
 	}
+	if sei.PlanCacheUnqualified != "" {
+		ssElement.planCacheUnqualifiedCount++
+		ssElement.lastPlanCacheUnqualified = sei.PlanCacheUnqualified
+	}
 
 	// SPM
 	if sei.PlanInBinding {
@@ -917,7 +932,7 @@ func formatSQL(sql string) string {
 }
 
 // Format the backoffType map to a string or nil.
-func formatBackoffTypes(backoffMap map[string]int) interface{} {
+func formatBackoffTypes(backoffMap map[string]int) any {
 	type backoffStat struct {
 		backoffType string
 		count       int
@@ -969,7 +984,7 @@ func avgSumFloat(sum float64, count int64) float64 {
 	return 0
 }
 
-func convertEmptyToNil(str string) interface{} {
+func convertEmptyToNil(str string) any {
 	if str == "" {
 		return nil
 	}

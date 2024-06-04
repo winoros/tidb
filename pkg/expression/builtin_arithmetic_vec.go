@@ -82,12 +82,12 @@ func (b *builtinArithmeticDivideDecimalSig) vecEvalDecimal(ctx EvalContext, inpu
 	y := buf.Decimals()
 	var to types.MyDecimal
 	var frac int
-	sc := ctx.GetSessionVars().StmtCtx
+	ec := errCtx(ctx)
 	for i := 0; i < n; i++ {
 		if result.IsNull(i) {
 			continue
 		}
-		err = types.DecimalDiv(&x[i], &y[i], &to, types.DivFracIncr)
+		err = types.DecimalDiv(&x[i], &y[i], &to, ctx.GetDivPrecisionIncrement())
 		if err == types.ErrDivByZero {
 			if err = handleDivisionByZeroError(ctx); err != nil {
 				return err
@@ -95,7 +95,7 @@ func (b *builtinArithmeticDivideDecimalSig) vecEvalDecimal(ctx EvalContext, inpu
 			result.SetNull(i, true)
 			continue
 		} else if err == types.ErrTruncated {
-			if err = sc.HandleTruncate(errTruncatedWrongValue.GenWithStackByArgs("DECIMAL", to)); err != nil {
+			if err = ec.HandleError(errTruncatedWrongValue.GenWithStackByArgs("DECIMAL", to)); err != nil {
 				return err
 			}
 		} else if err == nil {
@@ -383,9 +383,9 @@ func (b *builtinArithmeticMinusIntSig) vecEvalInt(ctx EvalContext, input *chunk.
 	rhi64s := rh.Int64s()
 	resulti64s := result.Int64s()
 
-	forceToSigned := ctx.GetSessionVars().SQLMode.HasNoUnsignedSubtractionMode()
-	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType().GetFlag())
-	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType().GetFlag())
+	forceToSigned := sqlMode(ctx).HasNoUnsignedSubtractionMode()
+	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType(ctx).GetFlag())
+	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType(ctx).GetFlag())
 
 	errType := "BIGINT UNSIGNED"
 	signed := forceToSigned || (!isLHSUnsigned && !isRHSUnsigned)
@@ -564,7 +564,7 @@ func (b *builtinArithmeticIntDivideDecimalSig) vectorized() bool {
 }
 
 func (b *builtinArithmeticIntDivideDecimalSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
-	sc := ctx.GetSessionVars().StmtCtx
+	ec := errCtx(ctx)
 	n := input.NumRows()
 	var err error
 	var buf [2]*chunk.Column
@@ -583,8 +583,8 @@ func (b *builtinArithmeticIntDivideDecimalSig) vecEvalInt(ctx EvalContext, input
 		num[i] = buf[i].Decimals()
 	}
 
-	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType().GetFlag())
-	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType().GetFlag())
+	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType(ctx).GetFlag())
+	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType(ctx).GetFlag())
 	isUnsigned := isLHSUnsigned || isRHSUnsigned
 
 	result.ResizeInt64(n, false)
@@ -596,7 +596,7 @@ func (b *builtinArithmeticIntDivideDecimalSig) vecEvalInt(ctx EvalContext, input
 		}
 
 		c := &types.MyDecimal{}
-		err = types.DecimalDiv(&num[0][i], &num[1][i], c, types.DivFracIncr)
+		err = types.DecimalDiv(&num[0][i], &num[1][i], c, ctx.GetDivPrecisionIncrement())
 		if err == types.ErrDivByZero {
 			if err = handleDivisionByZeroError(ctx); err != nil {
 				return err
@@ -605,10 +605,10 @@ func (b *builtinArithmeticIntDivideDecimalSig) vecEvalInt(ctx EvalContext, input
 			continue
 		}
 		if err == types.ErrTruncated {
-			err = sc.HandleTruncate(errTruncatedWrongValue.GenWithStackByArgs("DECIMAL", c))
+			err = ec.HandleError(errTruncatedWrongValue.GenWithStackByArgs("DECIMAL", c))
 		} else if err == types.ErrOverflow {
 			newErr := errTruncatedWrongValue.GenWithStackByArgs("DECIMAL", c)
-			err = sc.HandleError(newErr)
+			err = ec.HandleError(newErr)
 		}
 		if err != nil {
 			return err
@@ -745,8 +745,8 @@ func (b *builtinArithmeticIntDivideIntSig) vecEvalInt(ctx EvalContext, input *ch
 	rhsI64s := rhsBuf.Int64s()
 	resultI64s := result.Int64s()
 
-	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType().GetFlag())
-	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType().GetFlag())
+	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType(ctx).GetFlag())
+	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType(ctx).GetFlag())
 
 	switch {
 	case isLHSUnsigned && isRHSUnsigned:
@@ -875,8 +875,8 @@ func (b *builtinArithmeticPlusIntSig) vecEvalInt(ctx EvalContext, input *chunk.C
 	rhi64s := rh.Int64s()
 	resulti64s := result.Int64s()
 
-	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType().GetFlag())
-	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType().GetFlag())
+	isLHSUnsigned := mysql.HasUnsignedFlag(b.args[0].GetType(ctx).GetFlag())
+	isRHSUnsigned := mysql.HasUnsignedFlag(b.args[1].GetType(ctx).GetFlag())
 
 	switch {
 	case isLHSUnsigned && isRHSUnsigned:

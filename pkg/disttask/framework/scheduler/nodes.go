@@ -20,33 +20,40 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/tidb/br/pkg/lightning/log"
-	disttaskutil "github.com/pingcap/tidb/pkg/util/disttask"
-	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
+	llog "github.com/pingcap/tidb/pkg/lightning/log"
+	"github.com/pingcap/tidb/pkg/util/intest"
 	"go.uber.org/zap"
 )
 
 var (
 	// liveNodesCheckInterval is the tick interval of fetching all server infos from etcs.
-	nodesCheckInterval = 2 * checkTaskFinishedInterval
+	nodesCheckInterval = 2 * CheckTaskFinishedInterval
 )
 
 // NodeManager maintains live TiDB nodes in the cluster, and maintains the nodes
 // managed by the framework.
 type NodeManager struct {
+	logger *zap.Logger
 	// prevLiveNodes is used to record the live nodes in last checking.
 	prevLiveNodes map[string]struct{}
-	// managedNodes is the cached nodes managed by the framework.
-	// see TaskManager.GetManagedNodes for more details.
-	managedNodes atomic.Pointer[[]string]
+	// nodes is the cached nodes managed by the framework.
+	// see TaskManager.GetNodes for more details.
+	nodes atomic.Pointer[[]proto.ManagedNode]
 }
 
-func newNodeManager() *NodeManager {
+func newNodeManager(serverID string) *NodeManager {
+	logger := log.L()
+	if intest.InTest {
+		logger = log.L().With(zap.String("server-id", serverID))
+	}
 	nm := &NodeManager{
+		logger:        logger,
 		prevLiveNodes: make(map[string]struct{}),
 	}
-	managedNodes := make([]string, 0, 10)
-	nm.managedNodes.Store(&managedNodes)
+	nodes := make([]proto.ManagedNode, 0, 10)
+	nm.nodes.Store(&nodes)
 	return nm
 }
 
@@ -67,15 +74,14 @@ func (nm *NodeManager) maintainLiveNodesLoop(ctx context.Context, taskMgr TaskMa
 // see recoverMetaLoop in task executor for when node is inserted into dist_framework_meta.
 func (nm *NodeManager) maintainLiveNodes(ctx context.Context, taskMgr TaskManager) {
 	// Safe to discard errors since this function can be called at regular intervals.
-	serverInfos, err := GenerateTaskExecutorNodes(ctx)
+	liveExecIDs, err := GetLiveExecIDs(ctx)
 	if err != nil {
-		logutil.BgLogger().Warn("generate task executor nodes met error", log.ShortError(err))
+		nm.logger.Warn("generate task executor nodes met error", llog.ShortError(err))
 		return
 	}
-	nodeChanged := len(serverInfos) != len(nm.prevLiveNodes)
-	currLiveNodes := make(map[string]struct{}, len(serverInfos))
-	for _, info := range serverInfos {
-		execID := disttaskutil.GenerateExecID(info)
+	nodeChanged := len(liveExecIDs) != len(nm.prevLiveNodes)
+	currLiveNodes := make(map[string]struct{}, len(liveExecIDs))
+	for _, execID := range liveExecIDs {
 		if _, ok := nm.prevLiveNodes[execID]; !ok {
 			nodeChanged = true
 		}
@@ -87,7 +93,7 @@ func (nm *NodeManager) maintainLiveNodes(ctx context.Context, taskMgr TaskManage
 
 	oldNodes, err := taskMgr.GetAllNodes(ctx)
 	if err != nil {
-		logutil.BgLogger().Warn("get all nodes met error", log.ShortError(err))
+		nm.logger.Warn("get all nodes met error", llog.ShortError(err))
 		return
 	}
 
@@ -101,17 +107,17 @@ func (nm *NodeManager) maintainLiveNodes(ctx context.Context, taskMgr TaskManage
 		nm.prevLiveNodes = currLiveNodes
 		return
 	}
-	logutil.BgLogger().Info("delete dead nodes from dist_framework_meta",
-		zap.Int("dead-nodes", len(deadNodes)))
+	nm.logger.Info("delete dead nodes from dist_framework_meta",
+		zap.Strings("dead-nodes", deadNodes))
 	err = taskMgr.DeleteDeadNodes(ctx, deadNodes)
 	if err != nil {
-		logutil.BgLogger().Warn("delete dead nodes from dist_framework_meta failed", log.ShortError(err))
+		nm.logger.Warn("delete dead nodes from dist_framework_meta failed", llog.ShortError(err))
 		return
 	}
 	nm.prevLiveNodes = currLiveNodes
 }
 
-func (nm *NodeManager) refreshManagedNodesLoop(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
+func (nm *NodeManager) refreshNodesLoop(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
 	ticker := time.NewTicker(nodesCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -119,7 +125,7 @@ func (nm *NodeManager) refreshManagedNodesLoop(ctx context.Context, taskMgr Task
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			nm.refreshManagedNodes(ctx, taskMgr, slotMgr)
+			nm.refreshNodes(ctx, taskMgr, slotMgr)
 		}
 	}
 }
@@ -127,34 +133,59 @@ func (nm *NodeManager) refreshManagedNodesLoop(ctx context.Context, taskMgr Task
 // TestRefreshedChan is used to sync the test.
 var TestRefreshedChan = make(chan struct{})
 
-// refreshManagedNodes maintains the nodes managed by the framework.
-func (nm *NodeManager) refreshManagedNodes(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
-	newNodes, err := taskMgr.GetManagedNodes(ctx)
+// refreshNodes maintains the nodes managed by the framework.
+func (nm *NodeManager) refreshNodes(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
+	newNodes, err := taskMgr.GetAllNodes(ctx)
 	if err != nil {
-		logutil.BgLogger().Warn("get managed nodes met error", log.ShortError(err))
+		nm.logger.Warn("get managed nodes met error", llog.ShortError(err))
 		return
 	}
-	nodeIDs := make([]string, 0, len(newNodes))
+
 	var cpuCount int
 	for _, node := range newNodes {
-		nodeIDs = append(nodeIDs, node.ID)
 		if node.CPUCount > 0 {
 			cpuCount = node.CPUCount
 		}
 	}
 	slotMgr.updateCapacity(cpuCount)
-	nm.managedNodes.Store(&nodeIDs)
+	nm.nodes.Store(&newNodes)
 
 	failpoint.Inject("syncRefresh", func() {
 		TestRefreshedChan <- struct{}{}
 	})
 }
 
-// GetManagedNodes returns the nodes managed by the framework.
-// return a copy of the managed nodes.
-func (nm *NodeManager) getManagedNodes() []string {
-	nodes := *nm.managedNodes.Load()
-	res := make([]string, len(nodes))
+// GetNodes returns the nodes managed by the framework.
+// return a copy of the nodes.
+func (nm *NodeManager) getNodes() []proto.ManagedNode {
+	nodes := *nm.nodes.Load()
+	res := make([]proto.ManagedNode, len(nodes))
 	copy(res, nodes)
 	return res
+}
+
+func filterByScope(nodes []proto.ManagedNode, targetScope string) []string {
+	var nodeIDs []string
+	haveBackground := false
+	for _, node := range nodes {
+		if node.Role == "background" {
+			haveBackground = true
+		}
+	}
+	// prefer to use "background" node instead of "" node.
+	if targetScope == "" && haveBackground {
+		for _, node := range nodes {
+			if node.Role == "background" {
+				nodeIDs = append(nodeIDs, node.ID)
+			}
+		}
+		return nodeIDs
+	}
+
+	for _, node := range nodes {
+		if node.Role == targetScope {
+			nodeIDs = append(nodeIDs, node.ID)
+		}
+	}
+	return nodeIDs
 }

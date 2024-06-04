@@ -181,7 +181,7 @@ func TestInconsistentIndex(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		txn, err := store.Begin()
 		require.NoError(t, err)
-		_, err = idxOp.Create(ctx, txn, types.MakeDatums(i+10), kv.IntHandle(100+i), nil)
+		_, err = idxOp.Create(ctx.GetTableCtx(), txn, types.MakeDatums(i+10), kv.IntHandle(100+i), nil)
 		require.NoError(t, err)
 		err = txn.Commit(context.Background())
 		require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestInconsistentIndex(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		txn, err := store.Begin()
 		require.NoError(t, err)
-		err = idxOp.Delete(ctx.GetSessionVars().StmtCtx, txn, types.MakeDatums(i+10), kv.IntHandle(100+i))
+		err = idxOp.Delete(ctx.GetTableCtx(), txn, types.MakeDatums(i+10), kv.IntHandle(100+i))
 		require.NoError(t, err)
 		err = txn.Commit(context.Background())
 		require.NoError(t, err)
@@ -314,16 +314,16 @@ func TestCoprocessorPagingSize(t *testing.T) {
 	// Check 'rpc_num' in the execution information
 	//
 	// mysql> explain analyze select * from t_paging;
-	// +--------------------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-	// | id                 |task      | execution info                                                                                                                                                                                       |
-	// +--------------------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-	// | TableReader_5      |root      | time:7.27ms, loops:2, cop_task: {num: 10, max: 1.57ms, min: 313.3µs, avg: 675.9µs, p95: 1.57ms, tot_proc: 2ms, rpc_num: 10, rpc_time: 6.69ms, copr_cache_hit_ratio: 0.00, distsql_concurrency: 15}   |
-	// | └─TableFullScan_4  |cop[tikv] | tikv_task:{proc max:1.48ms, min:294µs, avg: 629µs, p80:1.21ms, p95:1.48ms, iters:0, tasks:10}                                                                                                        |
-	// +--------------------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+	// +--------------------+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+	// | id                 |task      | execution info                                                                                                                                                                                                        |
+	// +--------------------+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+	// | TableReader_5      |root      | time:7.27ms, loops:2, cop_task: {num: 10, max: 1.57ms, min: 313.3µs, avg: 675.9µs, p95: 1.57ms, tot_proc: 2ms, copr_cache_hit_ratio: 0.00, distsql_concurrency: 15}, rpc_info:{Cop:{num_rpc:10, total_time:6.69ms}}   |
+	// | └─TableFullScan_4  |cop[tikv] | tikv_task:{proc max:1.48ms, min:294µs, avg: 629µs, p80:1.21ms, p95:1.48ms, iters:0, tasks:10}                                                                                                                         |
+	// +--------------------+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 	// 2 rows in set (0.01 sec)
 
-	getRPCNumFromExplain := func(rows [][]interface{}) (res uint64) {
-		re := regexp.MustCompile("rpc_num: ([0-9]+)")
+	getRPCNumFromExplain := func(rows [][]any) (res uint64) {
+		re := regexp.MustCompile("num_rpc:([0-9]+)")
 		for _, row := range rows {
 			buf := bytes.NewBufferString("")
 			_, _ = fmt.Fprintf(buf, "%s\n", row)

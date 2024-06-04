@@ -46,7 +46,7 @@ func TestJoin2(t *testing.T) {
 	tk.MustExec("insert t values (1)")
 	tests := []struct {
 		sql    string
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			"select 1 from t as a left join t as b on 0",
@@ -352,7 +352,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results := []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows(),
@@ -403,7 +403,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 	tk.MustExec("truncate table t")
 	tk.MustExec("insert into t values(1, null, 0), (2, 1, 0)")
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows(),
@@ -447,7 +447,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 	tk.MustExec("truncate table t")
 	tk.MustExec("insert into t values(1, null, 0), (2, 1, 0), (null, 2, 0)")
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows(),
@@ -498,7 +498,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows(),
@@ -531,7 +531,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows(
@@ -590,7 +590,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows("0"),
@@ -622,7 +622,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows("0"),
@@ -663,7 +663,7 @@ func TestNullEmptyAwareSemiJoin(t *testing.T) {
 		},
 	}
 	results = []struct {
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			testkit.Rows("0"),
@@ -720,7 +720,7 @@ func TestIssue18070(t *testing.T) {
 	err := tk.ExecToErr("select /*+ inl_hash_join(t1)*/ * from t1 join t2 on t1.a = t2.a;")
 	require.True(t, exeerrors.ErrMemoryExceedForQuery.Equal(err))
 
-	fpName := "github.com/pingcap/tidb/pkg/executor/mockIndexMergeJoinOOMPanic"
+	fpName := "github.com/pingcap/tidb/pkg/executor/join/mockIndexMergeJoinOOMPanic"
 	require.NoError(t, failpoint.Enable(fpName, `panic("ERROR 1105 (HY000): Out Of Memory Quota![conn=1]")`))
 	defer func() {
 		require.NoError(t, failpoint.Disable(fpName))
@@ -738,9 +738,9 @@ func TestIssue20779(t *testing.T) {
 	tk.MustExec("insert into t1 values(1, 1);")
 	tk.MustExec("insert into t1 select * from t1;")
 
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/executor/testIssue20779", "return"))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/executor/join/testIssue20779", "return"))
 	defer func() {
-		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/executor/testIssue20779"))
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/executor/join/testIssue20779"))
 	}()
 
 	rs, err := tk.Exec("select /*+ inl_hash_join(t2) */ t1.b from t1 left join t1 t2 on t1.b=t2.b order by t1.b;")
@@ -758,7 +758,7 @@ func TestIssue30211(t *testing.T) {
 	tk.MustExec("create table t1(a int, index(a));")
 	tk.MustExec("create table t2(a int, index(a));")
 	func() {
-		fpName := "github.com/pingcap/tidb/pkg/executor/TestIssue30211"
+		fpName := "github.com/pingcap/tidb/pkg/executor/join/TestIssue30211"
 		require.NoError(t, failpoint.Enable(fpName, `panic("TestIssue30211 IndexJoinPanic")`))
 		defer func() {
 			require.NoError(t, failpoint.Disable(fpName))

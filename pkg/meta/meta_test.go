@@ -228,6 +228,7 @@ func TestMeta(t *testing.T) {
 	tbInfo := &model.TableInfo{
 		ID:   1,
 		Name: model.NewCIStr("t"),
+		DBID: dbInfo.ID,
 	}
 	err = m.CreateTableOrView(1, dbInfo.Name.L, tbInfo)
 	require.NoError(t, err)
@@ -265,6 +266,7 @@ func TestMeta(t *testing.T) {
 	tbInfo2 := &model.TableInfo{
 		ID:   2,
 		Name: model.NewCIStr("bb"),
+		DBID: dbInfo.ID,
 	}
 	err = m.CreateTableOrView(1, dbInfo.Name.L, tbInfo2)
 	require.NoError(t, err)
@@ -358,7 +360,7 @@ func TestMeta(t *testing.T) {
 		ID:   3,
 		Name: model.NewCIStr("tbl3"),
 	}
-	err = m.CreateTableAndSetAutoID(1, dbInfo.Name.L, tbInfo3, 123, 0)
+	err = m.CreateTableAndSetAutoID(1, dbInfo.Name.L, tbInfo3, meta.AutoIDGroup{RowID: 123, IncrementID: 0})
 	require.NoError(t, err)
 	id, err := m.GetAutoIDAccessors(1, tbInfo3.ID).RowID().Get()
 	require.NoError(t, err)

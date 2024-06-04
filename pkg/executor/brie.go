@@ -48,9 +48,9 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/printer"
 	"github.com/pingcap/tidb/pkg/util/sem"
-	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/pingcap/tidb/pkg/util/syncutil"
 	filter "github.com/pingcap/tidb/pkg/util/table-filter"
 	"github.com/tikv/client-go/v2/oracle"
@@ -224,7 +224,7 @@ func (bq *brieQueue) clearTask(sc *stmtctx.StatementContext) {
 	bq.lastClearTime = time.Now()
 	currTime := types.CurrentTime(mysql.TypeDatetime)
 
-	bq.tasks.Range(func(key, value interface{}) bool {
+	bq.tasks.Range(func(key, value any) bool {
 		item := value.(*brieQueueItem)
 		if d := currTime.Sub(sc.TypeCtx(), &item.info.finishTime); d.Compare(outdatedDuration) > 0 {
 			bq.tasks.Delete(key)
@@ -300,18 +300,21 @@ func (b *executorBuilder) buildBRIE(s *ast.BRIEStmt, schema *expression.Schema) 
 	case "hdfs":
 		if sem.IsEnabled() {
 			// Storage is not permitted to be hdfs when SEM is enabled.
-			b.err = exeerrors.ErrNotSupportedWithSem.GenWithStackByArgs("hdfs storage")
+			b.err = plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs("hdfs storage")
 			return nil
 		}
 	case "local", "file", "":
 		if sem.IsEnabled() {
 			// Storage is not permitted to be local when SEM is enabled.
-			b.err = exeerrors.ErrNotSupportedWithSem.GenWithStackByArgs("local storage")
+			b.err = plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs("local storage")
 			return nil
 		}
 	default:
 	}
 
+	failpoint.Inject("modifyStore", func(v failpoint.Value) {
+		tidbCfg.Store = v.(string)
+	})
 	if tidbCfg.Store != "tikv" {
 		b.err = errors.Errorf("%s requires tikv store, not %s", s.Kind, tidbCfg.Store)
 		return nil
@@ -330,6 +333,28 @@ func (b *executorBuilder) buildBRIE(s *ast.BRIEStmt, schema *expression.Schema) 
 			cfg.Checksum = opt.UintValue != 0
 		case ast.BRIEOptionSendCreds:
 			cfg.SendCreds = opt.UintValue != 0
+		case ast.BRIEOptionChecksumConcurrency:
+			cfg.ChecksumConcurrency = uint(opt.UintValue)
+		case ast.BRIEOptionEncryptionKeyFile:
+			cfg.CipherInfo.CipherKey, err = task.GetCipherKeyContent("", opt.StrValue)
+			if err != nil {
+				b.err = err
+				return nil
+			}
+		case ast.BRIEOptionEncryptionMethod:
+			switch opt.StrValue {
+			case "aes128-ctr":
+				cfg.CipherInfo.CipherType = encryptionpb.EncryptionMethod_AES128_CTR
+			case "aes192-ctr":
+				cfg.CipherInfo.CipherType = encryptionpb.EncryptionMethod_AES192_CTR
+			case "aes256-ctr":
+				cfg.CipherInfo.CipherType = encryptionpb.EncryptionMethod_AES256_CTR
+			case "plaintext":
+				cfg.CipherInfo.CipherType = encryptionpb.EncryptionMethod_PLAINTEXT
+			default:
+				b.err = errors.Errorf("unsupported encryption method: %s", opt.StrValue)
+				return nil
+			}
 		}
 	}
 
@@ -383,6 +408,22 @@ func (b *executorBuilder) buildBRIE(s *ast.BRIEStmt, schema *expression.Schema) 
 					return nil
 				}
 				e.backupCfg.BackupTS = tso
+			case ast.BRIEOptionCompression:
+				switch opt.StrValue {
+				case "zstd":
+					e.backupCfg.CompressionConfig.CompressionType = backuppb.CompressionType_ZSTD
+				case "snappy":
+					e.backupCfg.CompressionConfig.CompressionType = backuppb.CompressionType_SNAPPY
+				case "lz4":
+					e.backupCfg.CompressionConfig.CompressionType = backuppb.CompressionType_LZ4
+				default:
+					b.err = errors.Errorf("unsupported compression type: %s", opt.StrValue)
+					return nil
+				}
+			case ast.BRIEOptionCompressionLevel:
+				e.backupCfg.CompressionConfig.CompressionLevel = int32(opt.UintValue)
+			case ast.BRIEOptionIgnoreStats:
+				e.backupCfg.IgnoreStats = opt.UintValue != 0
 			}
 		}
 
@@ -391,8 +432,15 @@ func (b *executorBuilder) buildBRIE(s *ast.BRIEStmt, schema *expression.Schema) 
 		rcfg.Config = cfg
 		e.restoreCfg = &rcfg
 		for _, opt := range s.Options {
-			if opt.Tp == ast.BRIEOptionOnline {
+			switch opt.Tp {
+			case ast.BRIEOptionOnline:
 				e.restoreCfg.Online = opt.UintValue != 0
+			case ast.BRIEOptionWaitTiflashReady:
+				e.restoreCfg.WaitTiflashReady = opt.UintValue != 0
+			case ast.BRIEOptionWithSysTable:
+				e.restoreCfg.WithSysTable = opt.UintValue != 0
+			case ast.BRIEOptionLoadStats:
+				e.restoreCfg.LoadStats = opt.UintValue != 0
 			}
 		}
 
@@ -605,7 +653,7 @@ func handleBRIEError(err error, terror *terror.Error) error {
 }
 
 func (e *ShowExec) fetchShowBRIE(kind ast.BRIEKind) error {
-	globalBRIEQueue.tasks.Range(func(key, value interface{}) bool {
+	globalBRIEQueue.tasks.Range(func(_, value any) bool {
 		item := value.(*brieQueueItem)
 		if item.info.kind == kind {
 			item.progress.lock.Lock()
@@ -715,13 +763,13 @@ type tidbGlueSession struct {
 // NOTE: Maybe drain the restult too? See `gluetidb.tidbSession.ExecuteInternal` for more details.
 func (gs *tidbGlueSession) Execute(ctx context.Context, sql string) error {
 	ctx = kv.WithInternalSourceType(ctx, kv.InternalTxnBR)
-	_, _, err := gs.se.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, nil, sql)
+	_, _, err := gs.se.GetRestrictedSQLExecutor().ExecRestrictedSQL(ctx, nil, sql)
 	return err
 }
 
-func (gs *tidbGlueSession) ExecuteInternal(ctx context.Context, sql string, args ...interface{}) error {
+func (gs *tidbGlueSession) ExecuteInternal(ctx context.Context, sql string, args ...any) error {
 	ctx = kv.WithInternalSourceType(ctx, kv.InternalTxnBR)
-	exec := gs.se.(sqlexec.SQLExecutor)
+	exec := gs.se.GetSQLExecutor()
 	_, err := exec.ExecuteInternal(ctx, sql, args...)
 	return err
 }

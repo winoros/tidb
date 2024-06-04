@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
+	"github.com/pingcap/tidb/pkg/executor/join"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -30,7 +31,9 @@ import (
 	"github.com/pingcap/tidb/pkg/util/cteutil"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/disk"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/memory"
+	"go.uber.org/zap"
 )
 
 var _ exec.Executor = &CTEExec{}
@@ -91,6 +94,9 @@ func (e *CTEExec) Open(ctx context.Context) (err error) {
 			return err
 		}
 	}
+	if e.producer.openErr != nil {
+		return e.producer.openErr
+	}
 	if !e.producer.opened {
 		if err = e.producer.openProducer(ctx, e); err != nil {
 			return err
@@ -111,8 +117,18 @@ func (e *CTEExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	return e.producer.getChunk(e, req)
 }
 
+func setFirstErr(firstErr error, newErr error, msg string) error {
+	if newErr != nil {
+		logutil.BgLogger().Error("cte got error", zap.Any("err", newErr), zap.Any("extra msg", msg))
+		if firstErr == nil {
+			firstErr = newErr
+		}
+	}
+	return firstErr
+}
+
 // Close implements the Executor interface.
-func (e *CTEExec) Close() (err error) {
+func (e *CTEExec) Close() (firstErr error) {
 	func() {
 		e.producer.resTbl.Lock()
 		defer e.producer.resTbl.Unlock()
@@ -128,13 +144,13 @@ func (e *CTEExec) Close() (err error) {
 			// It means you can still read resTbl after call closeProducer().
 			// You can even call all three functions(openProducer/produce/closeProducer) in CTEExec.Next().
 			// Separating these three function calls is only to follow the abstraction of the volcano model.
-			err = e.producer.closeProducer()
+			err := e.producer.closeProducer()
+			firstErr = setFirstErr(firstErr, err, "close cte producer error")
 		}
 	}()
-	if err != nil {
-		return err
-	}
-	return e.BaseExecutor.Close()
+	err := e.BaseExecutor.Close()
+	firstErr = setFirstErr(firstErr, err, "close cte children error")
+	return
 }
 
 func (e *CTEExec) reset() {
@@ -144,9 +160,15 @@ func (e *CTEExec) reset() {
 }
 
 type cteProducer struct {
+	// opened should be false when not open or open fail(a.k.a. openErr != nil)
 	opened   bool
 	produced bool
 	closed   bool
+
+	// cteProducer is shared by multiple operators, so if the first operator tries to open
+	// and got error, the second should return open error directly instead of open again.
+	// Otherwise there may be resource leak because Close() only clean resource for the last Open().
+	openErr error
 
 	ctx sessionctx.Context
 
@@ -159,12 +181,12 @@ type cteProducer struct {
 	iterInTbl  cteutil.Storage
 	iterOutTbl cteutil.Storage
 
-	hashTbl baseHashTable
+	hashTbl join.BaseHashTable
 
 	// UNION ALL or UNION DISTINCT.
 	isDistinct bool
 	curIter    int
-	hCtx       *hashContext
+	hCtx       *join.HashContext
 	sel        []int
 
 	// Limit related info.
@@ -181,6 +203,14 @@ type cteProducer struct {
 }
 
 func (p *cteProducer) openProducer(ctx context.Context, cteExec *CTEExec) (err error) {
+	defer func() {
+		p.openErr = err
+		if err == nil {
+			p.opened = true
+		} else {
+			p.opened = false
+		}
+	}()
 	if p.seedExec == nil {
 		return errors.New("seedExec for CTEExec is nil")
 	}
@@ -188,11 +218,8 @@ func (p *cteProducer) openProducer(ctx context.Context, cteExec *CTEExec) (err e
 		return err
 	}
 
-	if p.memTracker != nil {
-		p.memTracker.Reset()
-	} else {
-		p.memTracker = memory.NewTracker(cteExec.ID(), -1)
-	}
+	p.resetTracker()
+	p.memTracker = memory.NewTracker(cteExec.ID(), -1)
 	p.diskTracker = disk.NewTracker(cteExec.ID(), -1)
 	p.memTracker.AttachTo(p.ctx.GetSessionVars().StmtCtx.MemTracker)
 	p.diskTracker.AttachTo(p.ctx.GetSessionVars().StmtCtx.DiskTracker)
@@ -212,38 +239,40 @@ func (p *cteProducer) openProducer(ctx context.Context, cteExec *CTEExec) (err e
 	}
 
 	if p.isDistinct {
-		p.hashTbl = newConcurrentMapHashTable()
-		p.hCtx = &hashContext{
-			allTypes: cteExec.RetFieldTypes(),
+		p.hashTbl = join.NewConcurrentMapHashTable()
+		p.hCtx = &join.HashContext{
+			AllTypes: cteExec.RetFieldTypes(),
 		}
 		// We use all columns to compute hash.
-		p.hCtx.keyColIdx = make([]int, len(p.hCtx.allTypes))
-		for i := range p.hCtx.keyColIdx {
-			p.hCtx.keyColIdx[i] = i
+		p.hCtx.KeyColIdx = make([]int, len(p.hCtx.AllTypes))
+		for i := range p.hCtx.KeyColIdx {
+			p.hCtx.KeyColIdx[i] = i
 		}
 	}
-	p.opened = true
 	return nil
 }
 
-func (p *cteProducer) closeProducer() (err error) {
-	if err = exec.Close(p.seedExec); err != nil {
-		return err
-	}
+func (p *cteProducer) closeProducer() (firstErr error) {
+	err := exec.Close(p.seedExec)
+	firstErr = setFirstErr(firstErr, err, "close seedExec err")
+
 	if p.recursiveExec != nil {
-		if err = exec.Close(p.recursiveExec); err != nil {
-			return err
-		}
+		err = exec.Close(p.recursiveExec)
+		firstErr = setFirstErr(firstErr, err, "close recursiveExec err")
+
 		// `iterInTbl` and `resTbl` are shared by multiple operators,
 		// so will be closed when the SQL finishes.
 		if p.iterOutTbl != nil {
-			if err = p.iterOutTbl.DerefAndClose(); err != nil {
-				return err
-			}
+			err = p.iterOutTbl.DerefAndClose()
+			firstErr = setFirstErr(firstErr, err, "deref iterOutTbl err")
 		}
 	}
+	// Reset to nil instead of calling Detach(),
+	// because ExplainExec still needs tracker to get mem usage info.
+	p.memTracker = nil
+	p.diskTracker = nil
 	p.closed = true
-	return nil
+	return
 }
 
 func (p *cteProducer) getChunk(cteExec *CTEExec, req *chunk.Chunk) (err error) {
@@ -486,13 +515,25 @@ func (p *cteProducer) reset() {
 	p.hashTbl = nil
 
 	p.opened = false
+	p.openErr = nil
 	p.produced = false
 	p.closed = false
 }
 
+func (p *cteProducer) resetTracker() {
+	if p.memTracker != nil {
+		p.memTracker.Reset()
+		p.memTracker = nil
+	}
+	if p.diskTracker != nil {
+		p.diskTracker.Reset()
+		p.diskTracker = nil
+	}
+}
+
 func (p *cteProducer) reopenTbls() (err error) {
 	if p.isDistinct {
-		p.hashTbl = newConcurrentMapHashTable()
+		p.hashTbl = join.NewConcurrentMapHashTable()
 	}
 	if err := p.resTbl.Reopen(); err != nil {
 		return err
@@ -529,7 +570,7 @@ func setupCTEStorageTracker(tbl cteutil.Storage, ctx sessionctx.Context, parentM
 
 func (p *cteProducer) tryDedupAndAdd(chk *chunk.Chunk,
 	storage cteutil.Storage,
-	hashTbl baseHashTable) (res *chunk.Chunk, err error) {
+	hashTbl join.BaseHashTable) (res *chunk.Chunk, err error) {
 	if p.isDistinct {
 		if chk, err = p.deduplicate(chk, storage, hashTbl); err != nil {
 			return nil, err
@@ -542,10 +583,10 @@ func (p *cteProducer) tryDedupAndAdd(chk *chunk.Chunk,
 // Use the returned sel to choose the computed hash values.
 func (p *cteProducer) computeChunkHash(chk *chunk.Chunk) (sel []int, err error) {
 	numRows := chk.NumRows()
-	p.hCtx.initHash(numRows)
+	p.hCtx.InitHash(numRows)
 	// Continue to reset to make sure all hasher is new.
-	for i := numRows; i < len(p.hCtx.hashVals); i++ {
-		p.hCtx.hashVals[i].Reset()
+	for i := numRows; i < len(p.hCtx.HashVals); i++ {
+		p.hCtx.HashVals[i].Reset()
 	}
 	sel = chk.Sel()
 	var hashBitMap []bool
@@ -571,8 +612,8 @@ func (p *cteProducer) computeChunkHash(chk *chunk.Chunk) (sel []int, err error) 
 	}
 
 	for i := 0; i < chk.NumCols(); i++ {
-		if err = codec.HashChunkSelected(p.ctx.GetSessionVars().StmtCtx.TypeCtx(), p.hCtx.hashVals,
-			chk, p.hCtx.allTypes[i], i, p.hCtx.buf, p.hCtx.hasNull,
+		if err = codec.HashChunkSelected(p.ctx.GetSessionVars().StmtCtx.TypeCtx(), p.hCtx.HashVals,
+			chk, p.hCtx.AllTypes[i], i, p.hCtx.Buf, p.hCtx.HasNull,
 			hashBitMap, false); err != nil {
 			return nil, err
 		}
@@ -584,14 +625,14 @@ func (p *cteProducer) computeChunkHash(chk *chunk.Chunk) (sel []int, err error) 
 // Duplicated rows are only marked to be removed by sel in Chunk, instead of really deleted.
 func (p *cteProducer) deduplicate(chk *chunk.Chunk,
 	storage cteutil.Storage,
-	hashTbl baseHashTable) (chkNoDup *chunk.Chunk, err error) {
+	hashTbl join.BaseHashTable) (chkNoDup *chunk.Chunk, err error) {
 	numRows := chk.NumRows()
 	if numRows == 0 {
 		return chk, nil
 	}
 
 	// 1. Compute hash values for chunk.
-	chkHashTbl := newConcurrentMapHashTable()
+	chkHashTbl := join.NewConcurrentMapHashTable()
 	selOri, err := p.computeChunkHash(chk)
 	if err != nil {
 		return nil, err
@@ -601,7 +642,7 @@ func (p *cteProducer) deduplicate(chk *chunk.Chunk,
 	// This sel is for filtering rows duplicated in cur chk.
 	selChk := make([]int, 0, numRows)
 	for i := 0; i < numRows; i++ {
-		key := p.hCtx.hashVals[selOri[i]].Sum64()
+		key := p.hCtx.HashVals[selOri[i]].Sum64()
 		row := chk.GetRow(i)
 
 		hasDup, err := p.checkHasDup(key, row, chk, storage, chkHashTbl)
@@ -624,7 +665,7 @@ func (p *cteProducer) deduplicate(chk *chunk.Chunk,
 	// This sel is for filtering rows duplicated in cteutil.Storage.
 	selStorage := make([]int, 0, len(selChk))
 	for i := 0; i < len(selChk); i++ {
-		key := p.hCtx.hashVals[selChk[i]].Sum64()
+		key := p.hCtx.HashVals[selChk[i]].Sum64()
 		row := chk.GetRow(i)
 
 		hasDup, err := p.checkHasDup(key, row, nil, storage, hashTbl)
@@ -652,11 +693,11 @@ func (p *cteProducer) checkHasDup(probeKey uint64,
 	row chunk.Row,
 	curChk *chunk.Chunk,
 	storage cteutil.Storage,
-	hashTbl baseHashTable) (hasDup bool, err error) {
+	hashTbl join.BaseHashTable) (hasDup bool, err error) {
 	entry := hashTbl.Get(probeKey)
 
-	for ; entry != nil; entry = entry.next {
-		ptr := entry.ptr
+	for ; entry != nil; entry = entry.Next {
+		ptr := entry.Ptr
 		var matchedRow chunk.Row
 		if curChk != nil {
 			matchedRow = curChk.GetRow(int(ptr.RowIdx))
@@ -667,8 +708,8 @@ func (p *cteProducer) checkHasDup(probeKey uint64,
 			return false, err
 		}
 		isEqual, err := codec.EqualChunkRow(p.ctx.GetSessionVars().StmtCtx.TypeCtx(),
-			row, p.hCtx.allTypes, p.hCtx.keyColIdx,
-			matchedRow, p.hCtx.allTypes, p.hCtx.keyColIdx)
+			row, p.hCtx.AllTypes, p.hCtx.KeyColIdx,
+			matchedRow, p.hCtx.AllTypes, p.hCtx.KeyColIdx)
 		if err != nil {
 			return false, err
 		}

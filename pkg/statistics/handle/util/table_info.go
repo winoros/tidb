@@ -59,8 +59,8 @@ func (c *tableInfoGetterImpl) TableInfoByID(is infoschema.InfoSchema, physicalID
 
 func buildPartitionID2TableID(is infoschema.InfoSchema) map[int64]int64 {
 	mapper := make(map[int64]int64)
-	for _, db := range is.AllSchemas() {
-		tbls := db.Tables
+	for _, dbName := range is.AllSchemaNames() {
+		tbls := is.SchemaTableInfos(dbName)
 		for _, tbl := range tbls {
 			pi := tbl.GetPartitionInfo()
 			if pi == nil {

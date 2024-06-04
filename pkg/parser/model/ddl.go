@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/terror"
 )
 
@@ -279,13 +280,6 @@ var BDRActionMap = map[DDLBDRType][]ActionType{
 	},
 }
 
-const (
-	// TiDBDDLV1 is the version 1 of DDL.
-	TiDBDDLV1 int64 = iota + 1
-	// TiDBDDLV2 is the version 2 of DDL.
-	TiDBDDLV2
-)
-
 // String return current ddl action in string
 func (action ActionType) String() string {
 	if v, ok := ActionMap[action]; ok {
@@ -494,9 +488,13 @@ type JobMeta struct {
 
 // Job is for a DDL operation.
 type Job struct {
-	ID         int64         `json:"id"`
-	Type       ActionType    `json:"type"`
-	SchemaID   int64         `json:"schema_id"`
+	ID   int64      `json:"id"`
+	Type ActionType `json:"type"`
+	// SchemaID means different for different job types:
+	// - ExchangeTablePartition: db id of non-partitioned table
+	SchemaID int64 `json:"schema_id"`
+	// TableID means different for different job types:
+	// - ExchangeTablePartition: non-partitioned table id
 	TableID    int64         `json:"table_id"`
 	SchemaName string        `json:"schema_name"`
 	TableName  string        `json:"table_name"`
@@ -510,8 +508,15 @@ type Job struct {
 	Mu       sync.Mutex `json:"-"`
 	// CtxVars are variables attached to the job. It is for internal usage.
 	// E.g. passing arguments between functions by one single *Job pointer.
+	// for ExchangeTablePartition, RenameTables, RenameTable, it's [slice-of-db-id, slice-of-table-id]
 	CtxVars []interface{} `json:"-"`
-	Args    []interface{} `json:"-"`
+	// Note: it might change when state changes, such as when rollback on AddColumn.
+	// - CreateTable, it's [model.TableInfo, foreignKeyCheck]
+	// - AddIndex or AddPrimaryKey: [unique, ....
+	// - TruncateTable: [new-table-id, foreignKeyCheck, ...
+	// - RenameTable: [old-db-id, new-table-name, old-db-name]
+	// - ExchangeTablePartition: [partition-id, pt-db-id, pt-id, partition-name, with-validation]
+	Args []interface{} `json:"-"`
 	// RawArgs : We must use json raw message to delay parsing special args.
 	RawArgs     json.RawMessage `json:"raw_args"`
 	SchemaState SchemaState     `json:"schema_state"`
@@ -523,7 +528,7 @@ type Job struct {
 	// StartTS uses timestamp allocated by TSO.
 	// Now it's the TS when we put the job to TiKV queue.
 	StartTS uint64 `json:"start_ts"`
-	// DependencyID is the job's ID that the current job depends on.
+	// DependencyID is the largest job ID before current job and current job depends on.
 	DependencyID int64 `json:"dependency_id"`
 	// Query string of the ddl job.
 	Query      string       `json:"query"`
@@ -541,7 +546,10 @@ type Job struct {
 	// Priority is only used to set the operation priority of adding indices.
 	Priority int `json:"priority"`
 
-	// SeqNum is the total order in all DDLs, it's used to identify the order of DDL.
+	// SeqNum is the total order in all DDLs, it's used to identify the order of
+	// moving the job into DDL history, not the order of the job execution.
+	// fast create table doesn't honor this field, there might duplicate seq_num in this case.
+	// TODO: deprecated it, as it forces 'moving jobs into DDL history' part to be serial.
 	SeqNum uint64 `json:"seq_num"`
 
 	// Charset is the charset when the DDL Job is created.
@@ -567,9 +575,13 @@ type Job struct {
 	// CDCWriteSource indicates the source of CDC write.
 	CDCWriteSource uint64 `json:"cdc_write_source"`
 
-	// LocalMode indicates whether the job is running in local TiDB.
-	// Only happens when tidb_ddl_version = 2.
+	// LocalMode = true means the job is running on the local TiDB that the client
+	// connects to, else it's run on the DDL owner.
+	// Only happens when tidb_enable_fast_create_table = on
 	LocalMode bool `json:"local_mode"`
+
+	// SQLMode for executing DDL query.
+	SQLMode mysql.SQLMode `json:"sql_mode"`
 }
 
 // InvolvingSchemaInfo returns the schema info involved in the job.
@@ -1019,9 +1031,9 @@ type JobState int32
 const (
 	JobStateNone    JobState = 0
 	JobStateRunning JobState = 1
+	// JobStateRollingback is the state to do the rolling back job.
 	// When DDL encountered an unrecoverable error at reorganization state,
 	// some keys has been added already, we need to remove them.
-	// JobStateRollingback is the state to do the rolling back job.
 	JobStateRollingback  JobState = 2
 	JobStateRollbackDone JobState = 3
 	JobStateDone         JobState = 4
@@ -1129,6 +1141,12 @@ type SchemaDiff struct {
 	SchemaID int64      `json:"schema_id"`
 	TableID  int64      `json:"table_id"`
 
+	// SubActionTypes is the list of action types done together within a multiple schema
+	// change job. As the job might contain multiple steps that changes schema version,
+	// if some step only contains one action, Type will be that action, and SubActionTypes
+	// will be empty.
+	// for other types of job, it will always be empty.
+	SubActionTypes []ActionType `json:"sub_action_types,omitempty"`
 	// OldTableID is the table ID before truncate, only used by truncate table DDL.
 	OldTableID int64 `json:"old_table_id"`
 	// OldSchemaID is the schema ID before rename table, only used by rename table DDL.

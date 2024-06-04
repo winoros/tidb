@@ -63,7 +63,8 @@ var (
 // }
 
 var (
-	mMetaPrefix          = []byte("m")
+	mMetaPrefix = []byte("m")
+	// the value inside it is actually the max current used ID, not next id.
 	mNextGlobalIDKey     = []byte("NextGlobalID")
 	mSchemaVersionKey    = []byte("SchemaVersionKey")
 	mDBs                 = []byte("DBs")
@@ -473,6 +474,8 @@ func (m *Meta) GetAutoIDAccessors(dbID, tableID int64) AutoIDAccessors {
 // To solve this problem, we always check the schema diff at first, if the diff is empty, we know at t2 moment we can only see the v9 schema,
 // so make neededSchemaVersion = neededSchemaVersion - 1.
 // For `Reload`, we can also do this: if the newest version's diff is not set yet, it is ok to load the previous version's infoSchema, and wait for the next reload.
+// if there are multiple consecutive jobs failed or cancelled after the schema version
+// increased, the returned 'version - 1' might still not have diff.
 func (m *Meta) GetSchemaVersionWithNonEmptyDiff() (int64, error) {
 	v, err := m.txn.GetInt64(mSchemaVersionKey)
 	if err != nil {
@@ -813,17 +816,23 @@ func (m *Meta) GetMetadataLock() (enable bool, isNull bool, err error) {
 
 // CreateTableAndSetAutoID creates a table with tableInfo in database,
 // and rebases the table autoID.
-func (m *Meta) CreateTableAndSetAutoID(dbID int64, dbName string, tableInfo *model.TableInfo, autoIncID, autoRandID int64) error {
+func (m *Meta) CreateTableAndSetAutoID(dbID int64, dbName string, tableInfo *model.TableInfo, autoIDs AutoIDGroup) error {
 	err := m.CreateTableOrView(dbID, dbName, tableInfo)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	_, err = m.txn.HInc(m.dbKey(dbID), m.autoTableIDKey(tableInfo.ID), autoIncID)
+	_, err = m.txn.HInc(m.dbKey(dbID), m.autoTableIDKey(tableInfo.ID), autoIDs.RowID)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	if tableInfo.AutoRandomBits > 0 {
-		_, err = m.txn.HInc(m.dbKey(dbID), m.autoRandomTableIDKey(tableInfo.ID), autoRandID)
+		_, err = m.txn.HInc(m.dbKey(dbID), m.autoRandomTableIDKey(tableInfo.ID), autoIDs.RandomID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if tableInfo.SepAutoInc() && tableInfo.GetAutoIncrementColInfo() != nil {
+		_, err = m.txn.HInc(m.dbKey(dbID), m.autoIncrementIDKey(tableInfo.ID), autoIDs.IncrementID)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -942,6 +951,8 @@ func (m *Meta) UpdateTable(dbID int64, tableInfo *model.TableInfo) error {
 		return errors.Trace(err)
 	}
 
+	tableInfo.Revision++
+
 	data, err := json.Marshal(tableInfo)
 	if err != nil {
 		return errors.Trace(err)
@@ -970,6 +981,7 @@ func (m *Meta) IterTables(dbID int64, fn func(info *model.TableInfo) error) erro
 		if err != nil {
 			return errors.Trace(err)
 		}
+		tbInfo.DBID = dbID
 
 		err = fn(tbInfo)
 		return errors.Trace(err)
@@ -1002,6 +1014,7 @@ func (m *Meta) ListTables(dbID int64) ([]*model.TableInfo, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		tbInfo.DBID = dbID
 
 		tables = append(tables, tbInfo)
 	}
@@ -1218,6 +1231,7 @@ func (m *Meta) GetTable(dbID int64, tableID int64) (*model.TableInfo, error) {
 
 	tableInfo := &model.TableInfo{}
 	err = json.Unmarshal(value, tableInfo)
+	tableInfo.DBID = dbID
 	return tableInfo, errors.Trace(err)
 }
 
@@ -1258,6 +1272,8 @@ var (
 
 var (
 	// DefaultJobListKey keeps all actions of DDL jobs except "add index".
+	// this and below list are always appended, so the order is the same as the
+	// job's creation order.
 	DefaultJobListKey JobListKeyType = mDDLJobListKey
 	// AddIndexJobListKey only keeps the action of adding index.
 	AddIndexJobListKey JobListKeyType = mDDLJobAddIdxList
@@ -1585,7 +1601,7 @@ func (m *Meta) DropTableName(dbName string, tableName string) error {
 func (m *Meta) DropDatabaseName(dbName string) error {
 	// iterate all tables
 	prefix := m.TableNameKey(dbName, "")
-	return m.txn.Iterate(prefix, prefix.PrefixNext(), func(key []byte, value []byte) error {
+	return m.txn.Iterate(prefix, prefix.PrefixNext(), func(key []byte, _ []byte) error {
 		return m.txn.Clear(key)
 	})
 }
@@ -1593,7 +1609,7 @@ func (m *Meta) DropDatabaseName(dbName string) error {
 // ClearAllTableNames clears all table names.
 func (m *Meta) ClearAllTableNames() error {
 	prefix := kv.Key(fmt.Sprintf("%s:", mNames))
-	return m.txn.Iterate(prefix, prefix.PrefixNext(), func(key []byte, value []byte) error {
+	return m.txn.Iterate(prefix, prefix.PrefixNext(), func(key []byte, _ []byte) error {
 		return m.txn.Clear(key)
 	})
 }

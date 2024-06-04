@@ -194,9 +194,11 @@ func (p *UserPrivileges) RequestVerificationWithUser(db, table, column string, p
 	if SkipWithGrant {
 		return true
 	}
-
 	if user == nil {
 		return false
+	}
+	if user.Username == "" && user.Hostname == "" {
+		return true
 	}
 
 	// Skip check for INFORMATION_SCHEMA database.
@@ -351,7 +353,7 @@ func (p *UserPrivileges) GetAuthWithoutVerification(user, host string) (success 
 	return
 }
 
-func checkAuthTokenClaims(claims map[string]interface{}, record *UserRecord, tokenLife time.Duration) error {
+func checkAuthTokenClaims(claims map[string]any, record *UserRecord, tokenLife time.Duration) error {
 	if sub, ok := claims[jwtRepo.SubjectKey]; !ok {
 		return errors.New("lack 'sub'")
 	} else if sub != record.User {
@@ -559,7 +561,7 @@ func (p *UserPrivileges) ConnectionVerification(user *auth.UserIdentity, authUse
 		}
 		tokenString := string(hack.String(authentication[:len(authentication)-1]))
 		var (
-			claims map[string]interface{}
+			claims map[string]any
 		)
 		if claims, err = GlobalJWKS.checkSigWithRetry(tokenString, 1); err != nil {
 			logutil.BgLogger().Error("verify JWT failed", zap.Error(err))

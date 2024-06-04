@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/log"
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
 	"github.com/pingcap/tidb/br/pkg/logutil"
+	"github.com/pingcap/tidb/pkg/util/prefetch"
 	"go.uber.org/zap"
 )
 
@@ -423,6 +424,7 @@ func (rs *KS3Storage) URI() string {
 func (rs *KS3Storage) Open(ctx context.Context, path string, o *ReaderOption) (ExternalFileReader, error) {
 	start := int64(0)
 	end := int64(0)
+	prefetchSize := 0
 	if o != nil {
 		if o.StartOffset != nil {
 			start = *o.StartOffset
@@ -430,17 +432,22 @@ func (rs *KS3Storage) Open(ctx context.Context, path string, o *ReaderOption) (E
 		if o.EndOffset != nil {
 			end = *o.EndOffset
 		}
+		prefetchSize = o.PrefetchSize
 	}
 	reader, r, err := rs.open(ctx, path, start, end)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	if prefetchSize > 0 {
+		reader = prefetch.NewReader(reader, prefetchSize)
+	}
 	return &ks3ObjectReader{
-		ctx:       ctx,
-		storage:   rs,
-		name:      path,
-		reader:    reader,
-		rangeInfo: r,
+		ctx:          ctx,
+		storage:      rs,
+		name:         path,
+		reader:       reader,
+		rangeInfo:    r,
+		prefetchSize: prefetchSize,
 	}, nil
 }
 
@@ -510,25 +517,35 @@ func (rs *KS3Storage) open(
 
 // ks3ObjectReader wrap GetObjectOutput.Body and add the `Seek` method.
 type ks3ObjectReader struct {
-	ctx       context.Context
-	storage   *KS3Storage
-	name      string
-	reader    io.ReadCloser
-	pos       int64
-	rangeInfo RangeInfo
-	retryCnt  int
+	ctx          context.Context
+	storage      *KS3Storage
+	name         string
+	reader       io.ReadCloser
+	pos          int64
+	rangeInfo    RangeInfo
+	prefetchSize int
 }
 
 // Read implement the io.Reader interface.
 func (r *ks3ObjectReader) Read(p []byte) (n int, err error) {
+	retryCnt := 0
 	maxCnt := r.rangeInfo.End + 1 - r.pos
+	if maxCnt == 0 {
+		return 0, io.EOF
+	}
 	if maxCnt > int64(len(p)) {
 		maxCnt = int64(len(p))
 	}
 	n, err = r.reader.Read(p[:maxCnt])
 	// TODO: maybe we should use !errors.Is(err, io.EOF) here to avoid error lint, but currently, pingcap/errors
 	// doesn't implement this method yet.
-	if err != nil && errors.Cause(err) != io.EOF && r.retryCnt < maxErrorRetries { //nolint:errorlint
+	for err != nil && errors.Cause(err) != io.EOF && retryCnt < maxErrorRetries { //nolint:errorlint
+		log.L().Warn(
+			"read s3 object failed, will retry",
+			zap.String("file", r.name),
+			zap.Int("retryCnt", retryCnt),
+			zap.Error(err),
+		)
 		// if can retry, reopen a new reader and try read again
 		end := r.rangeInfo.End + 1
 		if end == r.rangeInfo.Size {
@@ -542,7 +559,10 @@ func (r *ks3ObjectReader) Read(p []byte) (n int, err error) {
 			return
 		}
 		r.reader = newReader
-		r.retryCnt++
+		if r.prefetchSize > 0 {
+			r.reader = prefetch.NewReader(r.reader, r.prefetchSize)
+		}
+		retryCnt++
 		n, err = r.reader.Read(p[:maxCnt])
 	}
 
@@ -611,6 +631,9 @@ func (r *ks3ObjectReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.Trace(err)
 	}
 	r.reader = newReader
+	if r.prefetchSize > 0 {
+		r.reader = prefetch.NewReader(r.reader, r.prefetchSize)
+	}
 	r.rangeInfo = info
 	r.pos = realOffset
 	return realOffset, nil
@@ -708,3 +731,6 @@ func (rs *KS3Storage) Rename(ctx context.Context, oldFileName, newFileName strin
 	}
 	return nil
 }
+
+// Close implements ExternalStorage interface.
+func (*KS3Storage) Close() {}

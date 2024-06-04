@@ -60,7 +60,7 @@ type Storage interface {
 	SupportDeleteRange() (supported bool)
 	Name() string
 	Describe() string
-	ShowStatus(ctx context.Context, key string) (interface{}, error)
+	ShowStatus(ctx context.Context, key string) (any, error)
 	GetMemCache() kv.MemManager
 	GetRegionCache() *tikv.RegionCache
 	SendReq(bo *tikv.Backoffer, req *tikvrpc.Request, regionID tikv.RegionVerID, timeout time.Duration) (*tikvrpc.Response, error)
@@ -640,7 +640,7 @@ func isBehindKeyRange(x withKeyRange, _, endKey string) bool {
 	return endKey != "" && x.GetStartKey() >= endKey
 }
 
-// TableInfoWithKeyRange stores table or index informations with its key range.
+// TableInfoWithKeyRange stores table or index information with its key range.
 type TableInfoWithKeyRange struct {
 	*TableInfo
 	StartKey string

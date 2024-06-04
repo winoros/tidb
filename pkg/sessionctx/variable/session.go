@@ -32,11 +32,11 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/domain/resourcegroup"
 	"github.com/pingcap/tidb/pkg/errctx"
 	"github.com/pingcap/tidb/pkg/kv"
-	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -50,6 +50,7 @@ import (
 	pumpcli "github.com/pingcap/tidb/pkg/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/disk"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/kvcache"
@@ -186,7 +187,7 @@ type TxnCtxNeedToRestore struct {
 	pessimisticLockCache map[string][]byte
 
 	// CachedTables is not nil if the transaction write on cached table.
-	CachedTables map[int64]interface{}
+	CachedTables map[int64]any
 
 	// InsertTTLRowsCount counts how many rows are inserted in this statement
 	InsertTTLRowsCount int
@@ -195,10 +196,11 @@ type TxnCtxNeedToRestore struct {
 // TxnCtxNoNeedToRestore stores transaction variables which do not need to restored when rolling back to a savepoint.
 type TxnCtxNoNeedToRestore struct {
 	forUpdateTS uint64
-	Binlog      interface{}
-	InfoSchema  interface{}
-	History     interface{}
+	Binlog      any
+	InfoSchema  any
+	History     any
 	StartTS     uint64
+	StaleReadTs uint64
 
 	// ShardStep indicates the max size of continuous rowid shard in one transaction.
 	ShardStep    int
@@ -323,6 +325,35 @@ func (tc *TransactionContext) UpdateDeltaForTable(physicalTableID int64, delta i
 	tc.TableDeltaMap[physicalTableID] = item
 }
 
+// ColSize is a data struct to store the delta information for a table.
+type ColSize struct {
+	ColID int64
+	Size  int64
+}
+
+// UpdateDeltaForTableFromColSlice is the same as UpdateDeltaForTable, but it accepts a slice of column size.
+func (tc *TransactionContext) UpdateDeltaForTableFromColSlice(
+	physicalTableID int64, delta int64,
+	count int64, colSizes []ColSize,
+) {
+	tc.tdmLock.Lock()
+	defer tc.tdmLock.Unlock()
+	if tc.TableDeltaMap == nil {
+		tc.TableDeltaMap = make(map[int64]TableDelta)
+	}
+	item := tc.TableDeltaMap[physicalTableID]
+	if item.ColSize == nil && len(colSizes) > 0 {
+		item.ColSize = make(map[int64]int64, len(colSizes))
+	}
+	item.Delta += delta
+	item.Count += count
+	item.TableID = physicalTableID
+	for _, s := range colSizes {
+		item.ColSize[s.ColID] += s.Size
+	}
+	tc.TableDeltaMap[physicalTableID] = item
+}
+
 // GetKeyInPessimisticLockCache gets a key in pessimistic lock cache.
 func (tc *TransactionContext) GetKeyInPessimisticLockCache(key kv.Key) (val []byte, ok bool) {
 	if tc.pessimisticLockCache == nil && tc.CurrentStmtPessimisticLockCache == nil {
@@ -401,7 +432,7 @@ func (tc *TransactionContext) GetCurrentSavepoint() TxnCtxNeedToRestore {
 	maps.Copy(pessimisticLockCache, tc.pessimisticLockCache)
 	CurrentStmtPessimisticLockCache := make(map[string][]byte, len(tc.CurrentStmtPessimisticLockCache))
 	maps.Copy(CurrentStmtPessimisticLockCache, tc.CurrentStmtPessimisticLockCache)
-	cachedTables := make(map[int64]interface{}, len(tc.CachedTables))
+	cachedTables := make(map[int64]any, len(tc.CachedTables))
 	maps.Copy(cachedTables, tc.CachedTables)
 	return TxnCtxNeedToRestore{
 		TableDeltaMap:        tableDeltaMap,
@@ -449,7 +480,7 @@ func (tc *TransactionContext) ReleaseSavepoint(name string) bool {
 	name = strings.ToLower(name)
 	for i, sp := range tc.Savepoints {
 		if sp.Name == name {
-			tc.Savepoints = append(tc.Savepoints[:i])
+			tc.Savepoints = tc.Savepoints[:i]
 			return true
 		}
 	}
@@ -663,6 +694,11 @@ type HookContext interface {
 	GetStore() kv.Storage
 }
 
+// SessionVarsProvider provides the session variables.
+type SessionVarsProvider interface {
+	GetSessionVars() *SessionVars
+}
+
 // SessionVars is to handle user-defined or global variables in the current session.
 type SessionVars struct {
 	Concurrency
@@ -683,9 +719,6 @@ type SessionVars struct {
 	}
 	// systems variables, don't modify it directly, use GetSystemVar/SetSystemVar method.
 	systems map[string]string
-	// stmtVars variables are temporarily set by SET_VAR hint
-	// It only take effect for the duration of a single statement
-	stmtVars map[string]string
 	// SysWarningCount is the system variable "warning_count", because it is on the hot path, so we extract it from the systems
 	SysWarningCount int
 	// SysErrorCount is the system variable "error_count", because it is on the hot path, so we extract it from the systems
@@ -693,7 +726,7 @@ type SessionVars struct {
 	// nonPreparedPlanCacheStmts stores PlanCacheStmts for non-prepared plan cache.
 	nonPreparedPlanCacheStmts *kvcache.SimpleLRUCache
 	// PreparedStmts stores prepared statement.
-	PreparedStmts        map[uint32]interface{}
+	PreparedStmts        map[uint32]any
 	PreparedStmtNameToID map[string]uint32
 	// preparedStmtID is id of prepared statement.
 	preparedStmtID uint32
@@ -705,13 +738,13 @@ type SessionVars struct {
 	ActiveRoles []*auth.RoleIdentity
 
 	RetryInfo *RetryInfo
-	//  TxnCtx Should be reset on transaction finished.
+	// TxnCtx Should be reset on transaction finished.
 	TxnCtx *TransactionContext
 	// TxnCtxMu is used to protect TxnCtx.
 	TxnCtxMu sync.Mutex
 
 	// TxnManager is used to manage txn context in session
-	TxnManager interface{}
+	TxnManager any
 
 	// KVVars is the variables for KV storage.
 	KVVars *tikvstore.Variables
@@ -722,8 +755,8 @@ type SessionVars struct {
 		value string
 	}
 
-	// Status stands for the session status. e.g. in transaction or not, auto commit is on or off, and so on.
-	Status uint16
+	// status stands for the session status. e.g. in transaction or not, auto commit is on or off, and so on.
+	status atomic.Uint32
 
 	// ClientCapability is client's capability.
 	ClientCapability uint32
@@ -741,7 +774,7 @@ type SessionVars struct {
 	PlanColumnID atomic.Int64
 
 	// MapScalarSubQ maps the scalar sub queries from its ID to its struct.
-	MapScalarSubQ []interface{}
+	MapScalarSubQ []any
 
 	// MapHashCode2UniqueID4ExtendedCol map the expr's hash code to specified unique ID.
 	MapHashCode2UniqueID4ExtendedCol map[string]int
@@ -759,9 +792,6 @@ type SessionVars struct {
 	// the slow log to make it be compatible with MySQL, https://github.com/pingcap/tidb/issues/17846.
 	CurrentDBChanged bool
 
-	// StrictSQLMode indicates if the session is in strict mode.
-	StrictSQLMode bool
-
 	// CommonGlobalLoaded indicates if common global variable has been loaded for this session.
 	CommonGlobalLoaded bool
 
@@ -776,7 +806,7 @@ type SessionVars struct {
 
 	// SnapshotInfoschema is used with SnapshotTS, when the schema version at snapshotTS less than current schema
 	// version, we load an old version schema for query.
-	SnapshotInfoschema interface{}
+	SnapshotInfoschema any
 
 	// BinlogClient is used to write binlog.
 	BinlogClient *pumpcli.PumpsClient
@@ -980,10 +1010,6 @@ type SessionVars struct {
 	// BatchCommit indicates if we should split the transaction into multiple batches.
 	BatchCommit bool
 
-	// IDAllocator is provided by kvEncoder, if it is provided, we will use it to alloc auto id instead of using
-	// Table.alloc.
-	IDAllocator autoid.Allocator
-
 	// OptimizerSelectivityLevel defines the level of the selectivity estimation in plan.
 	OptimizerSelectivityLevel int
 
@@ -1071,6 +1097,9 @@ type SessionVars struct {
 	// If the value is 0, timeouts are not enabled.
 	// See https://dev.mysql.com/doc/refman/5.7/en/server-system-variables.html#sysvar_max_execution_time
 	MaxExecutionTime uint64
+
+	// LoadBindingTimeout is the timeout for loading the bind info.
+	LoadBindingTimeout uint64
 
 	// TiKVClientReadTimeout is the timeout for readonly kv request in milliseconds, 0 means using default value
 	// See https://github.com/pingcap/tidb/blob/7105505a78fc886c33258caa5813baf197b15247/docs/design/2023-06-30-configurable-kv-timeout.md?plain=1#L14-L15
@@ -1204,11 +1233,11 @@ type SessionVars struct {
 	// PresumeKeyNotExists indicates lazy existence checking is enabled.
 	PresumeKeyNotExists bool
 
-	// EnableParallelApply indicates that thether to use parallel apply.
+	// EnableParallelApply indicates that whether to use parallel apply.
 	EnableParallelApply bool
 
-	// EnableRedactLog indicates that whether redact log.
-	EnableRedactLog bool
+	// EnableRedactLog indicates that whether redact log. Possible values are 'OFF', 'ON', 'MARKER'.
+	EnableRedactLog string
 
 	// ShardAllocateStep indicates the max size of continuous rowid shard in one transaction.
 	ShardAllocateStep int64
@@ -1280,7 +1309,7 @@ type SessionVars struct {
 
 	// LocalTemporaryTables is *infoschema.LocalTemporaryTables, use interface to avoid circle dependency.
 	// It's nil if there is no local temporary table.
-	LocalTemporaryTables interface{}
+	LocalTemporaryTables any
 
 	// TemporaryTableData stores committed kv values for temporary table for current session.
 	TemporaryTableData TemporaryTableData
@@ -1291,7 +1320,7 @@ type SessionVars struct {
 	// ReadStaleness indicates the staleness duration for the following query
 	ReadStaleness time.Duration
 
-	// cachedStmtCtx is used to optimze the object allocation.
+	// cachedStmtCtx is used to optimize the object allocation.
 	cachedStmtCtx [2]stmtctx.StatementContext
 
 	// Rng stores the rand_seed1 and rand_seed2 for Rand() function
@@ -1308,7 +1337,10 @@ type SessionVars struct {
 	ReadConsistency ReadConsistencyLevel
 
 	// StatsLoadSyncWait indicates how long to wait for stats load before timeout.
-	StatsLoadSyncWait int64
+	StatsLoadSyncWait atomic.Int64
+
+	// EnableParallelHashaggSpill indicates if parallel hash agg could spill.
+	EnableParallelHashaggSpill bool
 
 	// SysdateIsNow indicates whether Sysdate is an alias of Now function
 	SysdateIsNow bool
@@ -1483,7 +1515,7 @@ type SessionVars struct {
 	shardRand *rand.Rand
 
 	// Resource group name
-	// NOTE: all statement relate opeartion should use StmtCtx.ResourceGroupName instead.
+	// NOTE: all statement relate operation should use StmtCtx.ResourceGroupName instead.
 	ResourceGroupName string
 
 	// PessimisticTransactionFairLocking controls whether fair locking for pessimistic transaction
@@ -1515,6 +1547,14 @@ type SessionVars struct {
 	// If there exists an index whose estimated selectivity is smaller than this threshold, the optimizer won't
 	// use the ExpectedCnt to adjust the estimated row count for index scan.
 	OptOrderingIdxSelThresh float64
+
+	// OptOrderingIdxSelRatio is the ratio for optimizer to determine when qualified rows from filtering outside
+	// of the index will be found during the scan of an ordering index.
+	// If all filtering is applied as matching on the ordering index, this ratio will have no impact.
+	// Value < 0 disables this enhancement.
+	// Value 0 will estimate row(s) found immediately.
+	// 0 > value <= 1 applies that percentage as the estimate when rows are found. For example 0.1 = 10%.
+	OptOrderingIdxSelRatio float64
 
 	// EnableMPPSharedCTEExecution indicates whether we enable the shared CTE execution strategy on MPP side.
 	EnableMPPSharedCTEExecution bool
@@ -1568,6 +1608,16 @@ type SessionVars struct {
 	// TxnEntrySizeLimit indicates indicates the max size of a entry in membuf. The default limit (from config) will be
 	// overwritten if this value is not 0.
 	TxnEntrySizeLimit uint64
+
+	// DivPrecisionIncrement indicates the number of digits by which to increase the scale of the result
+	// of division operations performed with the / operator.
+	DivPrecisionIncrement int
+
+	// allowed when tikv disk full happened.
+	DiskFullOpt kvrpcpb.DiskFullOpt
+
+	// GroupConcatMaxLen represents the maximum length of the result of GROUP_CONCAT.
+	GroupConcatMaxLen uint64
 }
 
 // GetOptimizerFixControlMap returns the specified value of the optimizer fix control.
@@ -1606,7 +1656,7 @@ func (s *SessionVars) IsPlanReplayerCaptureEnabled() bool {
 	return s.EnablePlanReplayerCapture || s.EnablePlanReplayedContinuesCapture
 }
 
-// GetChunkAllocator returns a vaid chunk allocator.
+// GetChunkAllocator returns a valid chunk allocator.
 func (s *SessionVars) GetChunkAllocator() chunk.Allocator {
 	if s.chunkPool == nil {
 		return chunk.NewEmptyAllocator()
@@ -1663,19 +1713,19 @@ func (s *SessionVars) ClearAlloc(alloc *chunk.Allocator, hasErr bool) {
 }
 
 // GetPreparedStmtByName returns the prepared statement specified by stmtName.
-func (s *SessionVars) GetPreparedStmtByName(stmtName string) (interface{}, error) {
+func (s *SessionVars) GetPreparedStmtByName(stmtName string) (any, error) {
 	stmtID, ok := s.PreparedStmtNameToID[stmtName]
 	if !ok {
-		return nil, ErrStmtNotFound
+		return nil, plannererrors.ErrStmtNotFound
 	}
 	return s.GetPreparedStmtByID(stmtID)
 }
 
 // GetPreparedStmtByID returns the prepared statement specified by stmtID.
-func (s *SessionVars) GetPreparedStmtByID(stmtID uint32) (interface{}, error) {
+func (s *SessionVars) GetPreparedStmtByID(stmtID uint32) (any, error) {
 	stmt, ok := s.PreparedStmts[stmtID]
 	if !ok {
-		return nil, ErrStmtNotFound
+		return nil, plannererrors.ErrStmtNotFound
 	}
 	return stmt, nil
 }
@@ -1929,17 +1979,14 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 			types:  make(map[string]*types.FieldType),
 		},
 		systems:                       make(map[string]string),
-		stmtVars:                      make(map[string]string),
-		PreparedStmts:                 make(map[uint32]interface{}),
+		PreparedStmts:                 make(map[uint32]any),
 		PreparedStmtNameToID:          make(map[string]uint32),
 		PlanCacheParams:               NewPlanCacheParamList(),
 		TxnCtx:                        &TransactionContext{},
 		RetryInfo:                     &RetryInfo{},
 		ActiveRoles:                   make([]*auth.RoleIdentity, 0, 10),
-		StrictSQLMode:                 true,
 		AutoIncrementIncrement:        DefAutoIncrementIncrement,
 		AutoIncrementOffset:           DefAutoIncrementOffset,
-		Status:                        mysql.ServerStatusAutocommit,
 		StmtCtx:                       stmtctx.NewStmtCtx(),
 		AllowAggPushDown:              false,
 		AllowCartesianBCJ:             DefOptCartesianBCJ,
@@ -2009,7 +2056,6 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		TMPTableSize:                  DefTiDBTmpTableMaxSize,
 		MPPStoreFailTTL:               DefTiDBMPPStoreFailTTL,
 		Rng:                           mathutil.NewWithTime(),
-		StatsLoadSyncWait:             StatsLoadSyncWait.Load(),
 		EnableLegacyInstanceScope:     DefEnableLegacyInstanceScope,
 		RemoveOrderbyInSubquery:       DefTiDBRemoveOrderbyInSubquery,
 		EnableSkewDistinctAgg:         DefTiDBSkewDistinctAgg,
@@ -2028,7 +2074,9 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		TiFlashComputeDispatchPolicy:  tiflashcompute.DispatchPolicyConsistentHash,
 		ResourceGroupName:             resourcegroup.DefaultResourceGroupName,
 		DefaultCollationForUTF8MB4:    mysql.DefaultCollationName,
+		GroupConcatMaxLen:             DefGroupConcatMaxLen,
 	}
+	vars.status.Store(uint32(mysql.ServerStatusAutocommit))
 	vars.StmtCtx.ResourceGroupName = resourcegroup.DefaultResourceGroupName
 	vars.KVVars = tikvstore.NewVariables(&vars.SQLKiller.Signal)
 	vars.Concurrency = Concurrency{
@@ -2075,6 +2123,7 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 	vars.MemTracker = memory.NewTracker(memory.LabelForSession, vars.MemQuotaQuery)
 	vars.MemTracker.IsRootTrackerOfSess = true
 	vars.MemTracker.Killer = &vars.SQLKiller
+	vars.StatsLoadSyncWait.Store(StatsLoadSyncWait.Load())
 
 	for _, engine := range config.GetGlobalConfig().IsolationRead.Engines {
 		switch engine {
@@ -2200,7 +2249,7 @@ func (s *SessionVars) AllocPlanColumnID() int64 {
 }
 
 // RegisterScalarSubQ register a scalar sub query into the map. This will be used for EXPLAIN.
-func (s *SessionVars) RegisterScalarSubQ(scalarSubQ interface{}) {
+func (s *SessionVars) RegisterScalarSubQ(scalarSubQ any) {
 	s.MapScalarSubQ = append(s.MapScalarSubQ, scalarSubQ)
 }
 
@@ -2264,15 +2313,36 @@ func (s *SessionVars) SetLastInsertID(insertID uint64) {
 // otherwise removes the flag.
 func (s *SessionVars) SetStatusFlag(flag uint16, on bool) {
 	if on {
-		s.Status |= flag
+		for {
+			status := s.status.Load()
+			if status&uint32(flag) == uint32(flag) {
+				break
+			}
+			if s.status.CompareAndSwap(status, status|uint32(flag)) {
+				break
+			}
+		}
 		return
 	}
-	s.Status &= ^flag
+	for {
+		status := s.status.Load()
+		if status&uint32(flag) == 0 {
+			break
+		}
+		if s.status.CompareAndSwap(status, status&^uint32(flag)) {
+			break
+		}
+	}
 }
 
-// GetStatusFlag gets the session server status variable, returns true if it is on.
-func (s *SessionVars) GetStatusFlag(flag uint16) bool {
-	return s.Status&flag > 0
+// HasStatusFlag gets the session server status variable, returns true if it is on.
+func (s *SessionVars) HasStatusFlag(flag uint16) bool {
+	return s.status.Load()&uint32(flag) > 0
+}
+
+// Status returns the server status.
+func (s *SessionVars) Status() uint16 {
+	return uint16(s.status.Load())
 }
 
 // SetInTxn sets whether the session is in transaction.
@@ -2286,12 +2356,12 @@ func (s *SessionVars) SetInTxn(val bool) {
 
 // InTxn returns if the session is in transaction.
 func (s *SessionVars) InTxn() bool {
-	return s.GetStatusFlag(mysql.ServerStatusInTrans)
+	return s.HasStatusFlag(mysql.ServerStatusInTrans)
 }
 
 // IsAutocommit returns if the session is set to autocommit.
 func (s *SessionVars) IsAutocommit() bool {
-	return s.GetStatusFlag(mysql.ServerStatusAutocommit)
+	return s.HasStatusFlag(mysql.ServerStatusAutocommit)
 }
 
 // IsIsolation if true it means the transaction is at that isolation level.
@@ -2340,7 +2410,7 @@ func (s *SessionVars) SetTxnIsolationLevelOneShotStateForNextTxn() {
 	}
 }
 
-// IsPessimisticReadConsistency if true it means the statement is in an read consistency pessimistic transaction.
+// IsPessimisticReadConsistency if true it means the statement is in a read consistency pessimistic transaction.
 func (s *SessionVars) IsPessimisticReadConsistency() bool {
 	return s.TxnCtx.IsPessimistic && s.IsIsolation(ast.ReadCommitted)
 }
@@ -2372,9 +2442,6 @@ func (s *SessionVars) GetSystemVar(name string) (string, bool) {
 	} else if name == ErrorCount {
 		return strconv.Itoa(int(s.SysErrorCount)), true
 	}
-	if val, ok := s.stmtVars[name]; ok {
-		return val, ok
-	}
 	val, ok := s.systems[name]
 	return val, ok
 }
@@ -2400,7 +2467,7 @@ func (k planCacheStmtKey) Hash() []byte {
 }
 
 // AddNonPreparedPlanCacheStmt adds this PlanCacheStmt into non-preapred plan-cache stmt cache
-func (s *SessionVars) AddNonPreparedPlanCacheStmt(sql string, stmt interface{}) {
+func (s *SessionVars) AddNonPreparedPlanCacheStmt(sql string, stmt any) {
 	if s.nonPreparedPlanCacheStmts == nil {
 		s.nonPreparedPlanCacheStmts = kvcache.NewSimpleLRUCache(uint(s.SessionPlanCacheSize), 0, 0)
 	}
@@ -2408,7 +2475,7 @@ func (s *SessionVars) AddNonPreparedPlanCacheStmt(sql string, stmt interface{}) 
 }
 
 // GetNonPreparedPlanCacheStmt gets the PlanCacheStmt.
-func (s *SessionVars) GetNonPreparedPlanCacheStmt(sql string) interface{} {
+func (s *SessionVars) GetNonPreparedPlanCacheStmt(sql string) any {
 	if s.nonPreparedPlanCacheStmts == nil {
 		return nil
 	}
@@ -2417,7 +2484,7 @@ func (s *SessionVars) GetNonPreparedPlanCacheStmt(sql string) interface{} {
 }
 
 // AddPreparedStmt adds prepareStmt to current session and count in global.
-func (s *SessionVars) AddPreparedStmt(stmtID uint32, stmt interface{}) error {
+func (s *SessionVars) AddPreparedStmt(stmtID uint32, stmt any) error {
 	if _, exists := s.PreparedStmts[stmtID]; !exists {
 		maxPreparedStmtCount := MaxPreparedStmtCountValue.Load()
 		newPreparedStmtCount := atomic.AddInt64(&PreparedStmtCount, 1)
@@ -2450,17 +2517,6 @@ func (s *SessionVars) WithdrawAllPreparedStmt() {
 	}
 	afterMinus := atomic.AddInt64(&PreparedStmtCount, -int64(psCount))
 	metrics.PreparedStmtGauge.Set(float64(afterMinus))
-}
-
-// SetStmtVar sets the value of a system variable temporarily
-func (s *SessionVars) setStmtVar(name string, val string) error {
-	s.stmtVars[name] = val
-	return nil
-}
-
-// ClearStmtVars clear temporarily system variables.
-func (s *SessionVars) ClearStmtVars() {
-	s.stmtVars = make(map[string]string)
 }
 
 // GetSessionOrGlobalSystemVar gets a system variable.
@@ -2605,6 +2661,11 @@ func (s *SessionVars) GetPrevStmtDigest() string {
 	return s.prevStmtDigest
 }
 
+// GetDivPrecisionIncrement returns the specified value of DivPrecisionIncrement.
+func (s *SessionVars) GetDivPrecisionIncrement() int {
+	return s.DivPrecisionIncrement
+}
+
 // LazyCheckKeyNotExists returns if we can lazy check key not exists.
 func (s *SessionVars) LazyCheckKeyNotExists() bool {
 	return s.PresumeKeyNotExists || (s.TxnCtx != nil && s.TxnCtx.IsPessimistic && s.StmtCtx.ErrGroupLevel(errctx.ErrGroupDupKey) == errctx.LevelError)
@@ -2644,7 +2705,7 @@ func (s *SessionVars) EncodeSessionStates(_ context.Context, sessionStates *sess
 
 	// Encode other session contexts.
 	sessionStates.PreparedStmtID = s.preparedStmtID
-	sessionStates.Status = s.Status
+	sessionStates.Status = s.status.Load()
 	sessionStates.CurrentDB = s.CurrentDB
 	sessionStates.LastTxnInfo = s.LastTxnInfo
 	if s.LastQueryInfo.StartTS != 0 {
@@ -2680,7 +2741,7 @@ func (s *SessionVars) DecodeSessionStates(_ context.Context, sessionStates *sess
 
 	// Decode other session contexts.
 	s.preparedStmtID = sessionStates.PreparedStmtID
-	s.Status = sessionStates.Status
+	s.status.Store(sessionStates.Status)
 	s.CurrentDB = sessionStates.CurrentDB
 	s.LastTxnInfo = sessionStates.LastTxnInfo
 	if sessionStates.LastQueryInfo != nil {
@@ -2787,6 +2848,9 @@ type Concurrency struct {
 
 	// IdleTransactionTimeout indicates the maximum time duration a transaction could be idle, unit is second.
 	IdleTransactionTimeout int
+
+	// BulkDMLEnabled indicates whether to enable bulk DML in pipelined mode.
+	BulkDMLEnabled bool
 }
 
 // SetIndexLookupConcurrency set the number of concurrent index lookup worker.
@@ -3061,7 +3125,7 @@ const (
 	SlowLogCopBackoffPrefix = "Cop_backoff_"
 	// SlowLogMemMax is the max number bytes of memory used in this statement.
 	SlowLogMemMax = "Mem_max"
-	// SlowLogDiskMax is the nax number bytes of disk used in this statement.
+	// SlowLogDiskMax is the max number bytes of disk used in this statement.
 	SlowLogDiskMax = "Disk_max"
 	// SlowLogPrepared is used to indicate whether this sql execute in prepare.
 	SlowLogPrepared = "Prepared"
@@ -3151,7 +3215,7 @@ type SlowQueryLogItems struct {
 	TimeOptimize      time.Duration
 	TimeWaitTS        time.Duration
 	IndexNames        string
-	CopTasks          *stmtctx.CopTasksDetails
+	CopTasks          *execdetails.CopTasksDetails
 	ExecDetail        execdetails.ExecDetails
 	MemMax            int64
 	DiskMax           int64
@@ -3174,7 +3238,7 @@ type SlowQueryLogItems struct {
 	ResultRows        int64
 	IsExplicitTxn     bool
 	IsWriteCacheTable bool
-	UsedStats         map[int64]*stmtctx.UsedStatsInfoForTable
+	UsedStats         *stmtctx.UsedStatsInfo
 	IsSyncStatsFailed bool
 	Warnings          []JSONSQLWarnForSlowLog
 	ResourceGroupName string
@@ -3269,13 +3333,13 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 	if len(logItems.Digest) > 0 {
 		writeSlowLogItem(&buf, SlowLogDigestStr, logItems.Digest)
 	}
-	if len(logItems.UsedStats) > 0 {
+	keys := logItems.UsedStats.Keys()
+	if len(keys) > 0 {
 		buf.WriteString(SlowLogRowPrefixStr + SlowLogStatsInfoStr + SlowLogSpaceMarkStr)
 		firstComma := false
-		keys := maps.Keys(logItems.UsedStats)
 		slices.Sort(keys)
 		for _, id := range keys {
-			usedStatsForTbl := logItems.UsedStats[id]
+			usedStatsForTbl := logItems.UsedStats.GetUsedInfo(id)
 			if usedStatsForTbl == nil {
 				continue
 			}
@@ -3592,9 +3656,32 @@ func (s *SessionVars) GetRuntimeFilterMode() RuntimeFilterMode {
 	return s.runtimeFilterMode
 }
 
+// GetMaxExecutionTime get the max execution timeout value.
+func (s *SessionVars) GetMaxExecutionTime() uint64 {
+	if s.StmtCtx.HasMaxExecutionTime {
+		return s.StmtCtx.MaxExecutionTime
+	}
+	return s.MaxExecutionTime
+}
+
 // GetTiKVClientReadTimeout returns readonly kv request timeout, prefer query hint over session variable
 func (s *SessionVars) GetTiKVClientReadTimeout() uint64 {
 	return s.TiKVClientReadTimeout
+}
+
+// SetDiskFullOpt sets the session variable DiskFullOpt
+func (s *SessionVars) SetDiskFullOpt(level kvrpcpb.DiskFullOpt) {
+	s.DiskFullOpt = level
+}
+
+// GetDiskFullOpt returns the value of DiskFullOpt in the current session.
+func (s *SessionVars) GetDiskFullOpt() kvrpcpb.DiskFullOpt {
+	return s.DiskFullOpt
+}
+
+// ClearDiskFullOpt resets the session variable DiskFullOpt to DiskFullOpt_NotAllowedOnFull.
+func (s *SessionVars) ClearDiskFullOpt() {
+	s.DiskFullOpt = kvrpcpb.DiskFullOpt_NotAllowedOnFull
 }
 
 // RuntimeFilterType type of runtime filter "IN"
@@ -3623,7 +3710,7 @@ func (rfType RuntimeFilterType) String() string {
 // RuntimeFilterTypeStringToType convert RuntimeFilterTypeNameString to RuntimeFilterType
 // If name is legal, it will return Runtime Filter Type and true
 // Else, it will return -1 and false
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal name
+// The second param means the convert is ok or not. True is ok, false means it is illegal name
 // At present, we only support two names: "IN" and "MIN_MAX"
 func RuntimeFilterTypeStringToType(name string) (RuntimeFilterType, bool) {
 	switch name {
@@ -3638,7 +3725,7 @@ func RuntimeFilterTypeStringToType(name string) (RuntimeFilterType, bool) {
 
 // ToRuntimeFilterType convert session var value to RuntimeFilterType list
 // If sessionVarValue is legal, it will return RuntimeFilterType list and true
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal value
+// The second param means the convert is ok or not. True is ok, false means it is illegal value
 // The legal value should be comma-separated, eg: "IN,MIN_MAX"
 func ToRuntimeFilterType(sessionVarValue string) ([]RuntimeFilterType, bool) {
 	typeNameList := strings.Split(sessionVarValue, ",")
@@ -3686,7 +3773,7 @@ func (rfMode RuntimeFilterMode) String() string {
 // RuntimeFilterModeStringToMode convert RuntimeFilterModeString to RuntimeFilterMode
 // If name is legal, it will return Runtime Filter Mode and true
 // Else, it will return -1 and false
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal name
+// The second param means the convert is ok or not. True is ok, false means it is illegal name
 // At present, we only support one name: "OFF", "LOCAL"
 func RuntimeFilterModeStringToMode(name string) (RuntimeFilterMode, bool) {
 	switch name {

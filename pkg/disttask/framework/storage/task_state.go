@@ -26,7 +26,7 @@ import (
 func (mgr *TaskManager) CancelTask(ctx context.Context, taskID int64) error {
 	_, err := mgr.ExecuteSQLWithNewSession(ctx,
 		`update mysql.tidb_global_task
-		 set state = %?, 
+		 set state = %?,
 			 state_update_time = CURRENT_TIMESTAMP()
 		 where id = %? and state in (%?, %?)`,
 		proto.TaskStateCancelling, taskID, proto.TaskStatePending, proto.TaskStateRunning,
@@ -36,7 +36,7 @@ func (mgr *TaskManager) CancelTask(ctx context.Context, taskID int64) error {
 
 // CancelTaskByKeySession cancels task by key using input session.
 func (*TaskManager) CancelTaskByKeySession(ctx context.Context, se sessionctx.Context, taskKey string) error {
-	_, err := sqlexec.ExecSQL(ctx, se,
+	_, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
 		`update mysql.tidb_global_task
 		 set state = %?,
 			 state_update_time = CURRENT_TIMESTAMP()
@@ -59,6 +59,19 @@ func (mgr *TaskManager) FailTask(ctx context.Context, taskID int64, currentState
 	return err
 }
 
+// RevertTask implements the scheduler.TaskManager interface.
+func (mgr *TaskManager) RevertTask(ctx context.Context, taskID int64, taskState proto.TaskState, taskErr error) error {
+	_, err := mgr.ExecuteSQLWithNewSession(ctx, `
+		update mysql.tidb_global_task
+		set state = %?,
+			error = %?,
+			state_update_time = CURRENT_TIMESTAMP()
+		where id = %? and state = %?`,
+		proto.TaskStateReverting, serializeErr(taskErr), taskID, taskState,
+	)
+	return err
+}
+
 // RevertedTask implements the scheduler.TaskManager interface.
 func (mgr *TaskManager) RevertedTask(ctx context.Context, taskID int64) error {
 	_, err := mgr.ExecuteSQLWithNewSession(ctx,
@@ -76,9 +89,9 @@ func (mgr *TaskManager) RevertedTask(ctx context.Context, taskID int64) error {
 func (mgr *TaskManager) PauseTask(ctx context.Context, taskKey string) (bool, error) {
 	found := false
 	err := mgr.WithNewSession(func(se sessionctx.Context) error {
-		_, err := sqlexec.ExecSQL(ctx, se,
-			`update mysql.tidb_global_task 
-			 set state = %?, 
+		_, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
+			`update mysql.tidb_global_task
+			 set state = %?,
 				 state_update_time = CURRENT_TIMESTAMP()
 			 where task_key = %? and state in (%?, %?)`,
 			proto.TaskStatePausing, taskKey, proto.TaskStatePending, proto.TaskStateRunning,
@@ -102,8 +115,7 @@ func (mgr *TaskManager) PausedTask(ctx context.Context, taskID int64) error {
 	_, err := mgr.ExecuteSQLWithNewSession(ctx,
 		`update mysql.tidb_global_task
 		 set state = %?,
-			 state_update_time = CURRENT_TIMESTAMP(),
-			 end_time = CURRENT_TIMESTAMP()
+			 state_update_time = CURRENT_TIMESTAMP()
 		 where id = %? and state = %?`,
 		proto.TaskStatePaused, taskID, proto.TaskStatePausing,
 	)
@@ -114,9 +126,9 @@ func (mgr *TaskManager) PausedTask(ctx context.Context, taskID int64) error {
 func (mgr *TaskManager) ResumeTask(ctx context.Context, taskKey string) (bool, error) {
 	found := false
 	err := mgr.WithNewSession(func(se sessionctx.Context) error {
-		_, err := sqlexec.ExecSQL(ctx, se,
+		_, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
 			`update mysql.tidb_global_task
-		     set state = %?, 
+		     set state = %?,
 			     state_update_time = CURRENT_TIMESTAMP()
 		     where task_key = %? and state = %?`,
 			proto.TaskStateResuming, taskKey, proto.TaskStatePaused,
@@ -135,10 +147,22 @@ func (mgr *TaskManager) ResumeTask(ctx context.Context, taskKey string) (bool, e
 	return found, nil
 }
 
+// ResumedTask implements the scheduler.TaskManager interface.
+func (mgr *TaskManager) ResumedTask(ctx context.Context, taskID int64) error {
+	_, err := mgr.ExecuteSQLWithNewSession(ctx, `
+		update mysql.tidb_global_task
+		set state = %?,
+			state_update_time = CURRENT_TIMESTAMP()
+		where id = %? and state = %?`,
+		proto.TaskStateRunning, taskID, proto.TaskStateResuming,
+	)
+	return err
+}
+
 // SucceedTask update task state from running to succeed.
 func (mgr *TaskManager) SucceedTask(ctx context.Context, taskID int64) error {
 	return mgr.WithNewSession(func(se sessionctx.Context) error {
-		_, err := sqlexec.ExecSQL(ctx, se, `
+		_, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(), `
 			update mysql.tidb_global_task
 			set state = %?,
 			    step = %?,
