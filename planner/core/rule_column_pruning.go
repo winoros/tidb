@@ -80,7 +80,20 @@ func (p *LogicalProjection) PruneColumns(parentUsedCols []*expression.Column, op
 	appendColumnPruneTraceStep(p, prunedColumns, opt)
 	selfUsedCols := make([]*expression.Column, 0, len(p.Exprs))
 	selfUsedCols = expression.ExtractColumnsFromExpressions(selfUsedCols, p.Exprs, nil)
-	return child.PruneColumns(selfUsedCols, opt)
+	err := child.PruneColumns(selfUsedCols, opt)
+	if err != nil {
+		return err
+	}
+	// If its columns are all pruned, we directly use its child. The child will output at least one column.
+	if p.Schema().Len() == 0 {
+		childSchema := child.Schema()
+		p.setSchemaAndNames(childSchema.Clone(), child.OutputNames())
+		p.Exprs = make([]expression.Expression, 0, childSchema.Len())
+		for _, col := range childSchema.Columns {
+			p.Exprs = append(p.Exprs, col)
+		}
+	}
+	return nil
 }
 
 // PruneColumns implements LogicalPlan interface.
@@ -554,10 +567,6 @@ func (p *LogicalWindow) extractUsedCols(parentUsedCols []*expression.Column) []*
 
 // PruneColumns implements LogicalPlan interface.
 func (p *LogicalLimit) PruneColumns(parentUsedCols []*expression.Column, opt *logicalOptimizeOp) error {
-	if len(parentUsedCols) == 0 { // happens when LIMIT appears in UPDATE.
-		return nil
-	}
-
 	savedUsedCols := make([]*expression.Column, len(parentUsedCols))
 	copy(savedUsedCols, parentUsedCols)
 	if err := p.children[0].PruneColumns(parentUsedCols, opt); err != nil {
