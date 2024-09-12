@@ -47,6 +47,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/ranger"
 	"github.com/pingcap/tidb/pkg/util/tracing"
+	"github.com/pingcap/tipb/go-tipb"
 	"go.uber.org/zap"
 )
 
@@ -2471,6 +2472,25 @@ func convertToTableScan(ds *DataSource, prop *property.PhysicalProperty, candida
 		}
 		if prop.MPPPartitionTp != property.AnyType {
 			return base.InvalidTask, nil
+		}
+		if candidate.path.Index != nil && candidate.path.Index.VectorInfo != nil {
+			vectorInfo := candidate.path.Index.VectorInfo
+			distanceMetricPB, err := vectorDistanceMetricToPB(vectorInfo.DistanceMetric)
+			if err != nil {
+				return base.InvalidTask, err
+			}
+
+			ts.AnnIndexExtra = &VectorIndexExtra{
+				candidate.path.Index,
+				uint(ts.Table.Columns[candidate.path.Index.Columns[0].Offset].GetFlen()),
+				tipb.ANNQueryInfo{
+					QueryType:      tipb.ANNQueryType_OrderBy,
+					DistanceMetric: distanceMetricPB,
+					TopK:           math.MaxUint32,
+					ColumnName:     candidate.path.Index.Columns[0].Name.L,
+					ColumnId:       ts.Table.Columns[candidate.path.Index.Columns[0].Offset].ID,
+				},
+			}
 		}
 		// ********************************** future deprecated start **************************/
 		var hasVirtualColumn bool

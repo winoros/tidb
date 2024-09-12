@@ -273,6 +273,10 @@ func (p *PhysicalTableScan) ToPB(ctx *base.BuildPBContext, storeType kv.StoreTyp
 		tsExec.PushedDownFilterConditions = conditions
 	}
 
+	if p.AnnIndexExtra != nil {
+		tsExec.AnnQuery = &p.AnnIndexExtra.ANNQueryInfo
+	}
+
 	var err error
 	tsExec.RuntimeFilterList, err = RuntimeFilterListToPB(ctx, p.runtimeFilterList, ctx.GetClient())
 	if err != nil {
@@ -289,6 +293,18 @@ func (p *PhysicalTableScan) ToPB(ctx *base.BuildPBContext, storeType kv.StoreTyp
 	}
 	err = tables.SetPBColumnsDefaultValue(ctx.GetExprCtx(), tsExec.Columns, p.Columns)
 	return &tipb.Executor{Tp: tipb.ExecType_TypeTableScan, TblScan: tsExec, ExecutorId: &executorID}, err
+}
+
+func vectorDistanceMetricToPB(metric model.DistanceMetric) (tipb.VectorDistanceMetric, error) {
+	switch metric {
+	case model.DistanceMetricL2:
+		return tipb.VectorDistanceMetric_L2, nil
+	case model.DistanceMetricCosine:
+		return tipb.VectorDistanceMetric_COSINE, nil
+	case model.DistanceMetricInnerProduct:
+		return tipb.VectorDistanceMetric_INNER_PRODUCT, nil
+	}
+	return tipb.VectorDistanceMetric_L2, errors.Errorf("unexpected vector distance metric: %v", metric)
 }
 
 func (p *PhysicalTableScan) partitionTableScanToPBForFlash(ctx *base.BuildPBContext) (*tipb.Executor, error) {

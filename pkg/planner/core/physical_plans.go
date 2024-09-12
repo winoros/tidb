@@ -955,6 +955,15 @@ type PhysicalTableScan struct {
 	// for runtime filter
 	runtimeFilterList []*RuntimeFilter `plan-cache-clone:"must-nil"` // plan with runtime filter is not cached
 	maxWaitTimeMs     int
+
+	AnnIndexExtra *VectorIndexExtra `plan-cache-clone:"must-nil"` // MPP plan should not be cached.
+}
+
+// VectorIndexExtra is the extra information for vector index.
+type VectorIndexExtra struct {
+	IndexInfo *model.IndexInfo
+	Dimension uint
+	tipb.ANNQueryInfo
 }
 
 // Clone implements op.PhysicalPlan interface.

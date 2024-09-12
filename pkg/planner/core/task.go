@@ -38,6 +38,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/paging"
 	"github.com/pingcap/tidb/pkg/util/plancodec"
+	"github.com/pingcap/tipb/go-tipb"
 	"go.uber.org/zap"
 )
 
@@ -990,6 +991,9 @@ func (p *PhysicalTopN) Attach2Task(tasks ...base.Task) base.Task {
 	} else if mppTask, ok := t.(*MppTask); ok && needPushDown && p.canPushDownToTiFlash(mppTask) {
 		pushedDownTopN := p.getPushedDownTopN(mppTask.p)
 		mppTask.p = pushedDownTopN
+		if !fixTopNForANNIndex(pushedDownTopN) {
+			return base.InvalidTask
+		}
 	}
 	rootTask := t.ConvertToRootTask(p.SCtx())
 	// Skip TopN with partition on the root. This is a derived topN and window function
@@ -998,6 +1002,46 @@ func (p *PhysicalTopN) Attach2Task(tasks ...base.Task) base.Task {
 		return t
 	}
 	return attachPlan2Task(p, rootTask)
+}
+
+var annIndexFnNameToMetric = map[string]tipb.VectorDistanceMetric{
+	ast.VecL1Distance:     tipb.VectorDistanceMetric_L1,
+	ast.VecL2Distance:     tipb.VectorDistanceMetric_L2,
+	ast.VecCosineDistance: tipb.VectorDistanceMetric_COSINE,
+
+	// Note: IP is not supported yet. Currently we will throw errors when building IP index.
+	ast.VecNegativeInnerProduct: tipb.VectorDistanceMetric_INNER_PRODUCT,
+}
+
+func fixTopNForANNIndex(p *PhysicalTopN) bool {
+	ts, ok := p.Children()[0].(*PhysicalTableScan)
+	if !ok || ts.AnnIndexExtra == nil {
+		return true
+	}
+	vecColID := ts.AnnIndexExtra.ColumnId
+	if len(p.ByItems) > 1 {
+		return false
+	}
+	sf, ok := p.ByItems[0].Expr.(*expression.ScalarFunction)
+	if !ok {
+		return false
+	}
+	disctanceMetricPB := annIndexFnNameToMetric[sf.FuncName.L]
+	if disctanceMetricPB != ts.AnnIndexExtra.DistanceMetric {
+		return false
+	}
+	orderByCol, ok := sf.GetArgs()[0].(*expression.Column)
+	if !ok || orderByCol.ID != vecColID {
+		return false
+	}
+	constArg, ok := sf.GetArgs()[1].(*expression.Constant)
+	if !ok || constArg.RetType.GetType() != mysql.TypeTiDBVectorFloat32 {
+		return false
+	}
+	ts.AnnIndexExtra.RefVecF32 = constArg.Value.GetVectorFloat32().SerializeTo(nil)
+	ts.PlanCostInit = false
+	ts.AnnIndexExtra.TopK = uint32(p.Count)
+	return true
 }
 
 // Attach2Task implements the PhysicalPlan interface.
