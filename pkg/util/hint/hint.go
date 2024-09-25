@@ -1130,5 +1130,32 @@ func collectUnmatchedStorageHintWarning(tiflashTables, tikvTables []HintedTable)
 	return warnings
 }
 
+// CheckAndGenerateLeadingHint used to check and generate the valid leading hint.
+// We are allowed to use at most one leading hint in a join group. When more than one,
+// all leading hints in the current join group will be invalid.
+// For example: select /*+ leading(t3) */ * from (select /*+ leading(t1) */ t2.b from t1 join t2 on t1.a=t2.a) t4 join t3 on t4.b=t3.b
+// The Join Group {t1, t2, t3} contains two leading hints includes leading(t3) and leading(t1).
+// Although they are in different query blocks, they are conflicting.
+// In addition, the table alias 't4' cannot be recognized because of the join group.
+func CheckAndGenerateLeadingHint(hintInfo []*PlanHints) (*PlanHints, bool) {
+	leadingHintNum := len(hintInfo)
+	var leadingHintInfo *PlanHints
+	hasDiffLeadingHint := false
+	if leadingHintNum > 0 {
+		leadingHintInfo = hintInfo[0]
+		// One join group has one leading hint at most. Check whether there are different join order hints.
+		for i := 1; i < leadingHintNum; i++ {
+			if hintInfo[i] != hintInfo[i-1] {
+				hasDiffLeadingHint = true
+				break
+			}
+		}
+		if hasDiffLeadingHint {
+			leadingHintInfo = nil
+		}
+	}
+	return leadingHintInfo, hasDiffLeadingHint
+}
+
 // ErrWarnConflictingHint is a warning error.
 var ErrWarnConflictingHint = dbterror.ClassOptimizer.NewStd(mysql.ErrWarnConflictingHint)

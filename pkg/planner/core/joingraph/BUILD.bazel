@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "joingraph",
+    srcs = [
+        "builder.go",
+        "greedy.go",
+        "leading_hint.go",
+    ],
+    importpath = "github.com/pingcap/tidb/pkg/planner/core/joingraph",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/expression",
+        "//pkg/parser/ast",
+        "//pkg/parser/model",
+        "//pkg/planner/core",
+        "//pkg/planner/core/base",
+        "//pkg/sessionctx",
+        "//pkg/util/hint",
+        "@com_github_bits_and_blooms_bitset//:bitset",
+    ],
+)
