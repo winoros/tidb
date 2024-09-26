@@ -245,10 +245,15 @@ func TestVectorIndex(t *testing.T) {
 		tiflash.Unlock()
 	}()
 
+	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/MockCheckVectorIndexProcess", `return(1)`)
+
 	tk.MustExec("create table t (a int, b vector, c vector(3), d vector(4));")
 	tk.MustExec("alter table t set tiflash replica 1;")
 	tk.MustExec("alter table t add vector index vecIdx1((vec_cosine_distance(d))) USING HNSW;")
-	tk.MustUseIndex("select * from t use index(vecIdx1) order by vec_cosine_distance(d) limit 1", "vecIdx1")
+	tk.MustUseIndex("select * from t use index(vecIdx1) order by vec_cosine_distance(d, '[1,1,1,1]') limit 1", "vecIdx1")
+	tk.MustUseIndex("select * from t use index(vecIdx1) order by vec_cosine_distance('[1,1,1,1]', d) limit 1", "vecIdx1")
+	tk.MustNoIndexUsed("select * from t use index(vecIdx1) order by vec_l2_distance(d, '[1,1,1,1]') limit 1")
+	tk.MustNoIndexUsed("select * from t use index(vecIdx1) where a = 5 order by vec_cosine_distance(d, '[1,1,1,1]') limit 1")
 }
 
 func TestAnalyzeVectorIndex(t *testing.T) {

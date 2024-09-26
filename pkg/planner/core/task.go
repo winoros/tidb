@@ -1019,28 +1019,32 @@ func fixTopNForANNIndex(p *PhysicalTopN) bool {
 		return true
 	}
 	vecColID := ts.AnnIndexExtra.ColumnId
-	if len(p.ByItems) > 1 {
+	if len(p.ByItems) != 1 {
 		return false
 	}
-	sf, ok := p.ByItems[0].Expr.(*expression.ScalarFunction)
+	if p.ByItems[0].Desc {
+		// Currently all vector search indexes must be used for ASC order.
+		// DESC order can be only applied to INNER_PRODUCT, which is not
+		// supported yet.
+		return false
+	}
+	vs, err := expression.ExtractVectorSearch(p.ByItems[0].Expr)
+	if err != nil || vs == nil {
+		return false
+	}
+	disctanceMetricPB, ok := annIndexFnNameToMetric[vs.DistanceFnName.L]
 	if !ok {
 		return false
 	}
-	disctanceMetricPB := annIndexFnNameToMetric[sf.FuncName.L]
 	if disctanceMetricPB != ts.AnnIndexExtra.DistanceMetric {
 		return false
 	}
-	orderByCol, ok := sf.GetArgs()[0].(*expression.Column)
-	if !ok || orderByCol.ID != vecColID {
+	if vs.Column.ID != vecColID {
 		return false
 	}
-	constArg, ok := sf.GetArgs()[1].(*expression.Constant)
-	if !ok || constArg.RetType.GetType() != mysql.TypeTiDBVectorFloat32 {
-		return false
-	}
-	ts.AnnIndexExtra.RefVecF32 = constArg.Value.GetVectorFloat32().SerializeTo(nil)
-	ts.PlanCostInit = false
+	ts.AnnIndexExtra.RefVecF32 = vs.Vec.SerializeTo(nil)
 	ts.AnnIndexExtra.TopK = uint32(p.Count)
+	ts.PlanCostInit = false
 	return true
 }
 

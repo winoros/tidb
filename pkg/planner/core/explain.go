@@ -17,6 +17,7 @@ package core
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -270,7 +271,7 @@ func (p *PhysicalTableScan) OperatorInfo(normalized bool) string {
 			buffer.WriteString(runtimeFilter.ExplainInfo(false))
 		}
 	}
-	if p.AnnIndexExtra != nil {
+	if p.AnnIndexExtra != nil && p.AnnIndexExtra.ANNQueryInfo.TopK != math.MaxUint32 {
 		buffer.WriteString(", annIndex:")
 		buffer.WriteString(p.AnnIndexExtra.GetDistanceMetric().String())
 		buffer.WriteString("(")

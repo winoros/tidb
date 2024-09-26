@@ -16,6 +16,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/expression"
@@ -273,7 +274,7 @@ func (p *PhysicalTableScan) ToPB(ctx *base.BuildPBContext, storeType kv.StoreTyp
 		tsExec.PushedDownFilterConditions = conditions
 	}
 
-	if p.AnnIndexExtra != nil {
+	if p.AnnIndexExtra != nil && p.AnnIndexExtra.ANNQueryInfo.TopK != math.MaxUint32 {
 		tsExec.AnnQuery = &p.AnnIndexExtra.ANNQueryInfo
 	}
 

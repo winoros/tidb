@@ -1121,7 +1121,7 @@ func TestCreateTableWithVectorIndex(t *testing.T) {
 
 	// test TiFlash store count is 2
 	mockTiflashStoreCnt := uint64(2)
-	store, dom = testkit.CreateMockStoreAndDomainWithSchemaLease(t, tiflashReplicaLease, withMockTiFlash(int(mockTiflashStoreCnt)), mockstore.WithDDLChecker())
+	store, dom = testkit.CreateMockStoreAndDomainWithSchemaLease(t, tiflashReplicaLease, mockstore.WithMockTiFlash(int(mockTiflashStoreCnt)), mockstore.WithDDLChecker())
 	tk = testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	checkCreateTableWithVectorIdx(1)
