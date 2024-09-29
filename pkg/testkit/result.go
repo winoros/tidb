@@ -49,6 +49,25 @@ func (res *Result) Check(expected [][]any) {
 	res.require.Equal(needBuff.String(), resBuff.String(), res.comment)
 }
 
+func (res *Result) CheckMultiExpects(expects ...[][]any) {
+	resBuff := bytes.NewBufferString("")
+	for _, row := range res.rows {
+		_, _ = fmt.Fprintf(resBuff, "%s\n", row)
+	}
+
+	needs := make([]string, 0, len(expects))
+	needBuff := bytes.NewBufferString("")
+	for _, expect := range expects {
+		for _, row := range expect {
+			_, _ = fmt.Fprintf(needBuff, "%s\n", row)
+		}
+		needs = append(needs, needBuff.String())
+		needBuff.Reset()
+	}
+
+	res.require.Contains(needs, resBuff.String(), res.comment)
+}
+
 // Equal check whether the result equals the expected results.
 func (res *Result) Equal(expected [][]any) bool {
 	resBuff := bytes.NewBufferString("")

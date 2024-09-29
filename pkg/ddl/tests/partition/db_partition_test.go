@@ -3155,9 +3155,16 @@ func TestRemovePartitioningAutoIDs(t *testing.T) {
 	tk3.MustExec(`insert into t values (null, 9)`)
 	tk2.MustExec(`insert into t values (null, 10)`)
 	tk3.MustExec(`COMMIT`)
-	tk3.MustQuery(`select _tidb_rowid, a, b from t`).Sort().Check(testkit.Rows(
-		"13 11 11", "14 2 2", "15 12 12", "17 16 18",
-		"19 18 4", "21 20 5", "23 22 6", "25 24 7", "30 29 9"))
+	tk3.MustQuery(`select _tidb_rowid, a, b from t`).Sort().CheckMultiExpects(
+		testkit.Rows(
+			"13 11 11", "14 2 2", "15 12 12", "17 16 18",
+			"19 18 4", "21 20 5", "23 22 6", "25 24 7", "30 29 9",
+		),
+		testkit.Rows(
+			"13 11 11", "14 2 2", "15 12 12", "17 16 18",
+			"19 18 4", "21 20 6", "30013 30012 5", "30015 30014 7", "30020 30019 9",
+		),
+	)
 	tk2.MustQuery(`select _tidb_rowid, a, b from t`).Sort().Check(testkit.Rows(
 		"13 11 11", "14 2 2", "15 12 12", "17 16 18",
 		"19 18 4", "23 22 6", "27 26 8", "32 31 10"))
