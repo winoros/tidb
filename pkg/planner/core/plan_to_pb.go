@@ -512,6 +512,7 @@ func (p *PhysicalIndexScan) ToPB(_ *base.BuildPBContext, store kv.StoreType) (*t
 			PrimaryColumnIds: pkColIDs,
 			FtsQueryInfo:     p.FtsQueryInfo,
 		}
+		idxExec.FtsQueryInfo.QueryFunc = tipb.ScalarFuncSig_FTSMatchWord
 		return &tipb.Executor{Tp: tipb.ExecType_TypeIndexScan, IdxScan: idxExec, ExecutorId: &executorID}, nil
 	}
 	idxExec := &tipb.IndexScan{
