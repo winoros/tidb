@@ -16,12 +16,18 @@ package stream
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pingcap/errors"
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
+	"github.com/pingcap/kvproto/pkg/encryptionpb"
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/br/pkg/encryption"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta"
@@ -38,6 +44,20 @@ const (
 
 	streamBackupGlobalCheckpointPrefix = "v1/global_checkpoint"
 )
+
+// metaPattern is a regular expression used to match backup metadata filenames.
+// The expected filename format is:
+//
+//	{flushTs}-{minDefaultTs}-{minTs}-{maxTs}.meta
+//
+// where each part is a hexadecimal string (0-9, a-f, A-F).
+// Example:
+//
+//	0000000000000001-0000000000003039-065CCFF1D8AC0000-065CCFF1D8AC0006.meta
+//
+// The pattern captures all four parts as separate groups.
+// Leading zeros are necessary for the pattern to match.
+var metaPattern = regexp.MustCompile(`^([0-9a-fA-F]{16})-([0-9a-fA-F]{16})-([0-9a-fA-F]{16})-([0-9a-fA-F]{16})$`)
 
 func GetStreamBackupMetaPrefix() string {
 	return streamBackupMetaPrefix
@@ -81,7 +101,7 @@ func buildObserveTableRanges(
 	backupTS uint64,
 ) ([]kv.KeyRange, error) {
 	snapshot := storage.GetSnapshot(kv.NewVersion(backupTS))
-	m := meta.NewSnapshotMeta(snapshot)
+	m := meta.NewReader(snapshot)
 
 	dbs, err := m.ListDatabases()
 	if err != nil {
@@ -157,16 +177,31 @@ type ContentRef struct {
 
 // MetadataHelper make restore/truncate compatible with metadataV1 and metadataV2.
 type MetadataHelper struct {
-	cache   map[string]*ContentRef
-	decoder *zstd.Decoder
+	cache             map[string]*ContentRef
+	decoder           *zstd.Decoder
+	encryptionManager *encryption.Manager
 }
 
-func NewMetadataHelper() *MetadataHelper {
+type MetadataHelperOption func(*MetadataHelper)
+
+func WithEncryptionManager(manager *encryption.Manager) MetadataHelperOption {
+	return func(mh *MetadataHelper) {
+		mh.encryptionManager = manager
+	}
+}
+
+func NewMetadataHelper(opts ...MetadataHelperOption) *MetadataHelper {
 	decoder, _ := zstd.NewReader(nil)
-	return &MetadataHelper{
+	helper := &MetadataHelper{
 		cache:   make(map[string]*ContentRef),
 		decoder: decoder,
 	}
+
+	for _, opt := range opts {
+		opt(helper)
+	}
+
+	return helper
 }
 
 func (m *MetadataHelper) InitCacheEntry(path string, ref int) {
@@ -191,6 +226,35 @@ func (m *MetadataHelper) decodeCompressedData(data []byte, compressionType backu
 		"failed to decode compressed data: compression type is unimplemented. type id is %d", compressionType)
 }
 
+func (m *MetadataHelper) verifyChecksumAndDecryptIfNeeded(ctx context.Context, data []byte,
+	encryptionInfo *encryptionpb.FileEncryptionInfo) ([]byte, error) {
+	// no need to decrypt
+	if encryptionInfo == nil {
+		return data, nil
+	}
+
+	if m.encryptionManager == nil {
+		return nil, errors.New("need to decrypt data but encryption manager not set")
+	}
+
+	// Verify checksum before decryption
+	if encryptionInfo.Checksum != nil {
+		actualChecksum := sha256.Sum256(data)
+		expectedChecksumHex := hex.EncodeToString(encryptionInfo.Checksum)
+		actualChecksumHex := hex.EncodeToString(actualChecksum[:])
+		if expectedChecksumHex != actualChecksumHex {
+			return nil, errors.Errorf("checksum mismatch before decryption, expected %s, actual %s",
+				expectedChecksumHex, actualChecksumHex)
+		}
+	}
+
+	decryptedContent, err := m.encryptionManager.Decrypt(ctx, data, encryptionInfo)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return decryptedContent, nil
+}
+
 func (m *MetadataHelper) ReadFile(
 	ctx context.Context,
 	path string,
@@ -198,6 +262,7 @@ func (m *MetadataHelper) ReadFile(
 	length uint64,
 	compressionType backuppb.CompressionType,
 	storage storage.ExternalStorage,
+	encryptionInfo *encryptionpb.FileEncryptionInfo,
 ) ([]byte, error) {
 	var err error
 	cref, exist := m.cache[path]
@@ -212,7 +277,12 @@ func (m *MetadataHelper) ReadFile(
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		return m.decodeCompressedData(data, compressionType)
+		// decrypt if needed
+		decryptedData, err := m.verifyChecksumAndDecryptIfNeeded(ctx, data, encryptionInfo)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return m.decodeCompressedData(decryptedData, compressionType)
 	}
 
 	cref.ref -= 1
@@ -223,8 +293,12 @@ func (m *MetadataHelper) ReadFile(
 			return nil, errors.Trace(err)
 		}
 	}
-
-	buf, err := m.decodeCompressedData(cref.data[offset:offset+length], compressionType)
+	// decrypt if needed
+	decryptedData, err := m.verifyChecksumAndDecryptIfNeeded(ctx, cref.data[offset:offset+length], encryptionInfo)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	buf, err := m.decodeCompressedData(decryptedData, compressionType)
 
 	if cref.ref <= 0 {
 		// need reset reference information.
@@ -298,11 +372,58 @@ func (*MetadataHelper) Marshal(meta *backuppb.Metadata) ([]byte, error) {
 	return meta.Marshal()
 }
 
+func (m *MetadataHelper) Close() {
+	if m.decoder != nil {
+		m.decoder.Close()
+	}
+	if m.encryptionManager != nil {
+		m.encryptionManager.Close()
+	}
+}
+
+func FilterPathByTs(path string, left, right uint64) string {
+	filename := strings.TrimSuffix(path, ".meta")
+	filename = filename[strings.LastIndex(filename, "/")+1:]
+
+	if metaPattern.MatchString(filename) {
+		matches := metaPattern.FindStringSubmatch(filename)
+		if len(matches) < 5 {
+			log.Warn("invalid meta file name format", zap.String("file", path))
+			// consider compatible with future file path change
+			return path
+		}
+
+		flushTs, _ := strconv.ParseUint(matches[1], 16, 64)
+		minDefaultTs, _ := strconv.ParseUint(matches[2], 16, 64)
+		minTs, _ := strconv.ParseUint(matches[3], 16, 64)
+		maxTs, _ := strconv.ParseUint(matches[4], 16, 64)
+
+		if minDefaultTs == 0 || minDefaultTs > minTs {
+			log.Warn("minDefaultTs is not correct, fallback to minTs",
+				zap.String("file", path),
+				zap.Uint64("flushTs", flushTs),
+				zap.Uint64("minTs", minTs),
+				zap.Uint64("minDefaultTs", minDefaultTs),
+			)
+			minDefaultTs = minTs
+		}
+
+		if right < minDefaultTs || maxTs < left {
+			return ""
+		}
+	}
+
+	// keep consistency with old behaviour
+	return path
+}
+
 // FastUnmarshalMetaData used a 128 worker pool to speed up
 // read metadata content from external_storage.
 func FastUnmarshalMetaData(
 	ctx context.Context,
 	s storage.ExternalStorage,
+	startTS uint64,
+	endTS uint64,
 	metaDataWorkerPoolSize uint,
 	fn func(path string, rawMetaData []byte) error,
 ) error {
@@ -311,10 +432,18 @@ func FastUnmarshalMetaData(
 	eg, ectx := errgroup.WithContext(ctx)
 	opt := &storage.WalkOption{SubDir: GetStreamBackupMetaPrefix()}
 	err := s.WalkDir(ectx, opt, func(path string, size int64) error {
-		if !strings.HasSuffix(path, ".meta") {
+		if !strings.HasSuffix(path, metaSuffix) {
 			return nil
 		}
-		readPath := path
+		readPath := FilterPathByTs(path, startTS, endTS)
+		if len(readPath) == 0 {
+			log.Info("skip download meta file out of range",
+				zap.String("file", path),
+				zap.Uint64("startTs", startTS),
+				zap.Uint64("endTs", endTS),
+			)
+			return nil
+		}
 		pool.ApplyOnErrorGroup(eg, func() error {
 			b, err := s.ReadFile(ectx, readPath)
 			if err != nil {

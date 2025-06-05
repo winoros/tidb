@@ -22,8 +22,8 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/planner/util/coretestsdk"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	statstestutil "github.com/pingcap/tidb/pkg/statistics/handle/ddl/testutil"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testdata"
 	"github.com/stretchr/testify/require"
@@ -57,8 +57,8 @@ func TestVerboseExplain(t *testing.T) {
 
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t1")
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t2")
+	testkit.SetTiFlashReplica(t, dom, "test", "t1")
+	testkit.SetTiFlashReplica(t, dom, "test", "t2")
 
 	var input []string
 	var output []struct {
@@ -88,7 +88,7 @@ func TestIsolationReadTiFlashNotChoosePointGet(t *testing.T) {
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
 	is := dom.InfoSchema()
-	tblInfo, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t"))
+	tblInfo, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tblInfo.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{
 		Count:     1,
@@ -144,7 +144,7 @@ func TestMergeContinuousSelections(t *testing.T) {
 
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "ts")
+	testkit.SetTiFlashReplica(t, dom, "test", "ts")
 
 	tk.MustExec(" set @@tidb_allow_mpp=1;")
 
@@ -176,7 +176,7 @@ func TestIssue31240(t *testing.T) {
 	// since allow-mpp is adjusted to false, there will be no physical plan if TiFlash cop is banned.
 	tk.MustExec("set @@session.tidb_allow_tiflash_cop=ON")
 
-	tbl, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "t31240", L: "t31240"})
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "t31240", L: "t31240"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -226,12 +226,13 @@ func TestIssue32632(t *testing.T) {
 		"`S_COMMENT` varchar(101) NOT NULL," +
 		"PRIMARY KEY (`S_SUPPKEY`) /*T![clustered_index] CLUSTERED */)")
 	h := dom.StatsHandle()
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
+	err := statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
 	tk.MustExec("set @@tidb_enforce_mpp = 1")
 
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "partsupp", L: "partsupp"})
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "partsupp", L: "partsupp"})
 	require.NoError(t, err)
-	tbl2, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "supplier", L: "supplier"})
+	tbl2, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "supplier", L: "supplier"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl1.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -275,9 +276,9 @@ func TestTiFlashPartitionTableScan(t *testing.T) {
 	tk.MustExec("drop table if exists hp_t;")
 	tk.MustExec("create table rp_t(a int) partition by RANGE (a) (PARTITION p0 VALUES LESS THAN (6),PARTITION p1 VALUES LESS THAN (11), PARTITION p2 VALUES LESS THAN (16), PARTITION p3 VALUES LESS THAN (21));")
 	tk.MustExec("create table hp_t(a int) partition by hash(a) partitions 4;")
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "rp_t", L: "rp_t"})
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "rp_t", L: "rp_t"})
 	require.NoError(t, err)
-	tbl2, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "hp_t", L: "hp_t"})
+	tbl2, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "hp_t", L: "hp_t"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl1.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -310,7 +311,7 @@ func TestTiFlashFineGrainedShuffle(t *testing.T) {
 	tk.MustExec("drop table if exists t1;")
 	tk.MustExec("create table t1(c1 int, c2 int)")
 
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "t1", L: "t1"})
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "t1", L: "t1"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl1.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -397,12 +398,12 @@ func TestFixControl45132(t *testing.T) {
 	tk.MustExec(`use test`)
 	tk.MustExec(`create table t (a int, b int, key(a))`)
 	values := make([]string, 0, 101)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		values = append(values, "(1, 1)")
 	}
 	values = append(values, "(2, 2)") // count(1) : count(2) == 100 : 1
 	tk.MustExec(`insert into t values ` + strings.Join(values, ","))
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		tk.MustExec(`insert into t select * from t`)
 	}
 	tk.MustExec(`analyze table t`)
@@ -451,15 +452,15 @@ func TestIssue52023(t *testing.T) {
 	tk.MustQuery(`select * from t where a IN (0x5,55)`).Check(testkit.Rows("\u0005"))
 	tk.MustQuery(`explain select * from t where a = 0x5`).Check(testkit.Rows("Point_Get_1 1.00 root table:t, partition:P4, clustered index:PRIMARY(a) "))
 	tk.MustQuery(`explain format='brief' select * from t where a = 5`).Check(testkit.Rows(""+
-		"TableReader 0.80 root partition:all data:Selection",
-		"└─Selection 0.80 cop[tikv]  eq(cast(test.t.a, double BINARY), 5)",
+		"TableReader 1.00 root partition:P4 data:Selection",
+		"└─Selection 1.00 cop[tikv]  eq(cast(test.t.a, double BINARY), 5)",
 		"  └─TableFullScan 1.00 cop[tikv] table:t keep order:false"))
 	tk.MustQuery(`explain format='brief' select * from t where a IN (5,55)`).Check(testkit.Rows(""+
-		"TableReader 0.96 root partition:all data:Selection",
-		"└─Selection 0.96 cop[tikv]  or(eq(cast(test.t.a, double BINARY), 5), eq(cast(test.t.a, double BINARY), 55))",
+		"TableReader 1.00 root partition:P4 data:Selection",
+		"└─Selection 1.00 cop[tikv]  or(eq(cast(test.t.a, double BINARY), 5), eq(cast(test.t.a, double BINARY), 55))",
 		"  └─TableFullScan 1.00 cop[tikv] table:t keep order:false"))
 	tk.MustQuery(`explain format='brief' select * from t where a IN (0x5,55)`).Check(testkit.Rows(""+
-		"TableReader 1.00 root partition:all data:Selection",
+		"TableReader 1.00 root partition:P4 data:Selection",
 		"└─Selection 1.00 cop[tikv]  or(eq(test.t.a, \"0x05\"), eq(cast(test.t.a, double BINARY), 55))",
 		"  └─TableFullScan 1.00 cop[tikv] table:t keep order:false"))
 }
@@ -474,7 +475,7 @@ func TestTiFlashExtraColumnPrune(t *testing.T) {
 	tk.MustExec("drop table if exists t1;")
 	tk.MustExec("create table t1(c1 int, c2 int)")
 
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "t1", L: "t1"})
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "t1", L: "t1"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl1.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -492,4 +493,46 @@ func TestTiFlashExtraColumnPrune(t *testing.T) {
 		})
 		tk.MustQuery(tt).Check(testkit.Rows(output[i].Plan...))
 	}
+}
+
+func TestIndexMergeJSONMemberOf2FlakyPart(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	// The following tests are flaky, we add it in unit test to have more chance to debug the issue.
+	tk.MustExec(`use test`)
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t(a int, b int, c int, d json, index iad(a, (cast(d->'$.b' as signed array))));`)
+	tk.MustExec(`insert into t value(1,1,1, '{"b":[1,2,3,4]}');`)
+	tk.MustExec(`insert into t value(2,2,2, '{"b":[3,4,5,6]}');`)
+	tk.MustExec(`set tidb_analyze_version=2;`)
+	tk.MustExec(`analyze table t all columns;`)
+	tk.MustQuery("explain select * from t use index (iad) where a = 1;").Check(testkit.Rows(
+		"TableReader_7 1.00 root  data:Selection_6",
+		"└─Selection_6 1.00 cop[tikv]  eq(test.t.a, 1)",
+		"  └─TableFullScan_5 2.00 cop[tikv] table:t keep order:false",
+	))
+	tk.MustQuery("explain select * from t use index (iad) where a = 1 and (2 member of (d->'$.b'));").Check(testkit.Rows(
+		"IndexMerge_7 1.00 root  type: union",
+		"├─IndexRangeScan_5(Build) 1.00 cop[tikv] table:t, index:iad(a, cast(json_extract(`d`, _utf8mb4'$.b') as signed array)) range:[1 2,1 2], keep order:false, stats:partial[d:unInitialized]",
+		"└─TableRowIDScan_6(Probe) 1.00 cop[tikv] table:t keep order:false, stats:partial[d:unInitialized]",
+	))
+}
+
+func TestIssue56915(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t(a int, b int, j json, index ia(a), index mvi( (cast(j as signed array)), a, b) );`)
+	tk.MustExec(`insert into t value(1,1,'[1,2,3,4,5]');`)
+	tk.MustExec(`insert into t value(1,1,'[1,2,3,4,5]');`)
+	tk.MustExec(`insert into t value(1,1,'[1,2,3,4,5]');`)
+	tk.MustExec(`insert into t value(1,1,'[1,2,3,4,5]');`)
+	tk.MustExec(`insert into t value(1,1,'[6]');`)
+	tk.MustExec(`analyze table t all columns;`)
+	tk.MustQuery("explain format = brief select * from t where a = 1 and 6 member of (j);").Check(testkit.Rows(
+		"IndexMerge 1.00 root  type: union",
+		"├─IndexRangeScan(Build) 1.00 cop[tikv] table:t, index:mvi(cast(`j` as signed array), a, b) range:[6 1,6 1], keep order:false, stats:partial[j:unInitialized]",
+		"└─TableRowIDScan(Probe) 1.00 cop[tikv] table:t keep order:false, stats:partial[j:unInitialized]",
+	))
 }

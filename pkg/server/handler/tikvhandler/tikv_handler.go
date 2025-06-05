@@ -40,16 +40,18 @@ import (
 	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/executor"
 	"github.com/pingcap/tidb/pkg/infoschema"
+	infoschemacontext "github.com/pingcap/tidb/pkg/infoschema/context"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/pingcap/tidb/pkg/server/handler"
 	"github.com/pingcap/tidb/pkg/session"
 	"github.com/pingcap/tidb/pkg/session/txninfo"
 	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/store/gcworker"
 	"github.com/pingcap/tidb/pkg/store/helper"
@@ -64,7 +66,9 @@ import (
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/pd/client/clients/router"
 	pd "github.com/tikv/pd/client/http"
+	"github.com/tikv/pd/client/opt"
 	"go.uber.org/zap"
 )
 
@@ -425,9 +429,9 @@ func (h SettingsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if generalLog := req.Form.Get("tidb_general_log"); generalLog != "" {
 			switch generalLog {
 			case "0":
-				variable.ProcessGeneralLog.Store(false)
+				vardef.ProcessGeneralLog.Store(false)
 			case "1":
-				variable.ProcessGeneralLog.Store(true)
+				vardef.ProcessGeneralLog.Store(true)
 			default:
 				handler.WriteError(w, errors.New("illegal argument"))
 				return
@@ -443,9 +447,9 @@ func (h SettingsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 			switch asyncCommit {
 			case "0":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnableAsyncCommit, variable.Off)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnableAsyncCommit, vardef.Off)
 			case "1":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnableAsyncCommit, variable.On)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnableAsyncCommit, vardef.On)
 			default:
 				handler.WriteError(w, errors.New("illegal argument"))
 				return
@@ -465,9 +469,9 @@ func (h SettingsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 			switch onePC {
 			case "0":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnable1PC, variable.Off)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnable1PC, vardef.Off)
 			case "1":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnable1PC, variable.On)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnable1PC, vardef.On)
 			default:
 				handler.WriteError(w, errors.New("illegal argument"))
 				return
@@ -484,7 +488,7 @@ func (h SettingsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 			if threshold > 0 {
-				atomic.StoreUint32(&variable.DDLSlowOprThreshold, uint32(threshold))
+				atomic.StoreUint32(&vardef.DDLSlowOprThreshold, uint32(threshold))
 			}
 		}
 		if checkMb4ValueInUtf8 := req.Form.Get("check_mb4_value_in_utf8"); checkMb4ValueInUtf8 != "" {
@@ -532,9 +536,9 @@ func (h SettingsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 			switch mutationChecker {
 			case "0":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnableMutationChecker, variable.Off)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnableMutationChecker, vardef.Off)
 			case "1":
-				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), variable.TiDBEnableMutationChecker, variable.On)
+				err = s.GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), vardef.TiDBEnableMutationChecker, vardef.On)
 			default:
 				handler.WriteError(w, errors.New("illegal argument"))
 				return
@@ -599,7 +603,7 @@ func (h FlashReplicaHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	replicaInfos := make([]*TableFlashReplicaInfo, 0)
-	schemas := schema.ListTablesWithSpecialAttribute(infoschema.TiFlashAttribute)
+	schemas := schema.ListTablesWithSpecialAttribute(infoschemacontext.TiFlashAttribute)
 	for _, schema := range schemas {
 		for _, tbl := range schema.TableInfos {
 			replicaInfos = appendTiFlashReplicaInfo(replicaInfos, tbl)
@@ -762,7 +766,7 @@ type SchemaTableStorage struct {
 	DataFree      int64  `json:"data_free"`
 }
 
-func getSchemaTablesStorageInfo(h *SchemaStorageHandler, schema *pmodel.CIStr, table *pmodel.CIStr) (messages []*SchemaTableStorage, err error) {
+func getSchemaTablesStorageInfo(h *SchemaStorageHandler, schema *ast.CIStr, table *ast.CIStr) (messages []*SchemaTableStorage, err error) {
 	var s sessiontypes.Session
 	if s, err = session.CreateSession(h.Store); err != nil {
 		return
@@ -804,7 +808,7 @@ func getSchemaTablesStorageInfo(h *SchemaStorageHandler, schema *pmodel.CIStr, t
 				break
 			}
 
-			for i := 0; i < req.NumRows(); i++ {
+			for i := range req.NumRows() {
 				messages = append(messages, &SchemaTableStorage{
 					TableSchema:   req.GetRow(i).GetString(0),
 					TableName:     req.GetRow(i).GetString(1),
@@ -833,13 +837,13 @@ func (h SchemaStorageHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 	params := mux.Vars(req)
 
 	var (
-		dbName    *pmodel.CIStr
-		tableName *pmodel.CIStr
+		dbName    *ast.CIStr
+		tableName *ast.CIStr
 		isSingle  bool
 	)
 
 	if reqDbName, ok := params[handler.DBName]; ok {
-		cDBName := pmodel.NewCIStr(reqDbName)
+		cDBName := ast.NewCIStr(reqDbName)
 		// all table schemas in a specified database
 		schemaInfo, exists := schema.SchemaByName(cDBName)
 		if !exists {
@@ -850,7 +854,7 @@ func (h SchemaStorageHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 
 		if reqTableName, ok := params[handler.TableName]; ok {
 			// table schema of a specified table name
-			cTableName := pmodel.NewCIStr(reqTableName)
+			cTableName := ast.NewCIStr(reqTableName)
 			data, e := schema.TableByName(context.Background(), cDBName, cTableName)
 			if e != nil {
 				handler.WriteError(w, e)
@@ -949,10 +953,10 @@ func (h SchemaHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	params := mux.Vars(req)
 
 	if dbName, ok := params[handler.DBName]; ok {
-		cDBName := pmodel.NewCIStr(dbName)
+		cDBName := ast.NewCIStr(dbName)
 		if tableName, ok := params[handler.TableName]; ok {
 			// table schema of a specified table name
-			cTableName := pmodel.NewCIStr(tableName)
+			cTableName := ast.NewCIStr(tableName)
 			data, err := schema.TableByName(context.Background(), cDBName, cTableName)
 			if err != nil {
 				handler.WriteError(w, err)
@@ -1048,7 +1052,7 @@ func (h *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	tableName, partitionName := handler.ExtractTableAndPartitionName(tableName)
-	tableVal, err := schema.TableByName(context.Background(), pmodel.NewCIStr(dbName), pmodel.NewCIStr(tableName))
+	tableVal, err := schema.TableByName(context.Background(), ast.NewCIStr(dbName), ast.NewCIStr(tableName))
 	if err != nil {
 		handler.WriteError(w, err)
 		return
@@ -1124,7 +1128,7 @@ func (h DDLHistoryJobHandler) getHistoryDDL(jobID, limit int) (jobs []*model.Job
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	txnMeta := meta.NewMeta(txn)
+	txnMeta := meta.NewMutator(txn)
 
 	jobs, err = ddl.ScanHistoryDDLJobs(txnMeta, int64(jobID), limit)
 	if err != nil {
@@ -1347,7 +1351,7 @@ func (h *TableHandler) getRegionsByID(tbl table.Table, id int64, name string) (*
 	startKey, endKey := tablecodec.GetTableHandleKeyRange(id)
 	ctx := context.Background()
 	pdCli := h.RegionCache.PDClient()
-	regions, err := pdCli.BatchScanRegions(ctx, []pd.KeyRange{{StartKey: startKey, EndKey: endKey}}, -1)
+	regions, err := pdCli.BatchScanRegions(ctx, []router.KeyRange{{StartKey: startKey, EndKey: endKey}}, -1, opt.WithAllowFollowerHandle())
 	if err != nil {
 		return nil, err
 	}
@@ -1370,7 +1374,7 @@ func (h *TableHandler) getRegionsByID(tbl table.Table, id int64, name string) (*
 		indices[i].Name = index.Meta().Name.String()
 		indices[i].ID = indexID
 		startKey, endKey := tablecodec.GetTableIndexKeyRange(id, indexID)
-		regions, err := pdCli.BatchScanRegions(ctx, []pd.KeyRange{{StartKey: startKey, EndKey: endKey}}, -1)
+		regions, err := pdCli.BatchScanRegions(ctx, []router.KeyRange{{StartKey: startKey, EndKey: endKey}}, -1, opt.WithAllowFollowerHandle())
 		if err != nil {
 			return nil, err
 		}
@@ -1956,7 +1960,7 @@ func (DDLHookHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hook := req.FormValue("ddl_hook")
 	switch hook {
 	case "ctc_hook":
-		err := failpoint.EnableCall("github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+		err := failpoint.EnableCall("github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
 			log.Info("on job run before", zap.String("job", job.String()))
 			// Only block the ctc type ddl here.
 			if job.Type != model.ActionModifyColumn {
@@ -1973,7 +1977,7 @@ func (DDLHookHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	case "default_hook":
-		_ = failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/onJobRunBefore")
+		_ = failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep")
 	}
 
 	handler.WriteData(w, "success!")

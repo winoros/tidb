@@ -20,6 +20,7 @@ import (
 	"github.com/docker/go-units"
 	"github.com/google/uuid"
 	"github.com/pingcap/tidb/br/pkg/storage"
+	"github.com/pingcap/tidb/pkg/ingestor/engineapi"
 	"github.com/pingcap/tidb/pkg/lightning/log"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"go.uber.org/zap"
@@ -48,6 +49,7 @@ func MergeOverlappingFiles(
 	onClose OnCloseFunc,
 	concurrency int,
 	checkHotspot bool,
+	onDup engineapi.OnDuplicateKey,
 ) error {
 	dataFilesSlice := splitDataFiles(paths, concurrency)
 	// during encode&sort step, the writer-limit is aligned to block size, so we
@@ -64,7 +66,6 @@ func MergeOverlappingFiles(
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(concurrency)
 	for _, files := range dataFilesSlice {
-		files := files
 		eg.Go(func() error {
 			return mergeOverlappingFilesInternal(
 				egCtx,
@@ -76,6 +77,7 @@ func MergeOverlappingFiles(
 				blockSize,
 				onClose,
 				checkHotspot,
+				onDup,
 			)
 		})
 	}
@@ -140,6 +142,7 @@ func mergeOverlappingFilesInternal(
 	blockSize int,
 	onClose OnCloseFunc,
 	checkHotspot bool,
+	onDup engineapi.OnDuplicateKey,
 ) (err error) {
 	task := log.BeginTask(logutil.Logger(ctx).With(
 		zap.String("writer-id", writerID),
@@ -165,11 +168,9 @@ func mergeOverlappingFilesInternal(
 		SetMemorySizeLimit(defaultOneWriterMemSizeLimit).
 		SetBlockSize(blockSize).
 		SetOnCloseFunc(onClose).
+		SetOnDup(onDup).
 		BuildOneFile(store, newFilePrefix, writerID)
-	err = writer.Init(ctx, partSize)
-	if err != nil {
-		return nil
-	}
+	writer.InitPartSizeAndLogger(ctx, partSize)
 	defer func() {
 		err2 := writer.Close(ctx)
 		if err2 == nil {

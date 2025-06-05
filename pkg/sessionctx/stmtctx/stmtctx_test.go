@@ -30,10 +30,12 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/types"
 	contextutil "github.com/pingcap/tidb/pkg/util/context"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/hint"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/util"
 )
@@ -41,7 +43,7 @@ import (
 func TestCopTasksDetails(t *testing.T) {
 	ctx := stmtctx.NewStmtCtx()
 	backoffs := []string{"tikvRPC", "pdRPC", "regionMiss"}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		d := &execdetails.ExecDetails{
 			DetailsNeedP90: execdetails.DetailsNeedP90{
 				CalleeAddress: fmt.Sprintf("%v", i+1),
@@ -62,10 +64,12 @@ func TestCopTasksDetails(t *testing.T) {
 	d := ctx.CopTasksDetails()
 	require.Equal(t, 100, d.NumCopTasks)
 	require.Equal(t, time.Second*101/2, d.AvgProcessTime)
+	require.Equal(t, time.Second*101/2*100, d.TotProcessTime)
 	require.Equal(t, time.Second*91, d.P90ProcessTime)
 	require.Equal(t, time.Second*100, d.MaxProcessTime)
 	require.Equal(t, "100", d.MaxProcessAddress)
 	require.Equal(t, time.Millisecond*101/2, d.AvgWaitTime)
+	require.Equal(t, time.Millisecond*101/2*100, d.TotWaitTime)
 	require.Equal(t, time.Millisecond*91, d.P90WaitTime)
 	require.Equal(t, time.Millisecond*100, d.MaxWaitTime)
 	require.Equal(t, "100", d.MaxWaitAddress)
@@ -221,7 +225,7 @@ func TestApproxRuntimeInfo(t *testing.T) {
 	var valRange = rand.Int31n(10000) + 1000
 	backoffs := []string{"tikvRPC", "pdRPC", "regionMiss"}
 	details := []*execdetails.ExecDetails{}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		d := &execdetails.ExecDetails{
 			DetailsNeedP90: execdetails.DetailsNeedP90{
 				CalleeAddress: fmt.Sprintf("%v", i+1),
@@ -248,7 +252,7 @@ func TestApproxRuntimeInfo(t *testing.T) {
 	}
 
 	ctx := stmtctx.NewStmtCtx()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		ctx.MergeExecDetails(details[i], nil)
 	}
 	d := ctx.CopTasksDetails()
@@ -261,6 +265,7 @@ func TestApproxRuntimeInfo(t *testing.T) {
 	for _, detail := range details {
 		timeSum += detail.TimeDetail.ProcessTime
 	}
+	require.Equal(t, d.TotProcessTime, timeSum)
 	require.Equal(t, d.AvgProcessTime, timeSum/time.Duration(n))
 	require.InEpsilon(t, d.P90ProcessTime.Nanoseconds(), details[n*9/10].TimeDetail.ProcessTime.Nanoseconds(), 0.05)
 	require.Equal(t, d.MaxProcessTime, details[n-1].TimeDetail.ProcessTime)
@@ -273,6 +278,7 @@ func TestApproxRuntimeInfo(t *testing.T) {
 	for _, detail := range details {
 		timeSum += detail.TimeDetail.WaitTime
 	}
+	require.Equal(t, d.TotWaitTime, timeSum)
 	require.Equal(t, d.AvgWaitTime, timeSum/time.Duration(n))
 	require.InEpsilon(t, d.P90WaitTime.Nanoseconds(), details[n*9/10].TimeDetail.WaitTime.Nanoseconds(), 0.05)
 	require.Equal(t, d.MaxWaitTime, details[n-1].TimeDetail.WaitTime)
@@ -303,7 +309,7 @@ func TestApproxRuntimeInfo(t *testing.T) {
 func TestStmtHintsClone(t *testing.T) {
 	hints := hint.StmtHints{}
 	value := reflect.ValueOf(&hints).Elem()
-	for i := 0; i < value.NumField(); i++ {
+	for i := range value.NumField() {
 		field := value.Field(i)
 		switch field.Kind() {
 		case reflect.Int, reflect.Int32, reflect.Int64:
@@ -432,6 +438,15 @@ func TestStmtCtxID(t *testing.T) {
 		require.Greater(t, ctxID, currentID)
 		currentID = ctxID
 	}
+}
+
+func TestIssue58600(t *testing.T) {
+	sc := stmtctx.NewStmtCtx()
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/sessionctx/stmtctx/afterFoundRowsLocked", func(sc *stmtctx.StatementContext) {
+		// no panic when call sc.Reset()
+		assert.False(t, sc.Reset())
+	})
+	sc.FoundRows()
 }
 
 func TestErrCtx(t *testing.T) {

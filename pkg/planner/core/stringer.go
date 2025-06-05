@@ -69,11 +69,13 @@ func fdToString(in base.LogicalPlan, strs []string, idxs []int) ([]string, []int
 		for _, child := range x.Children() {
 			strs, idxs = fdToString(child, strs, idxs)
 		}
-	case *DataSource:
+	case *logicalop.DataSource:
 		strs = append(strs, "{"+x.FDs().String()+"}")
 	case *logicalop.LogicalApply:
 		strs = append(strs, "{"+x.FDs().String()+"}")
 	case *logicalop.LogicalJoin:
+		strs = append(strs, "{"+x.FDs().String()+"}")
+	case *logicalop.LogicalUnionAll:
 		strs = append(strs, "{"+x.FDs().String()+"}")
 	default:
 	}
@@ -220,7 +222,7 @@ func toString(in base.Plan, strs []string, idxs []int) ([]string, []int) {
 		name := "Sequence"
 		str = name + "{" + strings.Join(children, ",") + "}"
 		idxs = idxs[:last]
-	case *DataSource:
+	case *logicalop.DataSource:
 		if x.PartitionDefIdx != nil {
 			// TODO: Change this to:
 			//str = fmt.Sprintf("Partition(%d)", x.TableInfo.Partition.Definitions[*x.PartitionDefIdx].Name.O)

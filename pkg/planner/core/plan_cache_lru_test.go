@@ -38,7 +38,7 @@ func randomPlanCacheValue(types []*types.FieldType) *PlanCacheValue {
 	random := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return &PlanCacheValue{
 		Plan:       plans[random.Int()%len(plans)],
-		paramTypes: types,
+		ParamTypes: types,
 	}
 }
 
@@ -69,11 +69,11 @@ func TestLRUPCPut(t *testing.T) {
 	}
 
 	// one key corresponding to multi values
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		keys[i] = "key-1"
 		opts := pTypes[i]
 		vals[i] = &PlanCacheValue{
-			paramTypes: opts,
+			ParamTypes: opts,
 		}
 		lru.Put(keys[i], vals[i], opts)
 	}
@@ -82,7 +82,7 @@ func TestLRUPCPut(t *testing.T) {
 
 	// test for non-existent elements
 	require.Equal(t, dropCnt, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		bucket, exist := lru.buckets[keys[i]]
 		require.True(t, exist)
 		for element := range bucket {
@@ -140,17 +140,17 @@ func TestLRUPCGet(t *testing.T) {
 		{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeInt24)},
 	}
 	// 5 bucket
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		keys[i] = fmt.Sprintf("key-%v", i%4)
 		opts := pTypes[i]
 		vals[i] = &PlanCacheValue{
-			paramTypes: opts,
+			ParamTypes: opts,
 		}
 		lru.Put(keys[i], vals[i], opts)
 	}
 
 	// test for non-existent elements
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		opts := pTypes[i]
 		value, exists := lru.Get(keys[i], opts)
 		require.False(t, exists)
@@ -193,11 +193,11 @@ func TestLRUPCDelete(t *testing.T) {
 		{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeEnum)},
 		{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeDate)},
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		keys[i] = fmt.Sprintf("key-%v", i)
 		opts := pTypes[i]
 		vals[i] = &PlanCacheValue{
-			paramTypes: opts,
+			ParamTypes: opts,
 		}
 		lru.Put(keys[i], vals[i], opts)
 	}
@@ -229,11 +229,11 @@ func TestLRUPCDeleteAll(t *testing.T) {
 		{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeEnum)},
 		{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeDate)},
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		keys[i] = fmt.Sprintf("key-%v", i)
 		opts := pTypes[i]
 		vals[i] = &PlanCacheValue{
-			paramTypes: opts,
+			ParamTypes: opts,
 		}
 		lru.Put(keys[i], vals[i], opts)
 	}
@@ -241,7 +241,7 @@ func TestLRUPCDeleteAll(t *testing.T) {
 
 	lru.DeleteAll()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		opts := pTypes[i]
 		value, exists := lru.Get(keys[i], opts)
 		require.False(t, exists)
@@ -272,11 +272,11 @@ func TestLRUPCSetCapacity(t *testing.T) {
 	}
 
 	// one key corresponding to multi values
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		keys[i] = "key-1"
 		opts := pTypes[i]
 		vals[i] = &PlanCacheValue{
-			paramTypes: opts,
+			ParamTypes: opts,
 		}
 		lru.Put(keys[i], vals[i], opts)
 	}
@@ -288,7 +288,7 @@ func TestLRUPCSetCapacity(t *testing.T) {
 
 	// test for non-existent elements
 	require.Equal(t, dropCnt, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		bucket, exist := lru.buckets[keys[i]]
 		require.True(t, exist)
 		for element := range bucket {
@@ -316,7 +316,7 @@ func TestLRUPCSetCapacity(t *testing.T) {
 	require.Nil(t, root)
 
 	err = lru.SetCapacity(0)
-	require.Error(t, err, "capacity of LRU cache should be at least 1")
+	require.ErrorContains(t, err, "capacity of LRU cache should be at least 1")
 }
 
 func TestIssue37914(t *testing.T) {
@@ -328,7 +328,7 @@ func TestIssue37914(t *testing.T) {
 	pTypes := []*types.FieldType{types.NewFieldType(mysql.TypeFloat), types.NewFieldType(mysql.TypeDouble)}
 	key := "key-1"
 	opts := pTypes
-	val := &PlanCacheValue{paramTypes: opts}
+	val := &PlanCacheValue{ParamTypes: opts}
 
 	require.NotPanics(t, func() {
 		lru.Put(key, val, opts)
@@ -353,10 +353,10 @@ func TestIssue38244(t *testing.T) {
 	}
 
 	// one key corresponding to multi values
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		keys[i] = fmt.Sprintf("key-%v", i)
 		opts := pTypes[i]
-		vals[i] = &PlanCacheValue{paramTypes: opts}
+		vals[i] = &PlanCacheValue{ParamTypes: opts}
 		lru.Put(keys[i], vals[i], opts)
 	}
 	require.Equal(t, lru.size, lru.capacity)
@@ -378,7 +378,7 @@ func TestLRUPlanCacheMemoryUsage(t *testing.T) {
 	}
 	var res int64 = 0
 	// put
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		k := randomPlanCacheKey()
 		v := randomPlanCacheValue(pTypes)
 		opts := pTypes

@@ -27,10 +27,11 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
 	"github.com/pingcap/tidb/pkg/planner/property"
 	"github.com/pingcap/tidb/pkg/planner/util"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/logutil"
@@ -167,7 +168,7 @@ func (p *PhysicalTableScan) ExplainID() fmt.Stringer {
 
 // TP overrides the TP in order to match different range.
 func (p *PhysicalTableScan) TP() string {
-	if infoschema.IsClusterTableByName(p.DBName.O, p.Table.Name.O) {
+	if infoschema.IsClusterTableByName(p.DBName.L, p.Table.Name.L) {
 		return plancodec.TypeMemTableScan
 	} else if p.isChildOfIndexLookUp {
 		return plancodec.TypeTableRowIDScan
@@ -189,7 +190,7 @@ func (p *PhysicalTableScan) ExplainNormalizedInfo() string {
 
 // OperatorInfo implements dataAccesser interface.
 func (p *PhysicalTableScan) OperatorInfo(normalized bool) string {
-	if infoschema.IsClusterTableByName(p.DBName.O, p.Table.Name.O) {
+	if infoschema.IsClusterTableByName(p.DBName.L, p.Table.Name.L) {
 		return ""
 	}
 
@@ -229,17 +230,15 @@ func (p *PhysicalTableScan) OperatorInfo(normalized bool) string {
 		}
 	}
 	if p.SCtx().GetSessionVars().EnableLateMaterialization && len(p.filterCondition) > 0 && p.StoreType == kv.TiFlash {
-		buffer.WriteString("pushed down filter:")
 		if len(p.LateMaterializationFilterCondition) > 0 {
+			buffer.WriteString("pushed down filter:")
 			if normalized {
 				buffer.Write(expression.SortedExplainNormalizedExpressionList(p.LateMaterializationFilterCondition))
 			} else {
 				buffer.Write(expression.SortedExplainExpressionList(p.SCtx().GetExprCtx().GetEvalCtx(), p.LateMaterializationFilterCondition))
 			}
-		} else {
-			buffer.WriteString("empty")
+			buffer.WriteString(", ")
 		}
-		buffer.WriteString(", ")
 	}
 	buffer.WriteString("keep order:")
 	buffer.WriteString(strconv.FormatBool(p.KeepOrder))
@@ -270,6 +269,57 @@ func (p *PhysicalTableScan) OperatorInfo(normalized bool) string {
 			buffer.WriteString(runtimeFilter.ExplainInfo(false))
 		}
 	}
+	if len(p.UsedColumnarIndexes) > 0 {
+		annIndexes := make([]string, 0, len(p.UsedColumnarIndexes))
+		invertedIndexes := make([]string, 0, len(p.UsedColumnarIndexes))
+		for _, idx := range p.UsedColumnarIndexes {
+			if idx == nil {
+				continue
+			}
+			if idx.QueryInfo != nil && idx.QueryInfo.IndexType == tipb.ColumnarIndexType_TypeVector {
+				annIndexBuffer := bytes.NewBuffer(make([]byte, 0, 256))
+				annIndexBuffer.WriteString(idx.QueryInfo.GetAnnQueryInfo().GetDistanceMetric().String())
+				annIndexBuffer.WriteString("(")
+				annIndexBuffer.WriteString(idx.QueryInfo.GetAnnQueryInfo().GetColumnName())
+				annIndexBuffer.WriteString("..")
+				if normalized {
+					annIndexBuffer.WriteString("[?]")
+				} else {
+					v, _, err := types.ZeroCopyDeserializeVectorFloat32(idx.QueryInfo.GetAnnQueryInfo().RefVecF32)
+					if err != nil {
+						annIndexBuffer.WriteString("[?]")
+					} else {
+						annIndexBuffer.WriteString(v.TruncatedString())
+					}
+				}
+				annIndexBuffer.WriteString(", limit:")
+				if normalized {
+					annIndexBuffer.WriteString("?")
+				} else {
+					fmt.Fprint(annIndexBuffer, idx.QueryInfo.GetAnnQueryInfo().TopK)
+				}
+				annIndexBuffer.WriteString(")")
+
+				if idx.QueryInfo.GetAnnQueryInfo().GetEnableDistanceProj() {
+					annIndexBuffer.WriteString("->")
+					cols := p.Schema().Columns
+					annIndexBuffer.WriteString(cols[len(cols)-1].String())
+				}
+				annIndexes = append(annIndexes, annIndexBuffer.String())
+			} else if idx.QueryInfo.IndexType == tipb.ColumnarIndexType_TypeInverted && idx.QueryInfo != nil {
+				invertedIndexes = append(invertedIndexes, idx.IndexInfo.Name.L)
+			}
+		}
+		if len(annIndexes) > 0 {
+			buffer.WriteString(", annIndex:")
+			buffer.WriteString(strings.Join(annIndexes, ", "))
+		}
+		if len(invertedIndexes) > 0 {
+			buffer.WriteString(", invertedindex:")
+			buffer.WriteString(strings.Join(invertedIndexes, ", "))
+		}
+	}
+
 	return buffer.String()
 }
 
@@ -379,7 +429,7 @@ func (p *PhysicalSelection) ExplainInfo() string {
 
 // ExplainNormalizedInfo implements Plan interface.
 func (p *PhysicalSelection) ExplainNormalizedInfo() string {
-	if variable.IgnoreInlistPlanDigest.Load() {
+	if vardef.IgnoreInlistPlanDigest.Load() {
 		return string(expression.SortedExplainExpressionListIgnoreInlist(p.Conditions))
 	}
 	return string(expression.SortedExplainNormalizedExpressionList(p.Conditions))
@@ -389,7 +439,7 @@ func (p *PhysicalSelection) ExplainNormalizedInfo() string {
 func (p *PhysicalProjection) ExplainInfo() string {
 	evalCtx := p.SCtx().GetExprCtx().GetEvalCtx()
 	enableRedactLog := p.SCtx().GetSessionVars().EnableRedactLog
-	exprStr := expression.ExplainExpressionList(evalCtx, p.Exprs, p.schema, enableRedactLog)
+	exprStr := expression.ExplainExpressionList(evalCtx, p.Exprs, p.Schema(), enableRedactLog)
 	if p.TiFlashFineGrainedShuffleStreamCount > 0 {
 		exprStr += fmt.Sprintf(", stream_count: %d", p.TiFlashFineGrainedShuffleStreamCount)
 	}
@@ -404,17 +454,17 @@ func (p *PhysicalExpand) explainInfoV2() string {
 		if i == 0 {
 			sb.WriteString("level-projection:")
 			sb.WriteString("[")
-			sb.WriteString(expression.ExplainExpressionList(evalCtx, oneL, p.schema, enableRedactLog))
+			sb.WriteString(expression.ExplainExpressionList(evalCtx, oneL, p.Schema(), enableRedactLog))
 			sb.WriteString("]")
 		} else {
 			sb.WriteString(",[")
-			sb.WriteString(expression.ExplainExpressionList(evalCtx, oneL, p.schema, enableRedactLog))
+			sb.WriteString(expression.ExplainExpressionList(evalCtx, oneL, p.Schema(), enableRedactLog))
 			sb.WriteString("]")
 		}
 	}
 	sb.WriteString("; schema: [")
-	colStrs := make([]string, 0, len(p.schema.Columns))
-	for _, col := range p.schema.Columns {
+	colStrs := make([]string, 0, len(p.Schema().Columns))
+	for _, col := range p.Schema().Columns {
 		colStrs = append(colStrs, col.StringWithCtx(evalCtx, perrors.RedactLogDisable))
 	}
 	sb.WriteString(strings.Join(colStrs, ","))
@@ -424,7 +474,7 @@ func (p *PhysicalExpand) explainInfoV2() string {
 
 // ExplainNormalizedInfo implements Plan interface.
 func (p *PhysicalProjection) ExplainNormalizedInfo() string {
-	if variable.IgnoreInlistPlanDigest.Load() {
+	if vardef.IgnoreInlistPlanDigest.Load() {
 		return string(expression.SortedExplainExpressionListIgnoreInlist(p.Exprs))
 	}
 	return string(expression.SortedExplainNormalizedExpressionList(p.Exprs))
@@ -502,13 +552,13 @@ func (p *basePhysicalAgg) explainInfo(normalized bool) string {
 		builder.Write(sortedExplainExpressionList(p.SCtx().GetExprCtx().GetEvalCtx(), p.GroupByItems))
 		builder.WriteString(", ")
 	}
-	for i := 0; i < len(p.AggFuncs); i++ {
+	for i := range p.AggFuncs {
 		builder.WriteString("funcs:")
 		var colName string
 		if normalized {
-			colName = p.schema.Columns[i].ExplainNormalizedInfo()
+			colName = p.Schema().Columns[i].ExplainNormalizedInfo()
 		} else {
-			colName = p.schema.Columns[i].ExplainInfo(p.SCtx().GetExprCtx().GetEvalCtx())
+			colName = p.Schema().Columns[i].ExplainInfo(p.SCtx().GetExprCtx().GetEvalCtx())
 		}
 		builder.WriteString(aggregation.ExplainAggFunc(p.SCtx().GetExprCtx().GetEvalCtx(), p.AggFuncs[i], normalized))
 		builder.WriteString("->")
@@ -548,13 +598,15 @@ func (p *PhysicalIndexJoin) explainInfo(normalized bool, isIndexMergeJoin bool) 
 
 	exprCtx := p.SCtx().GetExprCtx()
 	evalCtx := exprCtx.GetEvalCtx()
-	buffer := bytes.NewBufferString(p.JoinType.String())
+	buffer := new(strings.Builder)
+	buffer.WriteString(p.JoinType.String())
 	buffer.WriteString(", inner:")
 	if normalized {
 		buffer.WriteString(p.Children()[p.InnerChildIdx].TP())
 	} else {
 		buffer.WriteString(p.Children()[p.InnerChildIdx].ExplainID().String())
 	}
+	explainJoinLeftSide(buffer, p.JoinType.IsInnerJoin(), normalized, p.Children()[0])
 	if len(p.OuterJoinKeys) > 0 {
 		buffer.WriteString(", outer key:")
 		buffer.Write(expression.ExplainColumnList(evalCtx, p.OuterJoinKeys))
@@ -630,7 +682,7 @@ func (p *PhysicalHashJoin) explainInfo(normalized bool) string {
 	}
 
 	buffer.WriteString(p.JoinType.String())
-
+	explainJoinLeftSide(buffer, p.JoinType.IsInnerJoin(), normalized, p.Children()[0])
 	evalCtx := p.SCtx().GetExprCtx().GetEvalCtx()
 	if len(p.EqualConditions) > 0 {
 		if normalized {
@@ -702,6 +754,17 @@ func (p *PhysicalHashJoin) explainInfo(normalized bool) string {
 	return buffer.String()
 }
 
+func explainJoinLeftSide(buffer *strings.Builder, isInnerJoin bool, normalized bool, leftSide base.PhysicalPlan) {
+	if !isInnerJoin {
+		buffer.WriteString(", left side:")
+		if normalized {
+			buffer.WriteString(leftSide.TP())
+		} else {
+			buffer.WriteString(leftSide.ExplainID().String())
+		}
+	}
+}
+
 // ExplainInfo implements Plan interface.
 func (p *PhysicalMergeJoin) ExplainInfo() string {
 	return p.explainInfo(false)
@@ -716,7 +779,9 @@ func (p *PhysicalMergeJoin) explainInfo(normalized bool) string {
 	}
 
 	evalCtx := p.SCtx().GetExprCtx().GetEvalCtx()
-	buffer := bytes.NewBufferString(p.JoinType.String())
+	buffer := new(strings.Builder)
+	buffer.WriteString(p.JoinType.String())
+	explainJoinLeftSide(buffer, p.JoinType.IsInnerJoin(), normalized, p.Children()[0])
 	if len(p.LeftJoinKeys) > 0 {
 		fmt.Fprintf(buffer, ", left key:%s",
 			expression.ExplainColumnList(evalCtx, p.LeftJoinKeys))
@@ -830,7 +895,7 @@ func (p *PhysicalWindow) formatFrameBound(buffer *bytes.Buffer, bound *logicalop
 func (p *PhysicalWindow) ExplainInfo() string {
 	ectx := p.SCtx().GetExprCtx().GetEvalCtx()
 	buffer := bytes.NewBufferString("")
-	formatWindowFuncDescs(ectx, buffer, p.WindowFuncDescs, p.schema)
+	formatWindowFuncDescs(ectx, buffer, p.WindowFuncDescs, p.Schema())
 	buffer.WriteString(" over(")
 	isFirst := true
 	buffer = util.ExplainPartitionBy(ectx, buffer, p.PartitionBy, false)
@@ -911,7 +976,7 @@ func (p *PhysicalExchangeSender) ExplainInfo() string {
 	case tipb.ExchangeType_Hash:
 		fmt.Fprintf(buffer, "HashPartition")
 	}
-	if p.CompressionMode != kv.ExchangeCompressionModeNONE {
+	if p.CompressionMode != vardef.ExchangeCompressionModeNONE {
 		fmt.Fprintf(buffer, ", Compression: %s", p.CompressionMode.Name())
 	}
 	if p.ExchangeType == tipb.ExchangeType_Hash {

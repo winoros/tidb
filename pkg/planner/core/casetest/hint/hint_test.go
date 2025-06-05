@@ -16,15 +16,19 @@ package hint
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/planner/util/coretestsdk"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testdata"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,9 +48,9 @@ func TestReadFromStorageHint(t *testing.T) {
 
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t")
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "tt")
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "ttt")
+	testkit.SetTiFlashReplica(t, dom, "test", "t")
+	testkit.SetTiFlashReplica(t, dom, "test", "tt")
+	testkit.SetTiFlashReplica(t, dom, "test", "ttt")
 
 	var input []string
 	var output []struct {
@@ -69,7 +73,7 @@ func TestReadFromStorageHint(t *testing.T) {
 }
 
 func TestAllViewHintType(t *testing.T) {
-	store := testkit.CreateMockStore(t, coretestsdk.WithMockTiFlash(2))
+	store := testkit.CreateMockStore(t, mockstore.WithMockTiFlash(2))
 	tk := testkit.NewTestKit(t, store)
 
 	tk.MustExec("use test")
@@ -88,7 +92,7 @@ func TestAllViewHintType(t *testing.T) {
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
 	is := dom.InfoSchema()
-	tbl, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t"))
+	tbl, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tbl.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{
 		Count:     1,
@@ -130,7 +134,7 @@ func TestAllViewHintType(t *testing.T) {
 }
 
 func TestJoinHintCompatibility(t *testing.T) {
-	store := testkit.CreateMockStore(t, coretestsdk.WithMockTiFlash(2))
+	store := testkit.CreateMockStore(t, mockstore.WithMockTiFlash(2))
 	tk := testkit.NewTestKit(t, store)
 
 	tk.MustExec("use test")
@@ -153,9 +157,9 @@ func TestJoinHintCompatibility(t *testing.T) {
 
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t4")
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t5")
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t6")
+	testkit.SetTiFlashReplica(t, dom, "test", "t4")
+	testkit.SetTiFlashReplica(t, dom, "test", "t5")
+	testkit.SetTiFlashReplica(t, dom, "test", "t6")
 
 	tk.MustExec("create definer='root'@'localhost' view v as select /*+ leading(t1), inl_join(t1) */ t.a from t join t1 join t2 where t.a = t1.a and t1.b = t2.b;")
 	tk.MustExec("create definer='root'@'localhost' view v1 as select /*+ leading(t2), merge_join(t) */ t.a from t join t1 join t2 where t.a = t1.a and t1.b = t2.b;")
@@ -193,7 +197,7 @@ func TestReadFromStorageHintAndIsolationRead(t *testing.T) {
 
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t")
+	testkit.SetTiFlashReplica(t, dom, "test", "t")
 
 	var input []string
 	var output []struct {
@@ -217,16 +221,26 @@ func TestReadFromStorageHintAndIsolationRead(t *testing.T) {
 }
 
 func TestIsolationReadTiFlashUseIndexHint(t *testing.T) {
-	store := testkit.CreateMockStore(t)
+	store, dom := testkit.CreateMockStoreAndDomainWithSchemaLease(t, 200*time.Millisecond, mockstore.WithMockTiFlash(2))
 	tk := testkit.NewTestKit(t, store)
+
+	tiflash := infosync.NewMockTiFlash()
+	infosync.SetMockTiFlash(tiflash)
+	defer func() {
+		tiflash.Lock()
+		tiflash.StatusServer.Close()
+		tiflash.Unlock()
+	}()
+
+	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", `return(1)`)
 
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
-	tk.MustExec("create table t(a int, index idx(a));")
-
-	// Create virtual tiflash replica info.
-	dom := domain.GetDomain(tk.Session())
-	coretestsdk.SetTiFlashReplica(t, dom, "test", "t")
+	tk.MustExec("create table t(a int, vec vector(3), PRIMARY KEY (`a`) /*T![clustered_index] CLUSTERED */, index idx(a), vector index idx_vec ((VEC_COSINE_DISTANCE(`vec`))) USING HNSW);")
+	tblInfo, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	err = domain.GetDomain(tk.Session()).DDLExecutor().UpdateTableReplicaInfo(tk.Session(), tblInfo.Meta().ID, true)
+	require.NoError(t, err)
 
 	tk.MustExec("set @@session.tidb_isolation_read_engines=\"tiflash\"")
 	var input []string
@@ -271,7 +285,7 @@ func TestOptimizeHintOnPartitionTable(t *testing.T) {
 	// Create virtual tiflash replica info.
 	dom := domain.GetDomain(tk.Session())
 	is := dom.InfoSchema()
-	tbl, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t"))
+	tbl, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tbl.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{
 		Count:     1,
@@ -340,4 +354,91 @@ func TestQBHintHandlerDuplicateObjects(t *testing.T) {
 	// Explain statement
 	tk.MustQuery("EXPLAIN WITH t AS (SELECT /*+ inl_join(e) */ em.* FROM t_employees em JOIN t_employees e WHERE em.store_id = e.department_id) SELECT * FROM t;")
 	tk.MustQuery("show warnings").Check(testkit.Rows())
+}
+
+func TestOptimizerCostFactorHints(t *testing.T) {
+	// This test covers a subset of the cost factorst - using hints to increase the cost factor
+	// of a specific plan type. The test is not exhaustive and does not cover all cost factors.
+	store := testkit.CreateMockStore(t)
+
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b int, c int, primary key (a), key(b))")
+	// Insert some data
+	tk.MustExec("insert into t values (1,1,1),(2,2,2),(3,3,3),(4,4,4),(5,5,5)")
+	// Analyze table to update statistics
+	tk.MustExec("analyze table t")
+
+	// Test tableFullScan cost factor increase via hint
+	// Set index scan cost factor variable to isolate testing to TableFullScan
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=100")
+	rs := tk.MustQuery("explain format=verbose select * from t").Rows()
+	planCost1, err1 := strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err1)
+	rs = tk.MustQuery("explain format=verbose select /*+ SET_VAR(tidb_opt_table_full_scan_cost_factor=2) */ * from t").Rows()
+	planCost2, err2 := strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err2)
+	// 1st query should be cheaper than 2nd query
+	require.Less(t, planCost1, planCost2)
+	// Reset to index scan to default
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=1")
+
+	// Test tableReader cost factor increase via hint
+	// Set index scan cost factor variable to isolate testing to TableReader
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=100")
+	rs = tk.MustQuery("explain format=verbose select * from t").Rows()
+	planCost1, err1 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err1)
+	rs = tk.MustQuery("explain format=verbose select /*+ SET_VAR(tidb_opt_table_reader_cost_factor=2) */ * from t").Rows()
+	planCost2, err2 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err2)
+	// 1st query should be cheaper than 2nd query
+	require.Less(t, planCost1, planCost2)
+	// Reset to index scan variable to default
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=1")
+
+	// Test tableRangeScan cost factor increase
+	// Set index scan and table full scan cost factor variables to isolate testing to TableRangeScan
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=100")
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=100")
+	rs = tk.MustQuery("explain format=verbose select * from t where a > 3").Rows()
+	planCost1, err1 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err1)
+	rs = tk.MustQuery("explain format=verbose select /*+ SET_VAR(tidb_opt_table_range_scan_cost_factor=2) */ * from t where a > 3").Rows()
+	planCost2, err2 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err2)
+	// 1st query should be cheaper than 2nd query
+	require.Less(t, planCost1, planCost2)
+	// Reset to index and table full scan variables to default
+	tk.MustExec("set @@session.tidb_opt_index_scan_cost_factor=1")
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=1")
+
+	// Test IndexScan cost factor increase
+	// Increase table scan cost factor to isolate testing to IndexScan
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=100")
+	rs = tk.MustQuery("explain format=verbose select b from t where b > 3").Rows()
+	planCost1, err1 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err1)
+	rs = tk.MustQuery("explain format=verbose select /*+ SET_VAR(tidb_opt_index_scan_cost_factor=2) */ b from t where b > 3").Rows()
+	planCost2, err2 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err2)
+	// 1st query should be cheaper than 2nd query
+	require.Less(t, planCost1, planCost2)
+	// Reset table full scan variable to default
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=1")
+
+	// Test IndexReadercost factor increase
+	// Increase table scan cost factor variable to isolate testing to IndexReader
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=100")
+	rs = tk.MustQuery("explain format=verbose select b from t where b > 3").Rows()
+	planCost1, err1 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err1)
+	rs = tk.MustQuery("explain format=verbose select  /*+ SET_VAR(tidb_opt_index_reader_cost_factor=2) */ b from t where b > 3").Rows()
+	planCost2, err2 = strconv.ParseFloat(rs[0][2].(string), 64)
+	require.Nil(t, err2)
+	// 1st query should be cheaper than 2nd query
+	require.Less(t, planCost1, planCost2)
+	// Reset table scan cost factor variable to default
+	tk.MustExec("set @@session.tidb_opt_table_full_scan_cost_factor=1")
 }

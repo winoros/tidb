@@ -17,7 +17,9 @@ package importer
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -43,6 +45,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/cdcutil"
 	"github.com/pingcap/tidb/pkg/util/engine"
 	"github.com/pingcap/tidb/pkg/util/set"
@@ -152,8 +155,8 @@ func (ci *clusterResourceCheckItem) Check(ctx context.Context) (*precheck.CheckR
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
-			newTasks := append([]taskMeta(nil), tasks...)
-			for i := 0; i < len(newTasks); i++ {
+			newTasks := slices.Clone(tasks)
+			for i := range newTasks {
 				newTasks[i].tikvAvail = tikvAvail
 				newTasks[i].tiflashAvail = tiflashAvail
 			}
@@ -274,7 +277,6 @@ func (ci *emptyRegionCheckItem) Check(ctx context.Context) (*precheck.CheckResul
 		}
 	}
 	for _, store := range storeInfo.Stores {
-		store := store
 		stores[store.Store.ID] = &store
 	}
 	tableCount := 0
@@ -356,7 +358,6 @@ func (ci *regionDistributionCheckItem) Check(ctx context.Context) (*precheck.Che
 	}
 	stores := make([]*pdhttp.StoreInfo, 0, len(storesInfo.Stores))
 	for _, store := range storesInfo.Stores {
-		store := store
 		if metapb.StoreState(metapb.StoreState_value[store.Store.StateName]) != metapb.StoreState_Up {
 			continue
 		}
@@ -1045,8 +1046,8 @@ func (ci *schemaCheckItem) SchemaIsValid(ctx context.Context, tableInfo *mydump.
 		// so the last several columns either can be ignored or has a default value.
 		for i := len(row); i < colCountFromTiDB; i++ {
 			if _, ok := defaultCols[core.Columns[i].Name.L]; !ok {
-				msgs = append(msgs, fmt.Sprintf("TiDB schema `%s`.`%s` has %d columns,"+
-					"and data file has %d columns, but column %s are missing the default value,"+
+				msgs = append(msgs, fmt.Sprintf("TiDB schema `%s`.`%s` has %d columns, "+
+					"and data file has %d columns, but column %s is missing the default value, "+
 					"please give column a default value to skip this check",
 					tableInfo.DB, tableInfo.Name, colCountFromTiDB, len(row), core.Columns[i].Name.L))
 			}
@@ -1066,7 +1067,7 @@ func (ci *schemaCheckItem) SchemaIsValid(ctx context.Context, tableInfo *mydump.
 			// tidb's column is ignored
 			// we need ensure this column has the default value.
 			if _, hasDefault := defaultCols[col.Name.L]; !hasDefault {
-				msgs = append(msgs, fmt.Sprintf("TiDB schema `%s`.`%s`'s column %s cannot be ignored,"+
+				msgs = append(msgs, fmt.Sprintf("TiDB schema `%s`.`%s`'s column %s cannot be ignored, "+
 					"because it doesn't have a default value, please set tables.ignoreColumns properly",
 					tableInfo.DB, tableInfo.Name, col.Name.L))
 			}
@@ -1228,7 +1229,7 @@ outer:
 			return theResult, nil
 		}
 
-		for i := 0; i < len(rows[0]); i++ {
+		for i := range rows[0] {
 			if rows[0][i].GetString() != rows[1][i].GetString() {
 				return theResult, nil
 			}
@@ -1374,7 +1375,7 @@ func (ci *tableEmptyCheckItem) Check(ctx context.Context) (*precheck.CheckResult
 	ch := make(chan tableNameComponents, concurrency)
 	eg, gCtx := errgroup.WithContext(ctx)
 
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		eg.Go(func() error {
 			for tblNameComp := range ch {
 				fullTableName := common.UniqueTable(tblNameComp.DBName, tblNameComp.TableName)
@@ -1434,4 +1435,75 @@ loop:
 func hasDefault(col *model.ColumnInfo) bool {
 	return col.DefaultIsExpr || col.DefaultValue != nil || !mysql.HasNotNullFlag(col.GetFlag()) ||
 		col.IsGenerated() || mysql.HasAutoIncrementFlag(col.GetFlag())
+}
+
+// pdTiDBFromSameClusterCheckItem provides two sources of PD addresses and use
+// util.CheckIfSameCluster to check if they are from the same cluster.
+//
+// The first source stands for PD leader's all etcd client URL addresses in most
+// time, the second source stands for all PD nodes' first etcd client URL
+// addresses.
+//
+// If we can't reach PD leader, the first source will be replaced by the PD
+// address set in lightning's task configuration, or in TiDB's configuration.
+// Then it may have false alert if PD has multiple endpoints and above
+// configuration uses one of them, while etcd information uses another one, and
+// there are no common addresses passed to util.CheckIfSameCluster.
+type pdTiDBFromSameClusterCheckItem struct {
+	db            *sql.DB
+	pdAddrsGetter func(context.Context) []string
+}
+
+// NewPDTiDBFromSameClusterCheckItem creates a new pdTiDBFromSameClusterCheckItem.
+func NewPDTiDBFromSameClusterCheckItem(
+	db *sql.DB,
+	pdAddrsGetter func(context.Context) []string,
+) precheck.Checker {
+	return &pdTiDBFromSameClusterCheckItem{
+		db:            db,
+		pdAddrsGetter: pdAddrsGetter,
+	}
+}
+
+func (i *pdTiDBFromSameClusterCheckItem) Check(ctx context.Context) (*precheck.CheckResult, error) {
+	theResult := &precheck.CheckResult{
+		Item:     i.GetCheckItemID(),
+		Severity: precheck.Critical,
+		Passed:   true,
+		Message:  "PD and TiDB in configuration are from the same cluster",
+	}
+
+	pdLeaderAddrsGetter := func(ctx context.Context) ([]string, error) {
+		addrs := i.pdAddrsGetter(ctx)
+		for idx, addrURL := range addrs {
+			u, err2 := url.Parse(addrURL)
+			if err2 != nil {
+				return nil, errors.Trace(err2)
+			}
+			addrs[idx] = u.Host
+		}
+		return addrs, nil
+	}
+
+	sameCluster, pdAddrs, pdAddrsFromTiDB, err := util.CheckIfSameCluster(
+		ctx, pdLeaderAddrsGetter, util.GetPDsAddrWithoutScheme(i.db),
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if sameCluster {
+		return theResult, nil
+	}
+
+	theResult.Passed = false
+	theResult.Message = fmt.Sprintf(
+		"PD and TiDB in configuration are not from the same cluster, "+
+			"PD addresses read from PD are: %v, PD addresses read from TiDB are %v",
+		pdAddrs, pdAddrsFromTiDB,
+	)
+	return theResult, nil
+}
+
+func (*pdTiDBFromSameClusterCheckItem) GetCheckItemID() precheck.CheckItemID {
+	return precheck.CheckPDTiDBFromSameCluster
 }

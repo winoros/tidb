@@ -6,12 +6,12 @@ coverage.out
 *.iml
 *.swp
 *.log
+*.test.bin
 tags
 profile.coverprofile
 mysql_tester
 tests/integrationtest/integration-test.out
 tests/integrationtest/integrationtest_tidb-server
-tests/integrationtest/portgenerator
 tests/integrationtest/s/
 tests/integrationtest/replayer/
 *.fail.go

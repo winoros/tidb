@@ -27,7 +27,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/property"
 	"github.com/pingcap/tidb/pkg/planner/util/costusage"
 	"github.com/pingcap/tidb/pkg/planner/util/optimizetrace"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/util/paging"
 )
@@ -836,7 +836,7 @@ func (p *PhysicalHashJoin) GetCost(lCnt, rCnt float64, _ bool, costFlag uint64, 
 		build = p.Children()[1]
 	}
 	sessVars := p.SCtx().GetSessionVars()
-	oomUseTmpStorage := variable.EnableTmpStorageOnOOM.Load()
+	oomUseTmpStorage := vardef.EnableTmpStorageOnOOM.Load()
 	memQuota := sessVars.MemTracker.GetBytesLimit() // sessVars.MemQuotaQuery && hint
 	rowSize := getAvgRowSize(build.StatsInfo(), build.Schema().Columns)
 	spill := oomUseTmpStorage && memQuota > 0 && rowSize*buildCnt > float64(memQuota) && p.storeTp != kv.TiFlash
@@ -1025,7 +1025,7 @@ func (p *PhysicalSort) GetCost(count float64, schema *expression.Schema) float64
 	cpuCost := count * math.Log2(count) * sessVars.GetCPUFactor()
 	memoryCost := count * sessVars.GetMemoryFactor()
 
-	oomUseTmpStorage := variable.EnableTmpStorageOnOOM.Load()
+	oomUseTmpStorage := vardef.EnableTmpStorageOnOOM.Load()
 	memQuota := sessVars.MemTracker.GetBytesLimit() // sessVars.MemQuotaQuery && hint
 	rowSize := getAvgRowSize(p.StatsInfo(), schema.Columns)
 	spill := oomUseTmpStorage && memQuota > 0 && rowSize*count > float64(memQuota)
@@ -1056,10 +1056,7 @@ func (p *PhysicalSort) GetPlanCostVer1(taskType property.TaskType, option *optim
 
 // GetCost computes cost of TopN operator itself.
 func (p *PhysicalTopN) GetCost(count float64, isRoot bool) float64 {
-	heapSize := float64(p.Offset + p.Count)
-	if heapSize < 2.0 {
-		heapSize = 2.0
-	}
+	heapSize := max(float64(p.Offset+p.Count), 2.0)
 	sessVars := p.SCtx().GetSessionVars()
 	// Ignore the cost of `doCompaction` in current implementation of `TopNExec`, since it is the
 	// special side-effect of our Chunk format in TiDB layer, which may not exist in coprocessor's
@@ -1251,10 +1248,10 @@ func getCardinality(operator base.PhysicalPlan, costFlag uint64) float64 {
 		if actualProbeCnt == 0 {
 			return 0
 		}
-		return getOperatorActRows(operator) / float64(actualProbeCnt)
+		return max(0, getOperatorActRows(operator)/float64(actualProbeCnt))
 	}
 	rows := operator.StatsCount()
-	if rows == 0 && operator.SCtx().GetSessionVars().CostModelVersion == modelVer2 {
+	if rows <= 0 && operator.SCtx().GetSessionVars().CostModelVersion == modelVer2 {
 		// 0 est-row can lead to 0 operator cost which makes plan choice unstable.
 		rows = 1
 	}

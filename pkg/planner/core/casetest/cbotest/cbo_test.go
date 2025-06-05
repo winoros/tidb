@@ -16,46 +16,23 @@ package cbotest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/executor"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/planner"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/session"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/statistics"
-	"github.com/pingcap/tidb/pkg/statistics/handle/util"
+	statstestutil "github.com/pingcap/tidb/pkg/statistics/handle/ddl/testutil"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testdata"
 	"github.com/stretchr/testify/require"
 )
-
-func loadTableStats(fileName string, dom *domain.Domain) error {
-	statsPath := filepath.Join("testdata", fileName)
-	bytes, err := os.ReadFile(statsPath)
-	if err != nil {
-		return err
-	}
-	statsTbl := &util.JSONTable{}
-	err = json.Unmarshal(bytes, statsTbl)
-	if err != nil {
-		return err
-	}
-	statsHandle := dom.StatsHandle()
-	err = statsHandle.LoadStatsFromJSON(context.Background(), dom.InfoSchema(), statsTbl, 0)
-	if err != nil {
-		return err
-	}
-	return nil
-}
 
 // TestCBOWithoutAnalyze tests the plan with stats that only have count info.
 func TestCBOWithoutAnalyze(t *testing.T) {
@@ -65,8 +42,11 @@ func TestCBOWithoutAnalyze(t *testing.T) {
 	testKit.MustExec("create table t1 (a int)")
 	testKit.MustExec("create table t2 (a int)")
 	h := dom.StatsHandle()
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
+	err := statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
+
+	err = statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
 	testKit.MustExec("insert into t1 values (1), (2), (3), (4), (5), (6)")
 	testKit.MustExec("insert into t2 values (1), (2), (3), (4), (5), (6)")
 	require.NoError(t, h.DumpStatsDeltaToKV(true))
@@ -95,7 +75,8 @@ func TestStraightJoin(t *testing.T) {
 	h := dom.StatsHandle()
 	for _, tblName := range []string{"t1", "t2", "t3", "t4"} {
 		testKit.MustExec(fmt.Sprintf("create table %s (a int)", tblName))
-		require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
+		err := statstestutil.HandleNextDDLEventWithTxn(h)
+		require.NoError(t, err)
 	}
 	var input []string
 	var output [][]string
@@ -117,8 +98,8 @@ func TestTableDual(t *testing.T) {
 	h := dom.StatsHandle()
 	testKit.MustExec(`create table t(a int)`)
 	testKit.MustExec("insert into t values (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)")
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
-
+	err := statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
 	require.NoError(t, h.DumpStatsDeltaToKV(true))
 	require.NoError(t, h.Update(context.Background(), dom.InfoSchema()))
 	var input []string
@@ -150,7 +131,8 @@ func TestEstimation(t *testing.T) {
 	testKit.MustExec("insert into t select * from t")
 	testKit.MustExec("insert into t select * from t")
 	h := dom.StatsHandle()
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
+	err := statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
 	require.NoError(t, h.DumpStatsDeltaToKV(true))
 	testKit.MustExec("analyze table t all columns")
 	for i := 1; i <= 8; i++ {
@@ -172,6 +154,78 @@ func TestEstimation(t *testing.T) {
 			output[i].Plan = testdata.ConvertRowsToStrings(plan.Rows())
 		})
 		plan.Check(testkit.Rows(output[i].Plan...))
+	}
+}
+
+func TestIssue61389(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+	testKit.MustExec("set tidb_cost_model_version=2")
+	testKit.MustExec("use test;")
+	testKit.MustExec("CREATE TABLE `t19f3e4f1` (\n  `colc864` enum('d9','dt5w4','wsg','i','3','5ur3','s0m4','mmhw6','rh','ge9d','nm') DEFAULT 'dt5w4',\n  `colaadb` smallint DEFAULT '7697',\n  UNIQUE KEY `ee56e6aa` (`colc864`)\n);")
+	testKit.MustExec("CREATE TABLE `t0da79f8d` (\n  `colf2af` enum('xrsg','go9yf','mj4','u1l','8c','at','o','e9','bh','r','yah') DEFAULT 'r'\n);")
+	require.NoError(t, testkit.LoadTableStats("test.t0da79f8d.json", dom))
+	require.NoError(t, testkit.LoadTableStats("test.t19f3e4f1.json", dom))
+
+	var input []string
+	var output []struct {
+		SQL  string
+		Plan []string
+		Warn []string
+	}
+	analyzeSuiteData := GetAnalyzeSuiteData()
+	analyzeSuiteData.LoadTestCases(t, &input, &output)
+	for i, tt := range input {
+		testdata.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Plan = testdata.ConvertRowsToStrings(testKit.MustQuery(tt).Rows())
+			output[i].Warn = testdata.ConvertRowsToStrings(testKit.MustQuery("show warnings").Rows())
+		})
+		testKit.MustQuery(tt).Check(testkit.Rows(output[i].Plan...))
+		testKit.MustQuery("show warnings").Check(testkit.Rows(output[i].Warn...))
+	}
+}
+
+func TestIssue59563(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+	testKit.MustExec("set tidb_cost_model_version=2")
+	testKit.MustExec("set @@session.tidb_executor_concurrency = 4;")
+	testKit.MustExec("set @@session.tidb_hash_join_concurrency = 5;")
+	testKit.MustExec("set @@session.tidb_distsql_scan_concurrency = 15;")
+
+	testKit.MustExec("create database cardcore_issuing;")
+	testKit.MustExec("use cardcore_issuing;")
+	testKit.MustExec("CREATE TABLE `tbl_cardcore_transaction` (" +
+		" `ID` varchar(30) NOT NULL," +
+		" `period` varchar(6) DEFAULT NULL," +
+		" `account_number` varchar(19) DEFAULT NULL," +
+		" `transaction_status` varchar(3) DEFAULT NULL," +
+		" `entry_date` date DEFAULT NULL," +
+		" `value_date` date DEFAULT NULL," +
+		" `group_acount_number` varchar(19) DEFAULT NULL," +
+		" `payment_date` timestamp NULL DEFAULT NULL," +
+		" PRIMARY KEY (`ID`)," +
+		" KEY `tbl_cardcore_transaction_ix10` (`account_number`,`entry_date`,`value_date`)," +
+		" KEY `tbl_cardcore_transaction_ix17` (`period`,`group_acount_number`,`transaction_status`));")
+	require.NoError(t, testkit.LoadTableStats("issue59563.json", dom))
+
+	var input []string
+	var output []struct {
+		SQL  string
+		Plan []string
+		Warn []string
+	}
+	analyzeSuiteData := GetAnalyzeSuiteData()
+	analyzeSuiteData.LoadTestCases(t, &input, &output)
+	for i, tt := range input {
+		testdata.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Plan = testdata.ConvertRowsToStrings(testKit.MustQuery(tt).Rows())
+			output[i].Warn = testdata.ConvertRowsToStrings(testKit.MustQuery("show warnings").Rows())
+		})
+		testKit.MustQuery(tt).Check(testkit.Rows(output[i].Plan...))
+		testKit.MustQuery("show warnings").Check(testkit.Rows(output[i].Warn...))
 	}
 }
 
@@ -198,7 +252,7 @@ func TestIndexRead(t *testing.T) {
 
 	// This stats is generated by following format:
 	// fill (a, b, c, e) as (i*100+j, i, i+j, i*100+j), i and j is dependent and range of this two are [0, 99].
-	require.NoError(t, loadTableStats("analyzesSuiteTestIndexReadT.json", dom))
+	require.NoError(t, testkit.LoadTableStats("analyzesSuiteTestIndexReadT.json", dom))
 	for i := 1; i < 16; i++ {
 		testKit.MustExec(fmt.Sprintf("insert into t1 values(%v, %v)", i, i))
 	}
@@ -332,11 +386,12 @@ func TestOutdatedAnalyze(t *testing.T) {
 	testKit := testkit.NewTestKit(t, store)
 	testKit.MustExec("use test")
 	testKit.MustExec("create table t (a int, b int, index idx(a))")
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		testKit.MustExec(fmt.Sprintf("insert into t values (%d,%d)", i, i))
 	}
 	h := dom.StatsHandle()
-	require.NoError(t, h.HandleDDLEvent(<-h.DDLEventCh()))
+	err := statstestutil.HandleNextDDLEventWithTxn(h)
+	require.NoError(t, err)
 	require.NoError(t, h.DumpStatsDeltaToKV(true))
 	testKit.MustExec("analyze table t all columns")
 	testKit.MustExec("insert into t select * from t")
@@ -383,7 +438,7 @@ func TestNullCount(t *testing.T) {
 	var output [][]string
 	analyzeSuiteData := GetAnalyzeSuiteData()
 	analyzeSuiteData.LoadTestCases(t, &input, &output)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		testdata.OnRecord(func() {
 			output[i] = testdata.ConvertRowsToStrings(testKit.MustQuery(input[i]).Rows())
 		})
@@ -430,7 +485,7 @@ func TestInconsistentEstimation(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("create table t(a int, b int, c int, index ab(a,b), index ac(a,c))")
 	tk.MustExec("insert into t values (1,1,1), (1000,1000,1000)")
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tk.MustExec("insert into t values (5,5,5), (10,10,10)")
 	}
 	tk.MustExec("set @@tidb_analyze_version=1")
@@ -531,7 +586,7 @@ func TestLowSelIndexGreedySearch(t *testing.T) {
 	testKit.MustExec(`set tidb_opt_limit_push_down_threshold=0`)
 	testKit.MustExec("drop table if exists t")
 	testKit.MustExec("create table t (a varchar(32) default null, b varchar(10) default null, c varchar(12) default null, d varchar(32) default null, e bigint(10) default null, key idx1 (d,a), key idx2 (a,c), key idx3 (c,b), key idx4 (e))")
-	require.NoError(t, loadTableStats("analyzeSuiteTestLowSelIndexGreedySearchT.json", dom))
+	require.NoError(t, testkit.LoadTableStats("analyzeSuiteTestLowSelIndexGreedySearchT.json", dom))
 	var input []string
 	var output []struct {
 		SQL  string
@@ -559,7 +614,7 @@ func TestTiFlashCostModel(t *testing.T) {
 	tk.MustExec("create table t (a int, b int, c int, primary key(a))")
 	tk.MustExec("insert into t values(1,1,1), (2,2,2), (3,3,3)")
 
-	tbl, err := dom.InfoSchema().TableByName(context.Background(), pmodel.CIStr{O: "test", L: "test"}, pmodel.CIStr{O: "t", L: "t"})
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.CIStr{O: "test", L: "test"}, ast.CIStr{O: "t", L: "t"})
 	require.NoError(t, err)
 	// Set the hacked TiFlash replica for explain tests.
 	tbl.Meta().TiFlashReplica = &model.TiFlashReplicaInfo{Count: 1, Available: true}
@@ -589,9 +644,9 @@ func TestIndexEqualUnknown(t *testing.T) {
 	testKit := testkit.NewTestKit(t, store)
 	testKit.MustExec("use test")
 	testKit.MustExec("drop table if exists t, t1")
-	testKit.Session().GetSessionVars().EnableClusteredIndex = variable.ClusteredIndexDefModeIntOnly
+	testKit.Session().GetSessionVars().EnableClusteredIndex = vardef.ClusteredIndexDefModeIntOnly
 	testKit.MustExec("CREATE TABLE t(a bigint(20) NOT NULL, b bigint(20) NOT NULL, c bigint(20) NOT NULL, PRIMARY KEY (a,c,b), KEY (b))")
-	require.NoError(t, loadTableStats("analyzeSuiteTestIndexEqualUnknownT.json", dom))
+	require.NoError(t, testkit.LoadTableStats("analyzeSuiteTestIndexEqualUnknownT.json", dom))
 	var input []string
 	var output []struct {
 		SQL  string
@@ -619,7 +674,7 @@ func TestLimitIndexEstimation(t *testing.T) {
 	tk.MustExec("set session tidb_enable_extended_stats = on")
 	// Values in column a are from 1 to 1000000, values in column b are from 1000000 to 1,
 	// these 2 columns are strictly correlated in reverse order.
-	require.NoError(t, loadTableStats("analyzeSuiteTestLimitIndexEstimationT.json", dom))
+	require.NoError(t, testkit.LoadTableStats("analyzeSuiteTestLimitIndexEstimationT.json", dom))
 	var input []string
 	var output []struct {
 		SQL  string

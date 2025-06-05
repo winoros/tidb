@@ -56,6 +56,16 @@ error = '''
 invalid restore range
 '''
 
+["BR:Common:ErrMigrationNotFound"]
+error = '''
+no migration found
+'''
+
+["BR:Common:ErrMigrationVersionNotSupported"]
+error = '''
+the migration version isn't supported
+'''
+
 ["BR:Common:ErrUndefinedDbOrTable"]
 error = '''
 undefined restore databases or tables
@@ -221,6 +231,11 @@ error = '''
 databases already existed in restored cluster
 '''
 
+["BR:Restore:ErrRestoreCheckpointMismatch"]
+error = '''
+restore checkpoint mismatch
+'''
+
 ["BR:Restore:ErrRestoreChecksumMismatch"]
 error = '''
 restore checksum mismatch
@@ -304,6 +319,11 @@ the system table isn't supported for restoring yet
 ["BR:Stream:ErrStreamLogTaskExist"]
 error = '''
 stream task already exists
+'''
+
+["BR:Stream:ErrStreamLogTaskHasNoStorage"]
+error = '''
+stream task has no storage
 '''
 
 ["Lighting:Restore:ErrChecksumMismatch"]
@@ -461,6 +481,11 @@ error = '''
 server is busy
 '''
 
+["Lightning:KV:StoreDiskFull"]
+error = '''
+store disk full
+'''
+
 ["Lightning:Loader:ErrInvalidSchemaFile"]
 error = '''
 invalid schema file
@@ -519,6 +544,11 @@ check data source error
 ["Lightning:PreCheck:ErrCheckLocalResource"]
 error = '''
 check local storage resource error
+'''
+
+["Lightning:PreCheck:ErrCheckPDTiDBSameCluster"]
+error = '''
+check PD and TiDB in the same cluster error
 '''
 
 ["Lightning:PreCheck:ErrCheckTableEmpty"]
@@ -899,6 +929,11 @@ error = '''
 ["ddl:1350"]
 error = '''
 View's SELECT contains a '%s' clause
+'''
+
+["ddl:1351"]
+error = '''
+View's SELECT contains a variable or parameter
 '''
 
 ["ddl:1353"]
@@ -1321,6 +1356,11 @@ error = '''
 Check constraint '%s' uses column '%s', hence column cannot be dropped or renamed.
 '''
 
+["ddl:3981"]
+error = '''
+Storage engine does not support ENGINE_ATTRIBUTE.
+'''
+
 ["ddl:4135"]
 error = '''
 Sequence '%-.64s.%-.64s' has run out
@@ -1413,7 +1453,7 @@ Invalid storage current version: %d
 
 ["ddl:8210"]
 error = '''
-Invalid %!s(MISSING) state: %!v(MISSING)
+Invalid %s state: %v
 '''
 
 ["ddl:8211"]
@@ -1564,6 +1604,21 @@ Global Index is needed for index '%-.192s', since the unique index is not includ
 ["ddl:8265"]
 error = '''
 Auto analyze is not effective for index '%-.192s', need analyze manually
+'''
+
+["ddl:8270"]
+error = '''
+Invalid engine attribute format: %s
+'''
+
+["ddl:8271"]
+error = '''
+Invalid storage class: %s
+'''
+
+["ddl:9014"]
+error = '''
+TiFlash backfill index failed: %s
 '''
 
 ["domain:8027"]
@@ -1946,6 +2001,11 @@ error = '''
 Delete can not find column %s for table %s
 '''
 
+["executor:8179"]
+error = '''
+Timestamp is not valid, since it is in Daylight Saving Time transition '%s' for time zone '%s'
+'''
+
 ["executor:8212"]
 error = '''
 Failed to split region ranges: %s
@@ -2013,7 +2073,7 @@ Division by 0
 
 ["expression:1426"]
 error = '''
-Too big precision %d specified for column '%-.192s'. Maximum is %d.
+Too-big precision %d specified for '%-.192s'. Maximum is %d.
 '''
 
 ["expression:1582"]
@@ -2159,6 +2219,11 @@ entry too large, the max entry size is %d, the size of data is %d
 ["kv:8026"]
 error = '''
 not implemented
+'''
+
+["kv:8178"]
+error = '''
+key is too large, the size of given key is %d
 '''
 
 ["kv:9007"]
@@ -2359,6 +2424,11 @@ Table '%s' from one of the %ss cannot be used in %s
 ["planner:1288"]
 error = '''
 The target table %-.100s of the %s is not updatable
+'''
+
+["planner:1305"]
+error = '''
+%s %s does not exist
 '''
 
 ["planner:1345"]
@@ -2901,6 +2971,16 @@ error = '''
 Cannot set resource group for a role
 '''
 
+["schema:8258"]
+error = '''
+Table %s is in mode %s
+'''
+
+["schema:8259"]
+error = '''
+Invalid mode set from (or by default) %s to %s for table %s
+'''
+
 ["server:1040"]
 error = '''
 Too many connections
@@ -2909,6 +2989,11 @@ Too many connections
 ["server:1045"]
 error = '''
 Access denied for user '%-.48s'@'%-.255s' (using password: %s)
+'''
+
+["server:1053"]
+error = '''
+Server shutdown in progress
 '''
 
 ["server:1148"]
@@ -2924,6 +3009,11 @@ Got a packet bigger than 'max_allowed_packet' bytes
 ["server:1184"]
 error = '''
 Aborted connection %d to db: '%-.192s' user: '%-.48s' host: '%-.255s' (%-.64s)
+'''
+
+["server:1203"]
+error = '''
+User %-.64s has exceeded the 'max_user_connections' resource
 '''
 
 ["server:1251"]
@@ -3283,7 +3373,7 @@ Too big scale %d specified for column '%-.192s'. Maximum is %d.
 
 ["types:1426"]
 error = '''
-Too big precision %d specified for column '%-.192s'. Maximum is %d.
+Too-big precision %d specified for '%-.192s'. Maximum is %d.
 '''
 
 ["types:1427"]

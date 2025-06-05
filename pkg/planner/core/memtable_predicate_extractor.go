@@ -51,6 +51,9 @@ import (
 type extractHelper struct {
 	enableScalarPushDown bool
 	pushedDownFuncs      map[string]func(string) string
+
+	// Store whether the extracted strings for a specific column are converted to lower case
+	extractLowerString map[string]bool
 }
 
 func (extractHelper) extractColInConsExpr(ctx base.PlanContext, extractCols map[int64]*types.FieldName, expr *expression.ScalarFunction) (string, []types.Datum) {
@@ -106,12 +109,7 @@ func (helper *extractHelper) setColumnPushedDownFn(
 }
 
 func (extractHelper) isPushDownSupported(fnNameL string) bool {
-	for _, s := range []string{ast.Lower, ast.Upper} {
-		if fnNameL == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains([]string{ast.Lower, ast.Upper}, fnNameL)
 }
 
 // extractColBinaryOpScalarFunc extract the scalar function from a binary operation. For example,
@@ -124,7 +122,7 @@ func (extractHelper) extractColBinaryOpScalarFunc(
 	var constIdx int
 	// c = 'rhs'
 	// 'lhs' = c
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		_, isConst := args[i].(*expression.Constant)
 		if isConst {
 			constIdx = i
@@ -155,7 +153,7 @@ func (helper *extractHelper) tryToFindInnerColAndIdx(args []expression.Expressio
 		return nil, -1
 	}
 	var scalar *expression.ScalarFunction
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		var isScalar bool
 		scalar, isScalar = args[i].(*expression.ScalarFunction)
 		if isScalar {
@@ -190,7 +188,7 @@ func (helper *extractHelper) extractColBinaryOpConsExpr(
 	var colIdx int
 	// c = 'rhs'
 	// 'lhs' = c
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		var isCol bool
 		col, isCol = args[i].(*expression.Column)
 		if isCol {
@@ -342,6 +340,11 @@ func (helper *extractHelper) extractCol(
 			break
 		}
 	}
+
+	if helper.extractLowerString == nil {
+		helper.extractLowerString = make(map[string]bool)
+	}
+	helper.extractLowerString[extractColName] = valueToLower
 	return
 }
 
@@ -1045,9 +1048,8 @@ func (e *MetricTableExtractor) Extract(ctx base.PlanContext,
 	return remained
 }
 
-func (e *MetricTableExtractor) getTimeRange(start, end int64) (time.Time, time.Time) {
+func (e *MetricTableExtractor) getTimeRange(start, end int64) (startTime, endTime time.Time) {
 	const defaultMetricQueryDuration = 10 * time.Minute
-	var startTime, endTime time.Time
 	if start == 0 && end == 0 {
 		endTime = time.Now()
 		return endTime.Add(-defaultMetricQueryDuration), endTime
@@ -1305,22 +1307,19 @@ func (e *SlowQueryExtractor) Extract(ctx base.PlanContext,
 }
 
 func (e *SlowQueryExtractor) setTimeRange(start, end int64) {
-	const defaultSlowQueryDuration = 24 * time.Hour
-	var startTime, endTime time.Time
 	if start == 0 && end == 0 {
 		return
 	}
+	var startTime, endTime time.Time
 	if start != 0 {
 		startTime = e.convertToTime(start)
+	} else {
+		startTime, _ = types.MinDatetime.GoTime(time.UTC)
 	}
 	if end != 0 {
 		endTime = e.convertToTime(end)
-	}
-	if start == 0 {
-		startTime = endTime.Add(-defaultSlowQueryDuration)
-	}
-	if end == 0 {
-		endTime = startTime.Add(defaultSlowQueryDuration)
+	} else {
+		endTime, _ = types.MaxDatetime.GoTime(time.UTC)
 	}
 	timeRange := &TimeRange{
 		StartTime: startTime,

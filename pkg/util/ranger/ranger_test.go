@@ -24,12 +24,12 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/expression/exprstatic"
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	"github.com/pingcap/tidb/pkg/planner/util/utilfuncp"
 	"github.com/pingcap/tidb/pkg/session"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/testkit"
@@ -140,7 +140,7 @@ func TestTableRange(t *testing.T) {
 		},
 		{
 			exprStr:     `a IN (8,8,81,45)`,
-			accessConds: "[in(test.t.a, 8, 8, 81, 45)]",
+			accessConds: "[in(test.t.a, 8, 81, 45)]",
 			filterConds: "[]",
 			resultStr:   `[[8,8] [45,45] [81,81]]`,
 		},
@@ -224,7 +224,7 @@ func TestTableRange(t *testing.T) {
 		},
 		{
 			exprStr:     "a in (1, 1, 1, 1, 1, 1, 2, 1, 2, 3, 2, 3, 4, 4, 1, 2)",
-			accessConds: "[in(test.t.a, 1, 1, 1, 1, 1, 1, 2, 1, 2, 3, 2, 3, 4, 4, 1, 2)]",
+			accessConds: "[in(test.t.a, 1, 2, 3, 4)]",
 			filterConds: "[]",
 			resultStr:   "[[1,1] [2,2] [3,3] [4,4]]",
 		},
@@ -293,7 +293,7 @@ func TestTableRange(t *testing.T) {
 			for i, cond := range selection.Conditions {
 				conds[i] = expression.PushDownNot(sctx.GetExprCtx(), cond)
 			}
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			col := expression.ColInfo2Col(selection.Schema().Columns, tbl.Columns[0])
 			require.NotNil(t, col)
 			var filter []expression.Expression
@@ -489,7 +489,7 @@ create table t(
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			require.NotNil(t, selection)
 			conds := make([]expression.Expression, len(selection.Conditions))
 			for i, cond := range selection.Conditions {
@@ -662,7 +662,7 @@ func TestColumnRange(t *testing.T) {
 		{
 			colPos:      0,
 			exprStr:     `a IN (8,8,81,45)`,
-			accessConds: "[in(test.t.a, 8, 8, 81, 45)]",
+			accessConds: "[in(test.t.a, 8, 81, 45)]",
 			filterConds: "[]",
 			resultStr:   `[[8,8] [45,45] [81,81]]`,
 			length:      types.UnspecifiedLength,
@@ -853,7 +853,7 @@ func TestColumnRange(t *testing.T) {
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			sel := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			ds, ok := sel.Children()[0].(*plannercore.DataSource)
+			ds, ok := sel.Children()[0].(*logicalop.DataSource)
 			require.True(t, ok)
 			conds := make([]expression.Expression, len(sel.Conditions))
 			for i, cond := range sel.Conditions {
@@ -1013,7 +1013,7 @@ func TestIndexRangeForYear(t *testing.T) {
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			require.NotNil(t, selection)
 			conds := make([]expression.Expression, len(selection.Conditions))
 			for i, cond := range selection.Conditions {
@@ -1084,7 +1084,7 @@ func TestPrefixIndexRangeScan(t *testing.T) {
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			require.NotNil(t, selection)
 			conds := make([]expression.Expression, len(selection.Conditions))
 			for i, cond := range selection.Conditions {
@@ -1222,14 +1222,14 @@ create table t(
 		{
 			indexPos:    1,
 			exprStr:     `c in ('1.1', 1, 1.1) and a in ('1', 'a', NULL)`,
-			accessConds: "[in(test.t.c, 1.1, 1, 1.1) in(test.t.a, 1, a, <nil>)]",
+			accessConds: "[in(test.t.c, 1.1, 1) in(test.t.a, 1, a, <nil>)]",
 			filterConds: "[]",
 			resultStr:   "[[1 \"1\",1 \"1\"] [1 \"a\",1 \"a\"] [1.1 \"1\",1.1 \"1\"] [1.1 \"a\",1.1 \"a\"]]",
 		},
 		{
 			indexPos:    1,
 			exprStr:     "c in (1, 1, 1, 1, 1, 1, 2, 1, 2, 3, 2, 3, 4, 4, 1, 2)",
-			accessConds: "[in(test.t.c, 1, 1, 1, 1, 1, 1, 2, 1, 2, 3, 2, 3, 4, 4, 1, 2)]",
+			accessConds: "[in(test.t.c, 1, 2, 3, 4)]",
 			filterConds: "[]",
 			resultStr:   "[[1,1] [2,2] [3,3] [4,4]]",
 		},
@@ -1433,7 +1433,7 @@ create table t(
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			require.NotNil(t, selection)
 			conds := make([]expression.Expression, len(selection.Conditions))
 			for i, cond := range selection.Conditions {
@@ -1680,13 +1680,13 @@ func TestTableShardIndex(t *testing.T) {
 			for i, cond := range selection.Conditions {
 				conds[i] = expression.PushDownNot(sctx.GetExprCtx(), cond)
 			}
-			ds, ok := selection.Children()[0].(*plannercore.DataSource)
+			ds, ok := selection.Children()[0].(*logicalop.DataSource)
 			if !ok {
 				if tt.childLevel == 4 {
-					ds = selection.Children()[0].Children()[0].Children()[0].(*plannercore.DataSource)
+					ds = selection.Children()[0].Children()[0].Children()[0].(*logicalop.DataSource)
 				}
 			}
-			newConds := ds.AddPrefix4ShardIndexes(ds.SCtx(), conds)
+			newConds := utilfuncp.AddPrefix4ShardIndexes(ds, ds.SCtx(), conds)
 			require.Equal(t, tt.accessConds, expression.StringifyExpressionsWithCtx(ectx, newConds))
 		})
 	}
@@ -1902,7 +1902,7 @@ func TestRangeFallbackForDetachCondAndBuildRangeForIndex(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t1")
 	tk.MustExec("create table t1 (a int, b int, c int, d int, index idx(a, b, c))")
-	tbl, err := dom.InfoSchema().TableByName(context.Background(), model.NewCIStr("test"), model.NewCIStr("t1"))
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	tblInfo := tbl.Meta()
 	sctx := tk.Session()
@@ -2031,7 +2031,7 @@ func TestRangeFallbackForDetachCondAndBuildRangeForIndex(t *testing.T) {
 	// test prefix index
 	tk.MustExec("drop table if exists t2")
 	tk.MustExec("create table t2 (a varchar(10), b varchar(10), c varchar(10), d varchar(10), index idx(a(2), b(2), c(2)))")
-	tbl, err = dom.InfoSchema().TableByName(context.Background(), model.NewCIStr("test"), model.NewCIStr("t2"))
+	tbl, err = dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t2"))
 	require.NoError(t, err)
 	tblInfo = tbl.Meta()
 
@@ -2145,7 +2145,7 @@ func TestRangeFallbackForBuildTableRange(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (a int primary key, b int)")
-	tbl, err := dom.InfoSchema().TableByName(context.Background(), model.NewCIStr("test"), model.NewCIStr("t"))
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tblInfo := tbl.Meta()
 	sctx := tk.Session()
@@ -2181,7 +2181,7 @@ func TestRangeFallbackForBuildColumnRange(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (a varchar(20), b int not null)")
-	tbl, err := dom.InfoSchema().TableByName(context.Background(), model.NewCIStr("test"), model.NewCIStr("t"))
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tblInfo := tbl.Meta()
 	sctx := tk.Session()
@@ -2338,7 +2338,7 @@ create table t(
 		p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 		require.NoError(t, err, fmt.Sprintf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+		tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 		require.NotNil(t, selection, fmt.Sprintf("expr:%v", tt.exprStr))
 		conds := make([]expression.Expression, len(selection.Conditions))
 		for i, cond := range selection.Conditions {
@@ -2389,9 +2389,9 @@ func TestIssue40997(t *testing.T) {
         )
     )
 	`).Check(testkit.Rows(
-		"IndexLookUp_7 0.67 root  ",
-		"├─IndexRangeScan_5(Build) 0.67 cop[tikv] table:t71706696, index:dt_2(dt, db_id, tbl_id) range:(\"20210112\" 62812 228892694,\"20210112\" 62812 +inf], [\"20210112\" 62813 -inf,\"20210112\" 62813 226785696], keep order:false, stats:pseudo",
-		"└─TableRowIDScan_6(Probe) 0.67 cop[tikv] table:t71706696 keep order:false, stats:pseudo",
+		"IndexLookUp_7 1.25 root  ",
+		"├─IndexRangeScan_5(Build) 1.25 cop[tikv] table:t71706696, index:dt_2(dt, db_id, tbl_id) range:(\"20210112\" 62812 228892694,\"20210112\" 62812 +inf], [\"20210112\" 62813 -inf,\"20210112\" 62813 226785696], keep order:false, stats:pseudo",
+		"└─TableRowIDScan_6(Probe) 1.25 cop[tikv] table:t71706696 keep order:false, stats:pseudo",
 	))
 }
 
@@ -2502,7 +2502,7 @@ func TestMinAccessCondsForDNFCond(t *testing.T) {
 			p, err := plannercore.BuildLogicalPlanForTest(ctx, sctx, nodeW, ret.InfoSchema)
 			require.NoError(t, err)
 			selection := p.(base.LogicalPlan).Children()[0].(*logicalop.LogicalSelection)
-			tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo
+			tbl := selection.Children()[0].(*logicalop.DataSource).TableInfo
 			require.NotNil(t, selection)
 			conds := make([]expression.Expression, len(selection.Conditions))
 			for i, cond := range selection.Conditions {

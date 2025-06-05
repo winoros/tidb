@@ -155,8 +155,8 @@ func (rm *Manager) RunawayRecordFlushLoop() {
 	quarantineRecordCh := rm.quarantineRecordChan()
 	staleQuarantineRecordCh := rm.staleQuarantineRecordChan()
 	flushThreshold := flushThreshold()
-	// recordMap is used to deduplicate records.
-	recordMap = make(map[recordKey]*Record, flushThreshold)
+	// recordMap is used to deduplicate records which will be inserted into `mysql.tidb_runaway_queries`.
+	recordMap := make(map[recordKey]*Record, flushThreshold)
 
 	flushRunawayRecords := func() {
 		if len(recordMap) == 0 {
@@ -210,7 +210,7 @@ func (rm *Manager) RunawayRecordFlushLoop() {
 			}()
 		case r := <-staleQuarantineRecordCh:
 			go func() {
-				for i := 0; i < 3; i++ {
+				for range 3 {
 					err := handleRemoveStaleRunawayWatch(rm.sysSessionPool, r)
 					if err == nil {
 						break

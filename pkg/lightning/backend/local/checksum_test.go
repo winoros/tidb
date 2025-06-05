@@ -30,7 +30,7 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	. "github.com/pingcap/tidb/pkg/lightning/checkpoints"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	pmysql "github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util"
@@ -91,7 +91,7 @@ func TestDoChecksumParallel(t *testing.T) {
 	mock.ExpectExec("\\QUPDATE mysql.tidb SET VARIABLE_VALUE = ? WHERE VARIABLE_NAME = 'tikv_gc_life_time'\\E").
 		WithArgs("100h0m0s").
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		mock.ExpectQuery("\\QADMIN CHECKSUM TABLE `test`.`t`\\E").
 			WillDelayFor(100 * time.Millisecond).
 			WillReturnRows(
@@ -109,7 +109,7 @@ func TestDoChecksumParallel(t *testing.T) {
 	// db.Close() will close all connections from its idle pool, set it 1 to expect one close
 	db.SetMaxIdleConns(1)
 	var wg util.WaitGroupWrapper
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Run(func() {
 			checksum, err := manager.Checksum(context.Background(), &TidbTableInfo{DB: "test", Name: "t"})
 			require.NoError(t, err)
@@ -133,7 +133,7 @@ func TestIncreaseGCLifeTimeFail(t *testing.T) {
 		require.NoError(t, mock.ExpectationsWereMet())
 	}()
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		mock.ExpectQuery("\\QSELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'tikv_gc_life_time'\\E").
 			WillReturnRows(sqlmock.NewRows([]string{"VARIABLE_VALUE"}).AddRow("10m"))
 		mock.ExpectExec("\\QUPDATE mysql.tidb SET VARIABLE_VALUE = ? WHERE VARIABLE_NAME = 'tikv_gc_life_time'\\E").
@@ -149,7 +149,7 @@ func TestIncreaseGCLifeTimeFail(t *testing.T) {
 	manager := NewTiDBChecksumExecutor(db)
 	var wg util.WaitGroupWrapper
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Run(func() {
 			_, errChecksum := manager.Checksum(context.Background(), &TidbTableInfo{DB: "test", Name: "t"})
 			require.Equal(t, "update GC lifetime failed: update gc error: context canceled", errChecksum.Error())
@@ -172,11 +172,11 @@ func TestDoChecksumWithTikv(t *testing.T) {
 
 	tableInfo := &model.TableInfo{
 		ID:   999,
-		Name: pmodel.NewCIStr("t1"),
+		Name: ast.NewCIStr("t1"),
 		Columns: []*model.ColumnInfo{
 			{
 				ID:        1,
-				Name:      pmodel.NewCIStr("c1"),
+				Name:      ast.NewCIStr("c1"),
 				FieldType: *fieldType,
 			},
 		},

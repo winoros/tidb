@@ -27,7 +27,10 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
+	"runtime/coverage"
 	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
@@ -109,6 +112,8 @@ func (s *Server) listenStatusHTTPServer() error {
 	tlsConfig = s.SetCNChecker(tlsConfig)
 
 	if tlsConfig != nil {
+		// The protocols should be listed as the same order we dispatch the connection with cmux.
+		tlsConfig.NextProtos = []string{"http/1.1", "h2"}
 		// we need to manage TLS here for cmux to distinguish between HTTP and gRPC.
 		s.statusListener, err = tls.Listen("tcp", s.statusAddr, tlsConfig)
 	} else {
@@ -217,6 +222,8 @@ func (s *Server) startHTTPServer() {
 		Name("StatsDump")
 	router.Handle("/stats/dump/{db}/{table}/{snapshot}", s.newStatsHistoryHandler()).
 		Name("StatsHistoryDump")
+	router.Handle("/stats/priority-queue", s.newStatsPriorityQueueHandler()).
+		Name("StatsPriorityQueue")
 
 	router.Handle("/plan_replayer/dump/{filename}", s.newPlanReplayerHandler()).Name("PlanReplayerDump")
 	router.Handle("/extract_task/dump", s.newExtractServeHandler()).Name("ExtractTaskDump")
@@ -255,7 +262,7 @@ func (s *Server) startHTTPServer() {
 	// HTTP path for upgrade operations.
 	router.Handle("/upgrade/{op}", handler.NewClusterUpgradeHandler(tikvHandlerTool.Store.(kv.Storage))).Name("upgrade operations")
 
-	if s.cfg.Store == "tikv" {
+	if s.cfg.Store == config.StoreTypeTiKV {
 		// HTTP path for tikv.
 		router.Handle("/tables/{db}/{table}/regions", tikvhandler.NewTableHandler(tikvHandlerTool, tikvhandler.OpTableRegions))
 		router.Handle("/tables/{db}/{table}/ranges", tikvhandler.NewTableHandler(tikvHandlerTool, tikvhandler.OpTableRanges))
@@ -300,6 +307,64 @@ func (s *Server) startHTTPServer() {
 	router.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	// Other /debug/pprof paths not covered above are redirected to pprof.Index.
 	router.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
+
+	router.HandleFunc("/covdata", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/zip")
+		writer.Header().Set("Content-Disposition", "attachment; filename=files.zip")
+
+		dir := os.Getenv("TIDB_GOCOVERDIR")
+		if dir == "" {
+			serveError(writer, http.StatusInternalServerError, "TIDB_GOCOVERDIR is not set")
+			return
+		}
+		err := coverage.WriteMetaDir(dir)
+		if err != nil {
+			logutil.BgLogger().Warn("write coverage meta failed", zap.Error(err))
+			serveError(writer, http.StatusInternalServerError, "write coverage meta failed")
+			return
+		}
+		err = coverage.WriteCountersDir(dir)
+		if err != nil {
+			logutil.BgLogger().Warn("write coverage counters failed", zap.Error(err))
+			serveError(writer, http.StatusInternalServerError, "write coverage counters failed")
+			return
+		}
+
+		zipWriter := zip.NewWriter(writer)
+
+		err = filepath.Walk(dir, func(file string, fi os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				return nil
+			}
+			relPath, err := filepath.Rel(dir, file)
+			if err != nil {
+				return err
+			}
+			writer, err := zipWriter.Create(relPath)
+			if err != nil {
+				return err
+			}
+			srcFile, err := os.Open(filepath.Clean(file))
+			if err != nil {
+				return err
+			}
+			defer func() {
+				_ = srcFile.Close()
+			}()
+			_, err = io.Copy(writer, srcFile)
+			return err
+		})
+		if err != nil {
+			logutil.BgLogger().Warn("zip coverage files failed", zap.Error(err))
+			serveError(writer, http.StatusInternalServerError, "zip coverage files failed")
+			return
+		}
+		err = zipWriter.Close()
+		terror.Log(err)
+	})
 
 	ballast := newBallast(s.cfg.MaxBallastObjectSize)
 	{
@@ -481,7 +546,7 @@ func (s *Server) startStatusServerAndRPCServer(serverMux *http.ServeMux) {
 	statusServer := &http.Server{Addr: s.statusAddr, Handler: util2.NewCorsHandler(serverMux, s.cfg)}
 	grpcServer := NewRPCServer(s.cfg, s.dom, s)
 	service.RegisterChannelzServiceToServer(grpcServer)
-	if s.cfg.Store == "tikv" {
+	if s.cfg.Store == config.StoreTypeTiKV {
 		keyspaceName := config.GetGlobalKeyspaceName()
 		for {
 			var fullPath string
@@ -620,4 +685,18 @@ func (s *Server) newStatsHistoryHandler() *optimizor.StatsHistoryHandler {
 		panic("Failed to get domain")
 	}
 	return optimizor.NewStatsHistoryHandler(do)
+}
+
+func (s *Server) newStatsPriorityQueueHandler() *optimizor.StatsPriorityQueueHandler {
+	store, ok := s.driver.(*TiDBDriver)
+	if !ok {
+		panic("Illegal driver")
+	}
+
+	do, err := session.GetDomain(store.store)
+	if err != nil {
+		panic("Failed to get domain")
+	}
+
+	return optimizor.NewStatsPriorityQueueHandler(do)
 }

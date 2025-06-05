@@ -132,15 +132,23 @@ select 7;`
 		},
 		{
 			sql:    "select count(*),min(time),max(time) from %s",
-			result: []string{"1|2020-05-14 19:03:54.314615|2020-05-14 19:03:54.314615"},
+			result: []string{"7|2020-02-15 18:00:01.000000|2020-05-14 19:03:54.314615"},
 		},
 		{
-			sql:    "select count(*),min(time) from %s where time > '2020-02-16 20:00:00'",
-			result: []string{"1|2020-02-17 18:00:05.000000"},
+			sql:    "select count(*),min(time),max(time) from %s where time > '2020-02-16 20:00:00'",
+			result: []string{"2|2020-02-17 18:00:05.000000|2020-05-14 19:03:54.314615"},
 		},
 		{
 			sql:    "select count(*) from %s where time > '2020-02-17 20:00:00'",
-			result: []string{"0"},
+			result: []string{"1"},
+		},
+		{
+			sql:    "select count(*) from %s where time > '1980-01-11 00:00:00'",
+			result: []string{"7"},
+		},
+		{
+			sql:    "select count(*) from %s where time < '2024-01-01 00:00:00'",
+			result: []string{"7"},
 		},
 		{
 			sql:    "select query from %s where time > '2019-01-26 21:51:00' and time < now()",
@@ -214,7 +222,7 @@ select 10;`
 	config.UpdateGlobal(func(conf *config.Config) {
 		conf.Log.SlowQueryFile = fileName4
 	})
-	for k := 0; k < 2; k++ {
+	for k := range 2 {
 		// k = 0 for normal files
 		// k = 1 for compressed files
 		var fileNames []string
