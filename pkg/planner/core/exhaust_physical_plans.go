@@ -236,8 +236,7 @@ func GetMergeJoin(p *logicalop.LogicalJoin, prop *property.PhysicalProperty, sch
 
 	// If TiDB_SMJ hint is existed, it should consider enforce merge join,
 	// because we can't trust lhsChildProperty completely.
-	if (p.PreferJoinType&h.PreferMergeJoin) > 0 ||
-		shouldSkipHashJoin(p) { // if hash join is not allowed, generate as many other types of join as possible to avoid 'cant-find-plan' error.
+	if (p.PreferJoinType & h.PreferMergeJoin) > 0 {
 		joins = append(joins, getEnforcedMergeJoin(p, prop, schema, statsInfo)...)
 	}
 
@@ -493,14 +492,6 @@ func getHashJoins(p *logicalop.LogicalJoin, prop *property.PhysicalProperty) (jo
 	}
 
 	forced = (p.PreferJoinType&h.PreferHashJoin > 0) || forceLeftToBuild || forceRightToBuild
-	shouldSkipHashJoin := shouldSkipHashJoin(p)
-	if !forced && shouldSkipHashJoin {
-		return nil, false
-	} else if forced && shouldSkipHashJoin {
-		p.SCtx().GetSessionVars().StmtCtx.SetHintWarning(
-			"A conflict between the HASH_JOIN hint and the NO_HASH_JOIN hint, " +
-				"or the tidb_opt_enable_hash_join system variable, the HASH_JOIN hint will take precedence.")
-	}
 	return
 }
 
@@ -2794,10 +2785,22 @@ func exhaustPhysicalPlans4LogicalJoin(lp base.LogicalPlan, prop *property.Physic
 	}
 
 	hashJoins, forced := getHashJoins(p, prop)
+	skipHashJoin := shouldSkipHashJoin(p)
 	if forced && len(hashJoins) > 0 {
+		if skipHashJoin {
+			p.SCtx().GetSessionVars().StmtCtx.SetHintWarning(
+				"A conflict between the HASH_JOIN hint and the NO_HASH_JOIN hint, " +
+					"or the tidb_opt_enable_hash_join system variable, the HASH_JOIN hint will take precedence.")
+		}
 		return hashJoins, true, nil
 	}
-	joins = append(joins, hashJoins...)
+	if !skipHashJoin || len(joins) == 0 {
+		// If the hash join is not skipped, or there are no other join plans,
+		// we will append the hash join plans.
+		// Otherwise, we will return the other join plans.
+		// This is to ensure that we always return at least one join plan.
+		joins = append(joins, hashJoins...)
+	}
 
 	if p.PreferJoinType > 0 {
 		// If we reach here, it means we have a hint that doesn't work.
