@@ -2279,7 +2279,7 @@ func preferIndexJoinFamily(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (p
 		// valid physic for the hint
 		return true
 	}
-	return false
+	return shouldSkipHashJoin(p)
 }
 
 // handleForceIndexJoinHints handles the force index join hints and returns all plans that can satisfy the hints.
@@ -2794,13 +2794,7 @@ func exhaustPhysicalPlans4LogicalJoin(lp base.LogicalPlan, prop *property.Physic
 		}
 		return hashJoins, true, nil
 	}
-	if !skipHashJoin || len(joins) == 0 {
-		// If the hash join is not skipped, or there are no other join plans,
-		// we will append the hash join plans.
-		// Otherwise, we will return the other join plans.
-		// This is to ensure that we always return at least one join plan.
-		joins = append(joins, hashJoins...)
-	}
+	joins = append(joins, hashJoins...)
 
 	if p.PreferJoinType > 0 {
 		// If we reach here, it means we have a hint that doesn't work.
