@@ -36,6 +36,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/util/optimizetrace"
 	"github.com/pingcap/tidb/pkg/planner/util/utilfuncp"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/hint"
 	utilhint "github.com/pingcap/tidb/pkg/util/hint"
 	"github.com/pingcap/tidb/pkg/util/intset"
 	"github.com/pingcap/tidb/pkg/util/plancodec"
@@ -1233,6 +1234,12 @@ func (p *LogicalJoin) PreferAny(joinFlags ...uint) bool {
 		}
 	}
 	return false
+}
+
+func (p *LogicalJoin) PreferAnyIndexJoinFamily() bool {
+	return p.PreferAny(hint.PreferRightAsINLJInner, hint.PreferRightAsINLHJInner, hint.PreferRightAsINLMJInner,
+		hint.PreferLeftAsINLJInner, hint.PreferLeftAsINLHJInner, hint.PreferLeftAsINLMJInner)
+
 }
 
 // ExtractOnCondition divide conditions in CNF of join node into 4 groups.

@@ -742,6 +742,7 @@ func constructIndexJoin(
 	path *util.AccessPath,
 	compareFilters *ColWithCmpFuncManager,
 	extractOtherEQ bool,
+	checkHint bool,
 ) []base.PhysicalPlan {
 	if ranges == nil {
 		ranges = ranger.Ranges{} // empty range
@@ -844,6 +845,13 @@ func constructIndexJoin(
 		join.IdxColLens = path.IdxColLens
 	}
 	join.SetSchema(p.Schema())
+	if !checkHint {
+		return []base.PhysicalPlan{join}
+	}
+	remained := handleForceIndexJoinHints(p, prop, join)
+	if !remained {
+		return nil
+	}
 	return []base.PhysicalPlan{join}
 }
 
@@ -857,11 +865,14 @@ func constructIndexMergeJoin(
 	path *util.AccessPath,
 	compareFilters *ColWithCmpFuncManager,
 ) []base.PhysicalPlan {
+	if !p.SCtx().GetSessionVars().EnableIndexMergeJoin {
+		return nil
+	}
 	hintExists := false
 	if (outerIdx == 1 && (p.PreferJoinType&h.PreferLeftAsINLMJInner) > 0) || (outerIdx == 0 && (p.PreferJoinType&h.PreferRightAsINLMJInner) > 0) {
 		hintExists = true
 	}
-	indexJoins := constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, compareFilters, !hintExists)
+	indexJoins := constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, compareFilters, !hintExists, false)
 	indexMergeJoins := make([]base.PhysicalPlan, 0, len(indexJoins))
 	for _, plan := range indexJoins {
 		join := plan.(*PhysicalIndexJoin)
@@ -949,6 +960,10 @@ func constructIndexMergeJoin(
 				OuterCompareFuncs:       outerCompareFuncs,
 				Desc:                    !prop.IsSortItemEmpty() && prop.SortItems[0].Desc,
 			}.Init(p.SCtx())
+			remained := handleForceIndexJoinHints(p, prop, indexMergeJoin)
+			if !remained {
+				continue
+			}
 			indexMergeJoins = append(indexMergeJoins, indexMergeJoin)
 		}
 	}
@@ -965,7 +980,7 @@ func constructIndexHashJoin(
 	path *util.AccessPath,
 	compareFilters *ColWithCmpFuncManager,
 ) []base.PhysicalPlan {
-	indexJoins := constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, compareFilters, true)
+	indexJoins := constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, compareFilters, true, false)
 	indexHashJoins := make([]base.PhysicalPlan, 0, len(indexJoins))
 	for _, plan := range indexJoins {
 		join := plan.(*PhysicalIndexJoin)
@@ -975,6 +990,10 @@ func constructIndexHashJoin(
 			// join operator to provide any promise of the output order.
 			KeepOuterOrder: !prop.IsSortItemEmpty(),
 		}.Init(p.SCtx())
+		remained := handleForceIndexJoinHints(p, prop, indexHashJoin)
+		if !remained {
+			continue
+		}
 		indexHashJoins = append(indexHashJoins, indexHashJoin)
 	}
 	return indexHashJoins
@@ -1373,7 +1392,7 @@ func buildIndexJoinInner2TableScan(
 			failpoint.Return(constructIndexHashJoin(p, prop, outerIdx, innerTask, nil, keyOff2IdxOff, path, lastColMng))
 		}
 	})
-	joins = append(joins, constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, lastColMng, true)...)
+	joins = append(joins, constructIndexJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, lastColMng, true, true)...)
 	// We can reuse the `innerTask` here since index nested loop hash join
 	// do not need the inner child to promise the order.
 	joins = append(joins, constructIndexHashJoin(p, prop, outerIdx, innerTask, ranges, keyOff2IdxOff, path, lastColMng)...)
@@ -1425,7 +1444,7 @@ func buildIndexJoinInner2IndexScan(
 		}
 	})
 	if innerTask != nil {
-		joins = append(joins, constructIndexJoin(p, prop, outerIdx, innerTask, indexJoinResult.chosenRanges, keyOff2IdxOff, indexJoinResult.chosenPath, indexJoinResult.lastColManager, true)...)
+		joins = append(joins, constructIndexJoin(p, prop, outerIdx, innerTask, indexJoinResult.chosenRanges, keyOff2IdxOff, indexJoinResult.chosenPath, indexJoinResult.lastColManager, true, true)...)
 		// We can reuse the `innerTask` here since index nested loop hash join
 		// do not need the inner child to promise the order.
 		joins = append(joins, constructIndexHashJoin(p, prop, outerIdx, innerTask, indexJoinResult.chosenRanges, keyOff2IdxOff, indexJoinResult.chosenPath, indexJoinResult.lastColManager)...)
@@ -2023,21 +2042,25 @@ const (
 	indexMergeJoinMethod = 2
 )
 
-func getIndexJoinSideAndMethod(join base.PhysicalPlan) (innerSide, joinMethod int, ok bool) {
-	var innerIdx int
-	switch ij := join.(type) {
-	case *PhysicalIndexJoin:
-		innerIdx = ij.getInnerChildIdx()
-		joinMethod = indexJoinMethod
-	case *PhysicalIndexHashJoin:
-		innerIdx = ij.getInnerChildIdx()
-		joinMethod = indexHashJoinMethod
-	case *PhysicalIndexMergeJoin:
-		innerIdx = ij.getInnerChildIdx()
-		joinMethod = indexMergeJoinMethod
-	default:
-		return 0, 0, false
+func checkAndGetIndexJoinType(p base.PhysicalPlan) (IndexJoinType, bool) {
+	if p == nil {
+		return IndexJoinType(0), false
 	}
+	switch x := p.(type) {
+	case *PhysicalIndexJoin:
+		return x.GetIndexJoinType(), true
+	case *PhysicalIndexHashJoin:
+		return x.GetIndexJoinType(), true
+	case *PhysicalIndexMergeJoin:
+		return x.GetIndexJoinType(), true
+	}
+	return IndexJoinType(0), false
+}
+
+func getIndexJoinSideAndMethod[T IndexJoinFamilyConstraint](join T) (innerSide, ijType IndexJoinType, ok bool) {
+	var innerIdx int
+	innerIdx = join.getInnerChildIdx()
+	ijType = join.GetIndexJoinType()
 	ok = true
 	innerSide = joinLeft
 	if innerIdx == 1 {
@@ -2103,6 +2126,7 @@ func tryToGetIndexJoin(p *logicalop.LogicalJoin, prop *property.PhysicalProperty
 	case logicalop.InnerJoin:
 		supportLeftOuter, supportRightOuter = true, true
 	}
+	isForced := p.PreferAnyIndexJoinFamily()
 	candidates := make([]base.PhysicalPlan, 0, 2)
 	if supportLeftOuter {
 		candidates = append(candidates, getIndexJoinByOuterIdx(p, prop, 0)...)
@@ -2125,18 +2149,41 @@ func tryToGetIndexJoin(p *logicalop.LogicalJoin, prop *property.PhysicalProperty
 		stmtCtx.SetHintWarning("Some INL_MERGE_JOIN and NO_INDEX_MERGE_JOIN hints conflict, NO_INDEX_MERGE_JOIN may be ignored")
 	}
 
-	candidates, canForced = handleForceIndexJoinHints(p, prop, candidates)
-	if canForced {
-		return candidates, canForced
+	if len(candidates) == 0 {
+		// Cannot find any valid index join plan with these force hints.
+		// Print warning message if any hints cannot work.
+		// If the required property is not empty, we will enforce it and try the hint again.
+		// So we only need to generate warning message when the property is empty.
+		if prop.IsSortItemEmpty() {
+			var indexJoinTables, indexHashJoinTables, indexMergeJoinTables []h.HintedTable
+			if p.HintInfo != nil {
+				t := p.HintInfo.IndexJoin
+				indexJoinTables, indexHashJoinTables, indexMergeJoinTables = t.INLJTables, t.INLHJTables, t.INLMJTables
+			}
+			var errMsg string
+			switch {
+			case p.PreferAny(h.PreferLeftAsINLJInner, h.PreferRightAsINLJInner): // prefer index join
+				errMsg = fmt.Sprintf("Optimizer Hint %s or %s is inapplicable", h.Restore2JoinHint(h.HintINLJ, indexJoinTables), h.Restore2JoinHint(h.TiDBIndexNestedLoopJoin, indexJoinTables))
+			case p.PreferAny(h.PreferLeftAsINLHJInner, h.PreferRightAsINLHJInner): // prefer index hash join
+				errMsg = fmt.Sprintf("Optimizer Hint %s is inapplicable", h.Restore2JoinHint(h.HintINLHJ, indexHashJoinTables))
+			case p.PreferAny(h.PreferLeftAsINLMJInner, h.PreferRightAsINLMJInner): // prefer index merge join
+				errMsg = fmt.Sprintf("Optimizer Hint %s is inapplicable", h.Restore2JoinHint(h.HintINLMJ, indexMergeJoinTables))
+			}
+			// Append inapplicable reason.
+			if len(p.EqualConditions) == 0 {
+				errMsg += " without column equal ON condition"
+			}
+			// Generate warning message to client.
+			p.SCtx().GetSessionVars().StmtCtx.SetHintWarning(errMsg)
+		}
 	}
-	candidates = handleFilterIndexJoinHints(p, candidates)
-	// todo: if any variables banned it, why bother to generate it first?
-	return filterIndexJoinBySessionVars(p.SCtx(), candidates), false
+
+	return candidates, isForced
 }
 
 func enumerationContainIndexJoin(candidates []base.PhysicalPlan) bool {
 	return slices.ContainsFunc(candidates, func(candidate base.PhysicalPlan) bool {
-		_, _, ok := getIndexJoinSideAndMethod(candidate)
+		_, ok := checkAndGetIndexJoinType(candidate)
 		return ok
 	})
 }
@@ -2149,7 +2196,7 @@ func handleFilterIndexJoinHints(p *logicalop.LogicalJoin, candidates []base.Phys
 	}
 	filtered := make([]base.PhysicalPlan, 0, len(candidates))
 	for _, candidate := range candidates {
-		_, joinMethod, ok := getIndexJoinSideAndMethod(candidate)
+		joinMethod, ok := checkAndGetIndexJoinType(candidate)
 		if !ok {
 			continue
 		}
@@ -2163,12 +2210,18 @@ func handleFilterIndexJoinHints(p *logicalop.LogicalJoin, candidates []base.Phys
 	return filtered
 }
 
-// recordIndexJoinHintWarnings records the warnings msg if no valid preferred physic are picked.
-// todo: extend recordIndexJoinHintWarnings to support all kind of operator's warnings handling.
-func recordIndexJoinHintWarnings(lp base.LogicalPlan, prop *property.PhysicalProperty, inEnforce bool) error {
+// recordJoinHintWarnings records the warnings msg if no valid preferred physic are picked.
+// todo: extend recordJoinHintWarnings to support all kind of operator's warnings handling.
+func recordJoinHintWarnings(lp base.LogicalPlan, prop *property.PhysicalProperty, inEnforce bool, finalAffinity int) error {
 	p, ok := lp.(*logicalop.LogicalJoin)
 	if !ok {
 		return nil
+	}
+	// If a negative affinity is returned, it means that we choose the join we don't want.
+	// Currently, only hash join can not be fully ignored.
+	if finalAffinity < 0 {
+		errMsg := fmt.Sprintf("Optimizer Hint %s is inapplicable", h.Restore2JoinHint(h.HintINLJ, p.HintInfo.NoHashJoin))
+		return plannererrors.ErrInternal.FastGen(errMsg)
 	}
 	if !p.PreferAny(h.PreferRightAsINLJInner, h.PreferRightAsINLHJInner, h.PreferRightAsINLMJInner,
 		h.PreferLeftAsINLJInner, h.PreferLeftAsINLHJInner, h.PreferLeftAsINLMJInner) {
@@ -2215,8 +2268,38 @@ func recordIndexJoinHintWarnings(lp base.LogicalPlan, prop *property.PhysicalPro
 // It will return true if the hint can be applied when saw a real physic plan successfully built and returned up from child.
 // we cache the most preferred one among this valid and preferred physic plans. If there is no preferred physic applicable
 // for the logic hint, we will return false and the optimizer will continue to return the normal low-cost one.
-func applyLogicalJoinHint(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (preferred bool) {
-	return preferMergeJoin(lp, physicPlan) || preferIndexJoinFamily(lp, physicPlan) || preferHashJoin(lp, physicPlan)
+func applyLogicalJoinHint(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (affinity int) {
+	switch x := physicPlan.(type) {
+	case *PhysicalMergeJoin:
+		if preferMergeJoin(lp, x) {
+			return 1
+		}
+		return 0
+	case *PhysicalIndexJoin:
+		if preferIndexJoinFamily(lp, x) {
+			return 1
+		}
+		return 0
+	case *PhysicalIndexHashJoin:
+		if preferIndexJoinFamily(lp, x) {
+			return 1
+		}
+		return 0
+	case *PhysicalIndexMergeJoin:
+		if preferIndexJoinFamily(lp, x) {
+			return 1
+		}
+		return 0
+	case *PhysicalHashJoin:
+		if preferHashJoin(lp, x) {
+			return 1
+		}
+		if shouldSkipHashJoin(lp.(*logicalop.LogicalJoin)) {
+			return -1
+		}
+		return 0
+	}
+	return 0
 }
 
 func preferHashJoin(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (preferred bool) {
@@ -2254,19 +2337,19 @@ func preferMergeJoin(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (preferr
 	return ok && p.PreferJoinType&h.PreferMergeJoin > 0
 }
 
-func preferIndexJoinFamily(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (preferred bool) {
+func preferIndexJoinFamily[T IndexJoinFamilyConstraint](lp base.LogicalPlan, indexJoin T) (preferred bool) {
 	p, ok := lp.(*logicalop.LogicalJoin)
 	if !ok {
 		return false
 	}
-	if physicPlan == nil {
+	if indexJoin == nil {
 		return false
 	}
 	if !p.PreferAny(h.PreferRightAsINLJInner, h.PreferRightAsINLHJInner, h.PreferRightAsINLMJInner,
 		h.PreferLeftAsINLJInner, h.PreferLeftAsINLHJInner, h.PreferLeftAsINLMJInner) {
 		return false // no force index join hints
 	}
-	innerSide, joinMethod, ok := getIndexJoinSideAndMethod(physicPlan)
+	innerSide, joinMethod, ok := getIndexJoinSideAndMethod(indexJoin)
 	if !ok {
 		return false
 	}
@@ -2283,57 +2366,29 @@ func preferIndexJoinFamily(lp base.LogicalPlan, physicPlan base.PhysicalPlan) (p
 }
 
 // handleForceIndexJoinHints handles the force index join hints and returns all plans that can satisfy the hints.
-func handleForceIndexJoinHints(p *logicalop.LogicalJoin, prop *property.PhysicalProperty, candidates []base.PhysicalPlan) (indexJoins []base.PhysicalPlan, canForced bool) {
+func handleForceIndexJoinHints[T IndexJoinFamilyConstraint](p *logicalop.LogicalJoin, prop *property.PhysicalProperty, candidate T) (remained bool) {
+	innerSide, joinMethod, _ := getIndexJoinSideAndMethod(candidate)
 	if !p.PreferAny(h.PreferRightAsINLJInner, h.PreferRightAsINLHJInner, h.PreferRightAsINLMJInner,
 		h.PreferLeftAsINLJInner, h.PreferLeftAsINLHJInner, h.PreferLeftAsINLMJInner) {
-		return candidates, false // no force index join hints
+
+		if p.PreferAny(h.PreferNoIndexJoin) && joinMethod == indexJoinMethod ||
+			p.PreferAny(h.PreferNoIndexHashJoin) && joinMethod == indexHashJoinMethod ||
+			p.PreferAny(h.PreferNoIndexMergeJoin) && joinMethod == indexMergeJoinMethod {
+			return false
+		}
+
+		return true // no force index join hints
 	}
-	forced := make([]base.PhysicalPlan, 0, len(candidates))
-	for _, candidate := range candidates {
-		innerSide, joinMethod, ok := getIndexJoinSideAndMethod(candidate)
-		if !ok {
-			continue
-		}
-		if (p.PreferAny(h.PreferLeftAsINLJInner) && innerSide == joinLeft && joinMethod == indexJoinMethod) ||
-			(p.PreferAny(h.PreferRightAsINLJInner) && innerSide == joinRight && joinMethod == indexJoinMethod) ||
-			(p.PreferAny(h.PreferLeftAsINLHJInner) && innerSide == joinLeft && joinMethod == indexHashJoinMethod) ||
-			(p.PreferAny(h.PreferRightAsINLHJInner) && innerSide == joinRight && joinMethod == indexHashJoinMethod) ||
-			(p.PreferAny(h.PreferLeftAsINLMJInner) && innerSide == joinLeft && joinMethod == indexMergeJoinMethod) ||
-			(p.PreferAny(h.PreferRightAsINLMJInner) && innerSide == joinRight && joinMethod == indexMergeJoinMethod) {
-			forced = append(forced, candidate)
-		}
+	if (p.PreferAny(h.PreferLeftAsINLJInner) && innerSide == joinLeft && joinMethod == indexJoinMethod) ||
+		(p.PreferAny(h.PreferRightAsINLJInner) && innerSide == joinRight && joinMethod == indexJoinMethod) ||
+		(p.PreferAny(h.PreferLeftAsINLHJInner) && innerSide == joinLeft && joinMethod == indexHashJoinMethod) ||
+		(p.PreferAny(h.PreferRightAsINLHJInner) && innerSide == joinRight && joinMethod == indexHashJoinMethod) ||
+		(p.PreferAny(h.PreferLeftAsINLMJInner) && innerSide == joinLeft && joinMethod == indexMergeJoinMethod) ||
+		(p.PreferAny(h.PreferRightAsINLMJInner) && innerSide == joinRight && joinMethod == indexMergeJoinMethod) {
+		return true
 	}
 
-	if len(forced) > 0 {
-		return forced, true
-	}
-	// Cannot find any valid index join plan with these force hints.
-	// Print warning message if any hints cannot work.
-	// If the required property is not empty, we will enforce it and try the hint again.
-	// So we only need to generate warning message when the property is empty.
-	if prop.IsSortItemEmpty() {
-		var indexJoinTables, indexHashJoinTables, indexMergeJoinTables []h.HintedTable
-		if p.HintInfo != nil {
-			t := p.HintInfo.IndexJoin
-			indexJoinTables, indexHashJoinTables, indexMergeJoinTables = t.INLJTables, t.INLHJTables, t.INLMJTables
-		}
-		var errMsg string
-		switch {
-		case p.PreferAny(h.PreferLeftAsINLJInner, h.PreferRightAsINLJInner): // prefer index join
-			errMsg = fmt.Sprintf("Optimizer Hint %s or %s is inapplicable", h.Restore2JoinHint(h.HintINLJ, indexJoinTables), h.Restore2JoinHint(h.TiDBIndexNestedLoopJoin, indexJoinTables))
-		case p.PreferAny(h.PreferLeftAsINLHJInner, h.PreferRightAsINLHJInner): // prefer index hash join
-			errMsg = fmt.Sprintf("Optimizer Hint %s is inapplicable", h.Restore2JoinHint(h.HintINLHJ, indexHashJoinTables))
-		case p.PreferAny(h.PreferLeftAsINLMJInner, h.PreferRightAsINLMJInner): // prefer index merge join
-			errMsg = fmt.Sprintf("Optimizer Hint %s is inapplicable", h.Restore2JoinHint(h.HintINLMJ, indexMergeJoinTables))
-		}
-		// Append inapplicable reason.
-		if len(p.EqualConditions) == 0 {
-			errMsg += " without column equal ON condition"
-		}
-		// Generate warning message to client.
-		p.SCtx().GetSessionVars().StmtCtx.SetHintWarning(errMsg)
-	}
-	return candidates, false
+	return false
 }
 
 func checkChildFitBC(p base.Plan) bool {

@@ -1638,6 +1638,14 @@ func NewPhysicalHashJoin(p *logicalop.LogicalJoin, innerIdx int, useOuterToBuild
 	return hashJoin
 }
 
+type IndexJoinType uint
+
+const (
+	IndexJoinTypeIndexJoin IndexJoinType = iota
+	IndexJoinTypeIndexMergeJoin
+	IndexJoinTypeIndexHashJoin
+)
+
 // PhysicalIndexJoin represents the plan of index look up join.
 // NOTICE: When adding any member variables, remember to modify the Clone method.
 type PhysicalIndexJoin struct {
@@ -1717,6 +1725,11 @@ func (p *PhysicalIndexJoin) MemoryUsage() (sum int64) {
 	return
 }
 
+// GetIndexJoinType returns the type of index join.
+func (p *PhysicalIndexJoin) GetIndexJoinType() IndexJoinType {
+	return IndexJoinTypeIndexJoin
+}
+
 // PhysicalIndexMergeJoin represents the plan of index look up merge join.
 type PhysicalIndexMergeJoin struct {
 	PhysicalIndexJoin
@@ -1743,6 +1756,11 @@ func (p *PhysicalIndexMergeJoin) MemoryUsage() (sum int64) {
 	sum = p.PhysicalIndexJoin.MemoryUsage() + size.SizeOfSlice*3 + int64(cap(p.KeyOff2KeyOffOrderByIdx))*size.SizeOfInt +
 		int64(cap(p.CompareFuncs)+cap(p.OuterCompareFuncs))*size.SizeOfFunc + size.SizeOfBool*2
 	return
+}
+
+// GetIndexJoinType returns the type of index join.
+func (p *PhysicalIndexMergeJoin) GetIndexJoinType() IndexJoinType {
+	return IndexJoinTypeIndexMergeJoin
 }
 
 // PhysicalIndexHashJoin represents the plan of index look up hash join.
@@ -1780,6 +1798,17 @@ func (p *PhysicalIndexHashJoin) MemoryUsage() (sum int64) {
 	}
 
 	return p.PhysicalIndexJoin.MemoryUsage() + size.SizeOfBool
+}
+
+// GetIndexJoinType returns the type of index join.
+func (p *PhysicalIndexHashJoin) GetIndexJoinType() IndexJoinType {
+	return IndexJoinTypeIndexHashJoin
+}
+
+type IndexJoinFamilyConstraint interface {
+	*PhysicalIndexJoin | *PhysicalIndexMergeJoin | *PhysicalIndexHashJoin
+	GetIndexJoinType() IndexJoinType
+	getInnerChildIdx() int
 }
 
 // PhysicalMergeJoin represents merge join implementation of LogicalJoin.
