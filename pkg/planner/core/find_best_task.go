@@ -194,6 +194,7 @@ func enumeratePhysicalPlans4Task(
 	opt *optimizetrace.PhysicalOptimizeOp,
 ) (base.Task, int64, bool, error) {
 	var bestTask, preferTask = base.InvalidTask, base.InvalidTask
+	var affinityFromBest int
 	var curCntPlan, cntPlan int64
 	var err error
 	childTasks := make([]base.Task, 0, p.ChildLen())
@@ -254,7 +255,7 @@ func enumeratePhysicalPlans4Task(
 		// we need to check the hint is applicable before enforcing the property. otherwise
 		// what we get is Sort ot Exchanger kind of operators.
 		// todo: extend applyLogicalJoinHint to be a normal logicalOperator's interface to handle the hint related stuff.
-		hintApplicable := applyLogicalJoinHint(p.Self(), curTask.Plan())
+		curAffinity := applyLogicalJoinHint(p.Self(), curTask.Plan())
 
 		// Enforce curTask property
 		if addEnforcer {
@@ -283,26 +284,34 @@ func enumeratePhysicalPlans4Task(
 			bestTask = curTask
 		}
 
-		if hintApplicable {
-			// curTask is a preferred physic plan, compare cost with previous preferred one and cache the low-cost one.
-			if curIsBetter, err := compareTaskCost(curTask, preferTask, opt); err != nil {
-				return nil, 0, false, err
-			} else if curIsBetter {
-				preferTask = curTask
-			}
+		if bestTask.Invalid() {
+			bestTask = curTask
+			affinityFromBest = curAffinity
 		}
-	}
-	// there is a valid preferred low-cost physical one, return it.
-	if !preferTask.Invalid() {
-		return preferTask, cntPlan, true, nil
+
+		if affinityFromBest > curAffinity {
+			continue
+		}
+
+		if affinityFromBest < curAffinity {
+			bestTask = curTask
+			affinityFromBest = curAffinity
+		}
+
+		// curTask is a preferred physic plan, compare cost with previous preferred one and cache the low-cost one.
+		if curIsBetter, err := compareTaskCost(curTask, preferTask, opt); err != nil {
+			return nil, 0, false, err
+		} else if curIsBetter {
+			bestTask = curTask
+			affinityFromBest = curAffinity
+		}
 	}
 	// if there is no valid preferred low-cost physical one, return the normal low one.
 	// if the hint is specified without any valid plan, we should also record the warnings.
-	if warn := recordIndexJoinHintWarnings(p.Self(), prop, addEnforcer); warn != nil {
+	if warn := recordIndexJoinHintWarnings(p.Self(), prop, addEnforcer, affinityFromBest); warn != nil {
 		bestTask.AppendWarning(warn)
 	}
-	// return the normal lowest-cost physical one.
-	return bestTask, cntPlan, false, nil
+	return bestTask, cntPlan, affinityFromBest > 0, nil
 }
 
 // iteratePhysicalPlan4BaseLogical is used to iterate the physical plan and get all child tasks.
