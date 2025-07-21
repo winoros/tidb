@@ -42,6 +42,7 @@ const (
 	FlagJoinReOrder
 	FlagPruneColumnsAgain
 	FlagPushDownSequence
+	FlagEliminateUnionAllDualItem
 	FlagResolveExpand
 )
 
