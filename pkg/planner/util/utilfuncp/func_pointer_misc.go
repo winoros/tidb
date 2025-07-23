@@ -155,7 +155,7 @@ var AddPrefix4ShardIndexes func(lp base.LogicalPlan, sc base.PlanContext,
 var ApplyPredicateSimplification func(base.PlanContext, []expression.Expression, bool) []expression.Expression
 
 // IsSingleScan check whether the data source is a single scan.
-var IsSingleScan func(ds base.LogicalPlan, indexColumns []*expression.Column, idxColLens []int) bool
+var IsSingleScan func(ds base.LogicalPlan, indexColumns []*expression.Column, idxColLens []int, isTiCIIndex bool) bool
 
 // *************************************** physical op related *******************************************
 

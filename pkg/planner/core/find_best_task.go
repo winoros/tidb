@@ -2131,7 +2131,7 @@ func isIndexColsCoveringCol(sctx expression.EvalContext, col *expression.Column,
 	return false
 }
 
-func indexCoveringColumn(ds *logicalop.DataSource, column *expression.Column, indexColumns []*expression.Column, idxColLens []int, ignoreLen bool) bool {
+func indexCoveringColumn(ds *logicalop.DataSource, column *expression.Column, indexColumns []*expression.Column, idxColLens []int, ignoreLen bool, isTiCIIndex bool) bool {
 	if ds.TableInfo.PKIsHandle && mysql.HasPriKeyFlag(column.RetType.GetFlag()) {
 		return true
 	}
@@ -2139,23 +2139,31 @@ func indexCoveringColumn(ds *logicalop.DataSource, column *expression.Column, in
 		return true
 	}
 	evalCtx := ds.SCtx().GetExprCtx().GetEvalCtx()
-	coveredByPlainIndex := isIndexColsCoveringCol(evalCtx, column, indexColumns, idxColLens, ignoreLen)
 	coveredByClusteredIndex := isIndexColsCoveringCol(evalCtx, column, ds.CommonHandleCols, ds.CommonHandleLens, ignoreLen)
-	if !coveredByPlainIndex && !coveredByClusteredIndex {
+	if isTiCIIndex && !coveredByClusteredIndex {
+		// TiCI index only handle row handle columns, so if the column is not covered by clustered index,
+		// it must need to read from table.
 		return false
 	}
 	isClusteredNewCollationIdx := collate.NewCollationEnabled() &&
 		column.GetType(evalCtx).EvalType() == types.ETString &&
 		!mysql.HasBinaryFlag(column.GetType(evalCtx).GetFlag())
+	if isTiCIIndex && coveredByClusteredIndex && isClusteredNewCollationIdx && ds.Table.Meta().CommonHandleVersion == 0 {
+		return false
+	}
+	coveredByPlainIndex := isIndexColsCoveringCol(evalCtx, column, indexColumns, idxColLens, ignoreLen)
+	if !coveredByPlainIndex && !coveredByClusteredIndex {
+		return false
+	}
 	if !coveredByPlainIndex && coveredByClusteredIndex && isClusteredNewCollationIdx && ds.Table.Meta().CommonHandleVersion == 0 {
 		return false
 	}
 	return true
 }
 
-func isIndexCoveringColumns(ds *logicalop.DataSource, columns, indexColumns []*expression.Column, idxColLens []int) bool {
+func isIndexCoveringColumns(ds *logicalop.DataSource, columns, indexColumns []*expression.Column, idxColLens []int, isTiCIIndex bool) bool {
 	for _, col := range columns {
-		if !indexCoveringColumn(ds, col, indexColumns, idxColLens, false) {
+		if !indexCoveringColumn(ds, col, indexColumns, idxColLens, false, isTiCIIndex) {
 			return false
 		}
 	}
@@ -2165,12 +2173,12 @@ func isIndexCoveringColumns(ds *logicalop.DataSource, columns, indexColumns []*e
 func isIndexCoveringCondition(ds *logicalop.DataSource, condition expression.Expression, indexColumns []*expression.Column, idxColLens []int) bool {
 	switch v := condition.(type) {
 	case *expression.Column:
-		return indexCoveringColumn(ds, v, indexColumns, idxColLens, false)
+		return indexCoveringColumn(ds, v, indexColumns, idxColLens, false, false)
 	case *expression.ScalarFunction:
 		// Even if the index only contains prefix `col`, the index can cover `col is null`.
 		if v.FuncName.L == ast.IsNull {
 			if col, ok := v.GetArgs()[0].(*expression.Column); ok {
-				return indexCoveringColumn(ds, col, indexColumns, idxColLens, true)
+				return indexCoveringColumn(ds, col, indexColumns, idxColLens, true, false)
 			}
 		}
 		for _, arg := range v.GetArgs() {
@@ -2183,15 +2191,20 @@ func isIndexCoveringCondition(ds *logicalop.DataSource, condition expression.Exp
 	return true
 }
 
-func isSingleScan(lp base.LogicalPlan, indexColumns []*expression.Column, idxColLens []int) bool {
+func isSingleScan(lp base.LogicalPlan, indexColumns []*expression.Column, idxColLens []int, ticiIndex bool) bool {
 	ds := lp.(*logicalop.DataSource)
 	if !ds.SCtx().GetSessionVars().OptPrefixIndexSingleScan || ds.ColsRequiringFullLen == nil {
 		// ds.ColsRequiringFullLen is set at (*DataSource).PruneColumns. In some cases we don't reach (*DataSource).PruneColumns
 		// and ds.ColsRequiringFullLen is nil, so we fall back to ds.isIndexCoveringColumns(ds.schema.Columns, indexColumns, idxColLens).
-		return isIndexCoveringColumns(ds, ds.Schema().Columns, indexColumns, idxColLens)
+		return isIndexCoveringColumns(ds, ds.Schema().Columns, indexColumns, idxColLens, ticiIndex)
 	}
-	if !isIndexCoveringColumns(ds, ds.ColsRequiringFullLen, indexColumns, idxColLens) {
+	if !isIndexCoveringColumns(ds, ds.ColsRequiringFullLen, indexColumns, idxColLens, ticiIndex) {
 		return false
+	}
+	if ticiIndex {
+		// Currently TiCI will not execute any filter, all the predicates can be pushed down to TiCi will be transformed to special TiCI representation.
+		// So we will must read data from table kv if there still are some pushed down conditions.
+		return len(ds.PushedDownConds) == 0
 	}
 	for _, cond := range ds.AllConds {
 		if !isIndexCoveringCondition(ds, cond, indexColumns, idxColLens) {
@@ -2225,9 +2238,15 @@ func convertToIndexScan(ds *logicalop.DataSource, prop *property.PhysicalPropert
 	if !ds.SCtx().GetSessionVars().InRestrictedSQL {
 		logutil.BgLogger().Warn("0")
 	}
-	// TiCI currently can not set the order property.
-	if candidate.path.FtsQueryInfo != nil && !prop.IsSortItemEmpty() {
-		return base.InvalidTask, nil
+	if candidate.path.FtsQueryInfo != nil {
+		if !prop.IsSortItemEmpty() {
+			// TiCI currently can not set the order property.
+			return base.InvalidTask, nil
+		}
+		if prop.TaskTp == property.CopSingleReadTaskType {
+			// Don't push any operator to TiCI part.
+			return base.InvalidTask, nil
+		}
 	}
 	if !ds.SCtx().GetSessionVars().InRestrictedSQL {
 		logutil.BgLogger().Warn("1")
@@ -2356,7 +2375,7 @@ func convertToIndexScan(ds *logicalop.DataSource, prop *property.PhysicalPropert
 		task = task.ConvertToRootTask(ds.SCtx())
 	} else if _, ok := task.(*RootTask); ok {
 		return base.InvalidTask, nil
-	} else if is.FtsQueryInfo != nil {
+	} else if is.FtsQueryInfo != nil && prop.TaskTp != property.CopSingleReadTaskType {
 		cop.finishIndexPlan()
 	}
 	return task, nil
@@ -2621,7 +2640,7 @@ func splitIndexFilterConditions(ds *logicalop.DataSource, conditions []expressio
 		if ds.SCtx().GetSessionVars().OptPrefixIndexSingleScan {
 			covered = isIndexCoveringCondition(ds, cond, indexColumns, idxColLens)
 		} else {
-			covered = isIndexCoveringColumns(ds, expression.ExtractColumns(cond), indexColumns, idxColLens)
+			covered = isIndexCoveringColumns(ds, expression.ExtractColumns(cond), indexColumns, idxColLens, false)
 		}
 		if covered {
 			indexConditions = append(indexConditions, cond)

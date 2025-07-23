@@ -613,11 +613,12 @@ func derivePathStatsAndTryHeuristics(ds *logicalop.DataSource) error {
 			path.IsSingleScan = true
 		} else if path.FtsQueryInfo != nil {
 			deriveSearchPathStats(ds, path)
-			path.IsSingleScan = false
+			path.IsSingleScan = isSingleScan(ds, path.FullIdxCols, path.FullIdxColLens, true)
+			// path.IsSingleScan = false
 			logutil.BgLogger().Warn("add pushed down selection", zap.String("table filters", fmt.Sprintf("%v", path.TableFilters)))
 		} else {
 			deriveIndexPathStats(ds, path, ds.PushedDownConds, false)
-			path.IsSingleScan = isSingleScan(ds, path.FullIdxCols, path.FullIdxColLens)
+			path.IsSingleScan = isSingleScan(ds, path.FullIdxCols, path.FullIdxColLens, false)
 		}
 		// step: 3
 		// Try some heuristic rules to select access path.

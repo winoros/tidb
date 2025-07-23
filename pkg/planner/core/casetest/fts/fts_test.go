@@ -76,9 +76,9 @@ func TestTiFlashFTSIndexWhere(t *testing.T) {
 }
 
 func TestTiCISearchExplain(t *testing.T) {
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", `return(1)`))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/infosync/MockCreateTiCIIndexSuccess", `return(true)`))
 	defer func() {
-		err := failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess")
+		err := failpoint.Disable("github.com/pingcap/tidb/pkg/domain/infosync/MockCreateTiCIIndexSuccess")
 		require.NoError(t, err)
 	}()
 
@@ -100,7 +100,6 @@ func TestTiCISearchExplain(t *testing.T) {
 		FULLTEXT KEY (title),
 		index idx_field1 (field1)
 	)`)
-	tk.MustExec("insert into t1 values (1, 'this is title', 'this is body', 1)")
 	dom := domain.GetDomain(tk.Session())
 	testkit.SetTiFlashReplica(t, dom, "test", "t1")
 	tk.MustExec("create table t2(col text)")
