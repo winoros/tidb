@@ -84,15 +84,6 @@ func (p *LogicalProjection) PruneColumns(parentUsedCols []*expression.Column, op
 	if err != nil {
 		return err
 	}
-	// If its columns are all pruned, we directly use its child. The child will output at least one column.
-	if p.Schema().Len() == 0 {
-		childSchema := child.Schema()
-		p.setSchemaAndNames(childSchema.Clone(), child.OutputNames())
-		p.Exprs = make([]expression.Expression, 0, childSchema.Len())
-		for _, col := range childSchema.Columns {
-			p.Exprs = append(p.Exprs, col)
-		}
-	}
 	return nil
 }
 
@@ -186,16 +177,7 @@ func (la *LogicalAggregation) PruneColumns(parentUsedCols []*expression.Column, 
 	if err != nil {
 		return err
 	}
-	// Do an extra Projection Elimination here. This is specially for empty Projection below Aggregation.
-	// This kind of Projection would cause some bugs for MPP plan and is safe to be removed.
-	// This kind of Projection should be removed in Projection Elimination, but currently PrunColumnsAgain is
-	// the last rule. So we specially handle this case here.
-	if childProjection, isProjection := child.(*LogicalProjection); isProjection {
-		if len(childProjection.Exprs) == 0 && childProjection.Schema().Len() == 0 {
-			childOfChild := childProjection.children[0]
-			la.SetChildren(childOfChild)
-		}
-	}
+	removeNoColumnProjectionChild(la, 0)
 	return nil
 }
 
@@ -459,12 +441,14 @@ func (p *LogicalJoin) PruneColumns(parentUsedCols []*expression.Column, opt *log
 	if err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(p, 0)
 	addConstOneForEmptyProjection(p.children[0])
 
 	err = p.children[1].PruneColumns(rightCols, opt)
 	if err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(p, 1)
 	addConstOneForEmptyProjection(p.children[1])
 
 	p.mergeSchema()
@@ -484,6 +468,7 @@ func (la *LogicalApply) PruneColumns(parentUsedCols []*expression.Column, opt *l
 	if err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(la, 1)
 	addConstOneForEmptyProjection(la.children[1])
 
 	la.CorCols = extractCorColumnsBySchema4LogicalPlan(la.children[1], la.children[0].Schema())
@@ -495,6 +480,7 @@ func (la *LogicalApply) PruneColumns(parentUsedCols []*expression.Column, opt *l
 	if err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(la, 0)
 	addConstOneForEmptyProjection(la.children[0])
 
 	la.mergeSchema()
@@ -544,6 +530,7 @@ func (p *LogicalWindow) PruneColumns(parentUsedCols []*expression.Column, opt *l
 	if err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(p, 0)
 
 	p.SetSchema(p.children[0].Schema().Clone())
 	p.Schema().Append(windowColumns...)
@@ -572,6 +559,7 @@ func (p *LogicalLimit) PruneColumns(parentUsedCols []*expression.Column, opt *lo
 	if err := p.children[0].PruneColumns(parentUsedCols, opt); err != nil {
 		return err
 	}
+	removeNoColumnProjectionChild(p, 0)
 	p.schema = nil
 	p.inlineProjection(savedUsedCols, opt)
 	return nil
@@ -579,6 +567,18 @@ func (p *LogicalLimit) PruneColumns(parentUsedCols []*expression.Column, opt *lo
 
 func (*columnPruner) name() string {
 	return "column_prune"
+}
+
+// removeNoColumnProjectionChild folds empty Projection layers into their child.
+// This keeps the old PruneColumns API compatible with the newer behavior that returns a new child plan.
+func removeNoColumnProjectionChild(parent LogicalPlan, childIdx int) {
+	for {
+		proj, ok := parent.Children()[childIdx].(*LogicalProjection)
+		if !ok || proj.Schema().Len() != 0 || len(proj.Children()) == 0 {
+			return
+		}
+		parent.Children()[childIdx] = proj.Children()[0]
+	}
 }
 
 // By add const one, we can avoid empty Projection is eliminated.
