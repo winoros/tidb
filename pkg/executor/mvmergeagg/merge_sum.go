@@ -48,7 +48,7 @@ func (e *MVMergeAggExec) buildSumMerger(
 		return nil, errors.Errorf("SUM mapping expects 1 or 2 dependencies, got %d", len(mapping.DependencyColID))
 	}
 	outputColID := mapping.ColID[0]
-	deltaRef, err := resolveDepRef(mapping.DependencyColID[0], colID2ComputedIdx, e.DeltaAggColCount)
+	deltaRef, err := resolveDepRef(mapping.DependencyColID[0], colID2ComputedIdx, e.DeltaAggColStart, e.DeltaAggColCount)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func (e *MVMergeAggExec) buildSumMerger(
 
 	var countRef depRef
 	if isNullableSum {
-		countRef, err = resolveDepRef(mapping.DependencyColID[1], colID2ComputedIdx, e.DeltaAggColCount)
+		countRef, err = resolveDepRef(mapping.DependencyColID[1], colID2ComputedIdx, e.DeltaAggColStart, e.DeltaAggColCount)
 		if err != nil {
 			return nil, err
 		}

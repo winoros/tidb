@@ -584,6 +584,7 @@ func TestMaterializedViewRefreshCompleteBasic(t *testing.T) {
 	oldTS, err := strconv.ParseUint(fmt.Sprintf("%v", oldTSRow[0][0]), 10, 64)
 	require.NoError(t, err)
 	require.NotZero(t, oldTS)
+	t.Logf("before fast refresh mview tso: %d", oldTS)
 
 	// Make MV stale by changing base table.
 	tk.MustExec("insert into t values (2, 3), (3, 4)")
@@ -607,6 +608,56 @@ func TestMaterializedViewRefreshCompleteBasic(t *testing.T) {
 
 	tk.MustQuery(fmt.Sprintf("select LAST_REFRESH_RESULT, LAST_REFRESH_TYPE, LAST_SUCCESSFUL_REFRESH_READ_TSO = %d from mysql.tidb_mview_refresh where MVIEW_ID = %d", refreshLastQueryStartTS, mviewID)).
 		Check(testkit.Rows("success complete 1"))
+}
+
+func TestMaterializedViewRefreshFastBasic(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_allow_mpp = 0")
+	tk.MustExec("set @@tidb_allow_tiflash_cop = 0")
+	tk.MustExec("set @@tidb_isolation_read_engines = 'tikv'")
+	tk.MustExec("set @@tidb_opt_agg_push_down = 0")
+	tk.MustExec("set @@tidb_enable_collect_execution_info = 0")
+	tk.MustExec("create table t (a int not null, b int not null)")
+	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
+	tk.MustExec("create materialized view log on t (a, b) purge immediate")
+	tk.MustExec("create materialized view mv (a, s, cnt) refresh fast next 300 as select a, sum(b), count(1) from t group by a")
+	tk.MustQuery("select a, s, cnt from mv order by a").Check(testkit.Rows("1 15 2", "2 7 1"))
+
+	is := dom.InfoSchema()
+	mvTable, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("mv"))
+	require.NoError(t, err)
+	mviewID := mvTable.Meta().ID
+
+	oldTSRow := tk.MustQuery(fmt.Sprintf("select LAST_SUCCESSFUL_REFRESH_READ_TSO from mysql.tidb_mview_refresh where MVIEW_ID = %d", mviewID)).Rows()
+	require.Len(t, oldTSRow, 1)
+	oldTS, err := strconv.ParseUint(fmt.Sprintf("%v", oldTSRow[0][0]), 10, 64)
+	require.NoError(t, err)
+	require.NotZero(t, oldTS)
+
+	tk.MustExec("insert into t values (2, 3), (3, 4)")
+	tk.MustExec("update t set b = 8 where a = 1 and b = 5")
+	tk.MustExec("delete from t where a = 2 and b = 7")
+
+	tk.MustExec("refresh materialized view mv fast")
+	refreshLastQueryStartTSRow := tk.MustQuery("select json_extract(@@tidb_last_query_info, '$.start_ts')").Rows()
+	require.Len(t, refreshLastQueryStartTSRow, 1)
+	refreshLastQueryStartTS, err := strconv.ParseUint(refreshLastQueryStartTSRow[0][0].(string), 10, 64)
+	require.NoError(t, err)
+	t.Logf("fast refresh query start tso: %d", refreshLastQueryStartTS)
+
+	newTSRow := tk.MustQuery(fmt.Sprintf("select LAST_SUCCESSFUL_REFRESH_READ_TSO from mysql.tidb_mview_refresh where MVIEW_ID = %d", mviewID)).Rows()
+	require.Len(t, newTSRow, 1)
+	newTS, err := strconv.ParseUint(fmt.Sprintf("%v", newTSRow[0][0]), 10, 64)
+	require.NoError(t, err)
+	t.Logf("after fast refresh mview tso: %d", newTS)
+	require.NotEqual(t, oldTS, newTS)
+
+	tk.MustQuery(fmt.Sprintf("select LAST_REFRESH_RESULT, LAST_REFRESH_TYPE, LAST_SUCCESSFUL_REFRESH_READ_TSO = %d from mysql.tidb_mview_refresh where MVIEW_ID = %d", refreshLastQueryStartTS, mviewID)).
+		Check(testkit.Rows("success fast 1"))
+
+	tk.MustQuery("select a, s, cnt from mv order by a").Check(testkit.Rows("1 18 2", "2 3 1", "3 4 1"))
 }
 
 func TestMaterializedViewRefreshCompleteConcurrentNowait(t *testing.T) {

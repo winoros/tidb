@@ -180,6 +180,28 @@ func TestCheckAggPushDownSumInt(t *testing.T) {
 	require.True(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), desc, kv.TiKV))
 }
 
+func TestNewDistAggFuncSumInt(t *testing.T) {
+	ctx := mock.NewContext()
+	client := new(mock.Client)
+	desc, err := NewAggFuncDesc(ctx, ast.AggFuncSumInt, []expression.Expression{genColumn(mysql.TypeLonglong, 0)}, false)
+	require.NoError(t, err)
+
+	pushCtx := expression.NewPushDownContextFromSessionVars(
+		ctx,
+		ctx.GetSessionVars(),
+		client,
+	)
+	pbExpr, err := AggFuncToPBExpr(pushCtx, desc, kv.TiKV)
+	require.NoError(t, err)
+
+	agg, aggDesc, err := NewDistAggFunc(pbExpr, []*types.FieldType{types.NewFieldType(mysql.TypeLonglong)}, ctx)
+	require.NoError(t, err)
+	require.NotNil(t, agg)
+	require.NotNil(t, aggDesc)
+	require.Equal(t, ast.AggFuncSumInt, aggDesc.Name)
+	require.IsType(t, &sumFunction{}, agg)
+}
+
 func TestBitAnd(t *testing.T) {
 	s := createAggFuncSuite()
 	col := &expression.Column{

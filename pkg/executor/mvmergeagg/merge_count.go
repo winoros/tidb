@@ -33,7 +33,7 @@ func (e *MVMergeAggExec) buildCountMerger(
 		return nil, errors.New("COUNT mapping requires at least one dependency column")
 	}
 	outputColID := mapping.ColID[0]
-	deltaRef, err := resolveDepRef(mapping.DependencyColID[0], colID2ComputedIdx, e.DeltaAggColCount)
+	deltaRef, err := resolveDepRef(mapping.DependencyColID[0], colID2ComputedIdx, e.DeltaAggColStart, e.DeltaAggColCount)
 	if err != nil {
 		return nil, err
 	}

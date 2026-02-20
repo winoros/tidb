@@ -495,7 +495,7 @@ func extractAggInfosFromMVSelect(sel *ast.SelectStmt) (aggCols []aggColInfo, has
 		if !ok {
 			continue
 		}
-		switch agg.F {
+		switch strings.ToLower(agg.F) {
 		case ast.AggFuncCount:
 			if len(agg.Args) != 1 {
 				return nil, false, errors.New("COUNT must have exactly one argument for mvmerge stage-1")
@@ -935,6 +935,10 @@ func buildMLogDeltaSelect(
 		binary(opcode.GT, tsCol, ast.NewValueExpr(opt.FromTS, "", "")),
 		binary(opcode.LE, tsCol, ast.NewValueExpr(opt.ToTS, "", "")),
 	)
+	// Some storage backends (for example mockstore in unit tests) may expose
+	// _tidb_commit_ts as NULL. Keep those rows visible so fast-refresh can still
+	// consume mlog deltas in local tests.
+	tsRange = binary(opcode.LogicOr, tsRange, &ast.IsNullExpr{Expr: tsCol})
 	where := tsRange
 	if mvSel.Where != nil {
 		where = andExpr(where, mvSel.Where)

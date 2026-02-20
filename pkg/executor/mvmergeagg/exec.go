@@ -38,7 +38,7 @@ import (
 //
 // ColID contains the target aggregate column positions in child output schema.
 // DependencyColID can reference:
-// 1. child chunk delta-agg columns (col id < DeltaAggColCount), or
+// 1. child chunk delta-agg columns in [DeltaAggColStart, DeltaAggColStart+DeltaAggColCount), or
 // 2. columns already produced by previous mappings.
 type MVMergeAggMapping struct {
 	// AggFunc must be set; aggregate function name is read from AggFunc.Name.
@@ -77,7 +77,7 @@ type MVMergeAggRowOp struct {
 
 // MVMergeAggChunkResult contains worker result for one input chunk.
 type MVMergeAggChunkResult struct {
-	// Input is the original joined chunk (delta agg + MV columns).
+	// Input is the original child chunk consumed by MVMergeAggExec.
 	Input *chunk.Chunk
 	// ComputedCols is indexed by input column position.
 	// A nil item means this column is not computed by merge mappings.
@@ -96,7 +96,10 @@ type MVMergeAggResultWriter interface {
 type MVMergeAggExec struct {
 	exec.BaseExecutor
 
-	AggMappings      []MVMergeAggMapping
+	AggMappings []MVMergeAggMapping
+	// DeltaAggColStart/DeltaAggColCount describe the delta-column range in child output.
+	// The default (start=0) matches the original delta-first layout.
+	DeltaAggColStart int
 	DeltaAggColCount int
 	MinMaxRecompute  map[int]MinMaxRecomputeExec
 
@@ -349,8 +352,19 @@ func (e *MVMergeAggExec) prepareMergers() error {
 	}
 
 	childTypes := exec.RetTypes(e.Children(0))
+	if e.DeltaAggColStart < 0 || e.DeltaAggColStart > len(childTypes) {
+		return errors.Errorf("DeltaAggColStart %d out of range [0,%d]", e.DeltaAggColStart, len(childTypes))
+	}
 	if e.DeltaAggColCount < 0 || e.DeltaAggColCount > len(childTypes) {
 		return errors.Errorf("DeltaAggColCount %d out of range [0,%d]", e.DeltaAggColCount, len(childTypes))
+	}
+	if e.DeltaAggColStart+e.DeltaAggColCount > len(childTypes) {
+		return errors.Errorf(
+			"delta column range [%d,%d) out of child schema range [0,%d)",
+			e.DeltaAggColStart,
+			e.DeltaAggColStart+e.DeltaAggColCount,
+			len(childTypes),
+		)
 	}
 	colID2ComputedIdx := make(map[int]int, len(e.AggMappings))
 	e.compiledMergers = make([]aggMerger, 0, len(e.AggMappings))

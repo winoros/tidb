@@ -237,7 +237,7 @@ func TestExplainRefreshMVFastPlanTree(t *testing.T) {
 		{"    ├─HashAgg(Build)", "6400.00", "root", "", "group by:test.$mlog$t.a, funcs:sum_int(Column#13)->Column#6, funcs:firstrow(test.$mlog$t.a)->test.$mlog$t.a"},
 		{"    │ └─TableReader", "6400.00", "root", "", "data:HashAgg"},
 		{"    │   └─HashAgg", "6400.00", "cop[tikv]", "", "group by:test.$mlog$t.a, funcs:sum_int(test.$mlog$t._mlog$_old_new)->Column#13"},
-		{"    │     └─Selection", "8000.00", "cop[tikv]", "", "gt(test.$mlog$t._tidb_commit_ts, 0), le(test.$mlog$t._tidb_commit_ts, 1)"},
+		{"    │     └─Selection", "8000.00", "cop[tikv]", "", "or(and(gt(test.$mlog$t._tidb_commit_ts, 0), le(test.$mlog$t._tidb_commit_ts, 1)), isnull(test.$mlog$t._tidb_commit_ts))"},
 		{"    │       └─TableFullScan", "10000.00", "cop[tikv]", "table:$mlog$t", "keep order:false, stats:pseudo"},
 		{"    └─TableReader(Probe)", "10000.00", "root", "", "data:TableFullScan"},
 		{"      └─TableFullScan", "10000.00", "cop[tikv]", "table:mv", "keep order:false, stats:pseudo"},

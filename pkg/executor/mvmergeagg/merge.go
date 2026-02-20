@@ -37,18 +37,20 @@ type depRef struct {
 	idx    int
 }
 
-func resolveDepRef(depColID int, colID2ComputedIdx map[int]int, deltaAggColCount int) (depRef, error) {
+func resolveDepRef(depColID int, colID2ComputedIdx map[int]int, deltaAggColStart, deltaAggColCount int) (depRef, error) {
 	if idx, ok := colID2ComputedIdx[depColID]; ok {
 		return depRef{
 			source: depFromComputed,
 			idx:    idx,
 		}, nil
 	}
-	if depColID < 0 || depColID >= deltaAggColCount {
+	deltaAggColEnd := deltaAggColStart + deltaAggColCount
+	if depColID < deltaAggColStart || depColID >= deltaAggColEnd {
 		return depRef{}, errors.Errorf(
-			"dependency col id %d is invalid: expect delta agg range [0,%d) or previously computed columns",
+			"dependency col id %d is invalid: expect delta agg range [%d,%d) or previously computed columns",
 			depColID,
-			deltaAggColCount,
+			deltaAggColStart,
+			deltaAggColEnd,
 		)
 	}
 	return depRef{
