@@ -101,3 +101,23 @@ func TestAggFuncSumIntToPb(t *testing.T) {
 		}
 	}
 }
+
+func TestNewDistAggFuncSumInt(t *testing.T) {
+	ctx := mock.NewContext()
+	client := new(mock.Client)
+	args := []expression.Expression{genColumn(mysql.TypeLonglong, 0)}
+	aggFunc, err := NewAggFuncDesc(ctx, ast.AggFuncSumInt, args, false)
+	require.NoError(t, err)
+	pushCtx := expression.NewPushDownContextFromSessionVars(
+		ctx,
+		ctx.GetSessionVars(),
+		client,
+	)
+	pbExpr, err := AggFuncToPBExpr(pushCtx, aggFunc, kv.TiKV)
+	require.NoError(t, err)
+	distAgg, distDesc, err := NewDistAggFunc(pbExpr, []*types.FieldType{types.NewFieldType(mysql.TypeLonglong)}, ctx.GetExprCtx())
+	require.NoError(t, err)
+	require.NotNil(t, distAgg)
+	require.NotNil(t, distDesc)
+	require.Equal(t, ast.AggFuncSumInt, distDesc.Name)
+}

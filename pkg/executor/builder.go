@@ -64,6 +64,7 @@ import (
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
+	"github.com/pingcap/tidb/pkg/planner/mvmerge"
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/planner/util/coreusage"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -188,6 +189,8 @@ func (b *executorBuilder) build(p base.Plan) exec.Executor {
 		return b.buildRefreshMaterializedView(v)
 	case *plannercore.PurgeMaterializedViewLog:
 		return b.buildPurgeMaterializedViewLog(v)
+	case *plannercore.MVDeltaMerge:
+		return b.buildMVDeltaMerge(v)
 	case *plannercore.Deallocate:
 		return b.buildDeallocate(v)
 	case *plannercore.Delete:
@@ -1341,6 +1344,351 @@ func (b *executorBuilder) buildPurgeMaterializedViewLog(v *plannercore.PurgeMate
 		stmt:         v.Statement,
 	}
 	return e
+}
+
+func (b *executorBuilder) buildMVDeltaMerge(v *plannercore.MVDeltaMerge) exec.Executor {
+	if v.Source == nil {
+		b.err = errors.New("MVDeltaMerge source plan is nil")
+		return nil
+	}
+
+	sourceExec := b.build(v.Source)
+	if b.err != nil {
+		return nil
+	}
+	if sourceExec == nil {
+		b.err = errors.New("MVDeltaMerge source executor is nil")
+		return nil
+	}
+
+	sourceFieldTypes := sourceExec.RetFieldTypes()
+	if len(sourceFieldTypes) == 0 {
+		b.err = errors.New("MVDeltaMerge source schema is empty")
+		return nil
+	}
+	if v.MVColumnCount <= 0 || v.MVColumnCount > len(sourceFieldTypes) {
+		b.err = errors.Errorf(
+			"MVDeltaMerge MVColumnCount %d is out of range (source schema len %d)",
+			v.MVColumnCount,
+			len(sourceFieldTypes),
+		)
+		return nil
+	}
+
+	deltaAggColCount := len(sourceFieldTypes) - v.MVColumnCount
+	if deltaAggColCount <= 0 {
+		b.err = errors.Errorf(
+			"MVDeltaMerge delta aggregate column count must be positive, got %d (source=%d mv=%d)",
+			deltaAggColCount,
+			len(sourceFieldTypes),
+			v.MVColumnCount,
+		)
+		return nil
+	}
+
+	mvTable, ok := b.is.TableByID(context.Background(), v.MVTableID)
+	if !ok {
+		b.err = errors.Errorf("MVDeltaMerge target table id %d not found in infoschema", v.MVTableID)
+		return nil
+	}
+	targetInfo := mvTable.Meta()
+	targetHandleCols, err := buildMVDeltaMergeTargetHandleCols(targetInfo)
+	if err != nil {
+		b.err = err
+		return nil
+	}
+
+	aggMappings, err := buildMVDeltaMergeAggMappings(
+		b.ctx,
+		v.AggInfos,
+		sourceFieldTypes,
+		deltaAggColCount,
+		v.MVColumnCount,
+		v.CountStarMVOffset,
+	)
+	if err != nil {
+		b.err = err
+		return nil
+	}
+
+	return &MVDeltaMergeAggExec{
+		BaseExecutor:         exec.NewBaseExecutor(b.ctx, v.Schema(), v.ID(), sourceExec),
+		AggMappings:          aggMappings,
+		DeltaAggColCount:     deltaAggColCount,
+		TargetTable:          mvTable,
+		TargetInfo:           targetInfo,
+		TargetHandleCols:     targetHandleCols,
+		MinMaxRecompute:      nil,
+		TargetWritableColIDs: nil,
+	}
+}
+
+func buildMVDeltaMergeTargetHandleCols(targetInfo *model.TableInfo) (plannerutil.HandleCols, error) {
+	if targetInfo == nil {
+		return nil, errors.New("MVDeltaMerge target table info is nil")
+	}
+
+	if targetInfo.PKIsHandle {
+		pkCol := targetInfo.GetPkColInfo()
+		if pkCol == nil {
+			return nil, errors.New("MVDeltaMerge target table reports PKIsHandle but primary key column is nil")
+		}
+		return plannerutil.NewIntHandleCols(&expression.Column{
+			Index:   pkCol.Offset,
+			RetType: &pkCol.FieldType,
+			ID:      pkCol.ID,
+		}), nil
+	}
+
+	if targetInfo.IsCommonHandle {
+		pkIdx := tables.FindPrimaryIndex(targetInfo)
+		if pkIdx == nil {
+			return nil, errors.New("MVDeltaMerge target table reports IsCommonHandle but primary index is nil")
+		}
+		tblCols := make([]*expression.Column, len(targetInfo.Columns))
+		for i := range targetInfo.Columns {
+			colInfo := targetInfo.Columns[i]
+			tblCols[i] = &expression.Column{
+				Index:   i,
+				RetType: &colInfo.FieldType,
+				ID:      colInfo.ID,
+			}
+		}
+		return plannerutil.NewCommonHandleCols(targetInfo, pkIdx, tblCols), nil
+	}
+
+	return nil, errors.New(
+		"MVDeltaMerge fast refresh requires target materialized view primary key to be table handle",
+	)
+}
+
+type mvDeltaMergeAggMappingItem struct {
+	info        mvmerge.AggInfo
+	outputColID int
+	mapping     MVDeltaMergeAggMapping
+}
+
+func buildMVDeltaMergeAggMappings(
+	sctx sessionctx.Context,
+	aggInfos []mvmerge.AggInfo,
+	sourceFieldTypes []*types.FieldType,
+	deltaAggColCount int,
+	mvColumnCount int,
+	countStarMVOffset int,
+) ([]MVDeltaMergeAggMapping, error) {
+	if len(aggInfos) == 0 {
+		return nil, errors.New("MVDeltaMerge has empty aggregate infos")
+	}
+	if sctx == nil {
+		return nil, errors.New("MVDeltaMerge session context is nil")
+	}
+	if mvColumnCount <= 0 {
+		return nil, errors.Errorf("MVDeltaMerge MVColumnCount must be positive, got %d", mvColumnCount)
+	}
+	if countStarMVOffset < 0 || countStarMVOffset >= mvColumnCount {
+		return nil, errors.Errorf(
+			"MVDeltaMerge CountStarMVOffset %d is out of range [0,%d)",
+			countStarMVOffset,
+			mvColumnCount,
+		)
+	}
+
+	sourceColumnCount := len(sourceFieldTypes)
+	mvColumnOffsetBase := deltaAggColCount
+	if sourceColumnCount != mvColumnOffsetBase+mvColumnCount {
+		return nil, errors.Errorf(
+			"MVDeltaMerge schema layout mismatch: source columns=%d, delta columns=%d, mv columns=%d",
+			sourceColumnCount,
+			mvColumnOffsetBase,
+			mvColumnCount,
+		)
+	}
+
+	expectedCountStarOutputColID := mvColumnOffsetBase + countStarMVOffset
+	mappingItems := make([]mvDeltaMergeAggMappingItem, 0, len(aggInfos))
+	seenOutputColID := make(map[int]struct{}, len(aggInfos))
+	countStarItemIdx := -1
+
+	for _, aggInfo := range aggInfos {
+		outputColID := mvColumnOffsetBase + aggInfo.MVOffset
+		if outputColID < mvColumnOffsetBase || outputColID >= sourceColumnCount {
+			return nil, errors.Errorf(
+				"MVDeltaMerge aggregate output column id %d (mv offset %d) is out of range [%d,%d)",
+				outputColID,
+				aggInfo.MVOffset,
+				mvColumnOffsetBase,
+				sourceColumnCount,
+			)
+		}
+		if _, exists := seenOutputColID[outputColID]; exists {
+			return nil, errors.Errorf("MVDeltaMerge duplicate aggregate output column id %d", outputColID)
+		}
+		seenOutputColID[outputColID] = struct{}{}
+
+		deps := append([]int(nil), aggInfo.Dependencies...)
+		for _, dep := range deps {
+			if dep < 0 || dep >= sourceColumnCount {
+				return nil, errors.Errorf(
+					"MVDeltaMerge dependency column id %d for output column %d is out of range [0,%d)",
+					dep,
+					outputColID,
+					sourceColumnCount,
+				)
+			}
+		}
+
+		aggFuncName, err := mvDeltaMergeAggFuncName(aggInfo.Kind)
+		if err != nil {
+			return nil, err
+		}
+		aggArg, err := mvDeltaMergeAggArgExpr(aggInfo, deps, sourceFieldTypes)
+		if err != nil {
+			return nil, err
+		}
+		aggDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), aggFuncName, []expression.Expression{aggArg}, false)
+		if err != nil {
+			return nil, err
+		}
+
+		item := mvDeltaMergeAggMappingItem{
+			info:        aggInfo,
+			outputColID: outputColID,
+			mapping: MVDeltaMergeAggMapping{
+				AggFunc:         aggDesc,
+				ColID:           []int{outputColID},
+				DependencyColID: deps,
+			},
+		}
+		if aggInfo.Kind == mvmerge.AggCountStar {
+			if outputColID != expectedCountStarOutputColID {
+				return nil, errors.Errorf(
+					"MVDeltaMerge COUNT(*) output column id mismatch: expected %d, got %d",
+					expectedCountStarOutputColID,
+					outputColID,
+				)
+			}
+			if countStarItemIdx >= 0 {
+				return nil, errors.New("MVDeltaMerge has multiple COUNT(*) aggregate infos")
+			}
+			countStarItemIdx = len(mappingItems)
+		}
+		mappingItems = append(mappingItems, item)
+	}
+
+	if countStarItemIdx < 0 {
+		return nil, errors.New("MVDeltaMerge aggregate infos do not contain COUNT(*)")
+	}
+
+	ordered := make([]MVDeltaMergeAggMapping, 0, len(mappingItems))
+	produced := make(map[int]struct{}, len(mappingItems))
+	ordered = append(ordered, mappingItems[countStarItemIdx].mapping)
+	produced[mappingItems[countStarItemIdx].outputColID] = struct{}{}
+
+	pending := make([]mvDeltaMergeAggMappingItem, 0, len(mappingItems)-1)
+	for i := range mappingItems {
+		if i == countStarItemIdx {
+			continue
+		}
+		pending = append(pending, mappingItems[i])
+	}
+
+	for len(pending) > 0 {
+		progress := false
+		nextPending := pending[:0]
+		for _, item := range pending {
+			if mvDeltaMergeDependenciesReady(item.mapping.DependencyColID, produced, deltaAggColCount) {
+				ordered = append(ordered, item.mapping)
+				produced[item.outputColID] = struct{}{}
+				progress = true
+				continue
+			}
+			nextPending = append(nextPending, item)
+		}
+		if !progress {
+			unresolved := make([]int, 0, len(nextPending))
+			for _, item := range nextPending {
+				unresolved = append(unresolved, item.outputColID)
+			}
+			slices.Sort(unresolved)
+			return nil, errors.Errorf(
+				"MVDeltaMerge aggregate dependencies are unsatisfied, unresolved output column ids: %v",
+				unresolved,
+			)
+		}
+		pending = nextPending
+	}
+
+	return ordered, nil
+}
+
+func mvDeltaMergeAggFuncName(kind mvmerge.AggKind) (string, error) {
+	switch kind {
+	case mvmerge.AggCountStar, mvmerge.AggCount:
+		return ast.AggFuncCount, nil
+	case mvmerge.AggSum:
+		return ast.AggFuncSum, nil
+	case mvmerge.AggMin:
+		return ast.AggFuncMin, nil
+	case mvmerge.AggMax:
+		return ast.AggFuncMax, nil
+	default:
+		return "", errors.Errorf("unsupported MVDeltaMerge aggregate kind %v", kind)
+	}
+}
+
+func mvDeltaMergeAggArgExpr(
+	aggInfo mvmerge.AggInfo,
+	dependencies []int,
+	sourceFieldTypes []*types.FieldType,
+) (expression.Expression, error) {
+	if aggInfo.Kind == mvmerge.AggCountStar {
+		return expression.NewOne(), nil
+	}
+	if len(dependencies) == 0 {
+		return nil, errors.Errorf(
+			"MVDeltaMerge aggregate %v at mv offset %d has empty dependencies",
+			aggInfo.Kind,
+			aggInfo.MVOffset,
+		)
+	}
+	dep := dependencies[0]
+	if dep < 0 || dep >= len(sourceFieldTypes) {
+		return nil, errors.Errorf(
+			"MVDeltaMerge aggregate %v at mv offset %d has invalid dependency col id %d",
+			aggInfo.Kind,
+			aggInfo.MVOffset,
+			dep,
+		)
+	}
+	retType := sourceFieldTypes[dep]
+	if retType == nil {
+		return nil, errors.Errorf(
+			"MVDeltaMerge aggregate %v at mv offset %d has unavailable dependency type at col %d",
+			aggInfo.Kind,
+			aggInfo.MVOffset,
+			dep,
+		)
+	}
+	return &expression.Column{
+		Index:   dep,
+		RetType: retType,
+	}, nil
+}
+
+func mvDeltaMergeDependenciesReady(
+	dependencies []int,
+	produced map[int]struct{},
+	deltaAggColCount int,
+) bool {
+	for _, dep := range dependencies {
+		if dep < deltaAggColCount {
+			continue
+		}
+		if _, ok := produced[dep]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // buildTrace builds a TraceExec for future executing. This method will be called
