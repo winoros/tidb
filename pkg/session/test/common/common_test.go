@@ -97,6 +97,69 @@ func TestPrepare(t *testing.T) {
 	require.NoError(t, rs.Close())
 }
 
+func TestRefreshMaterializedViewDoesNotMarkDDLExecution(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec("create table t_mv_flag (a int not null, b int not null)")
+	tk.MustExec("insert into t_mv_flag values (1, 10)")
+	tk.MustExec("create materialized view log on t_mv_flag (a, b) purge immediate")
+	tk.MustExec("create materialized view mv_flag (a, s, cnt) refresh fast next 300 as select a, sum(b), count(1) from t_mv_flag group by a")
+	require.NotNil(t, tk.Session().Value(sessionctx.LastExecuteDDL))
+
+	tk.MustExec("insert into t_mv_flag values (1, 5)")
+	tk.MustExec("refresh materialized view mv_flag complete")
+	require.Nil(t, tk.Session().Value(sessionctx.LastExecuteDDL))
+}
+
+func TestRefreshMaterializedViewDisallowExplicitTransaction(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec("create table t_mv_txn (a int not null, b int not null)")
+	tk.MustExec("insert into t_mv_txn values (1, 10)")
+	tk.MustExec("create materialized view log on t_mv_txn (a, b) purge immediate")
+	tk.MustExec("create materialized view mv_txn (a, s, cnt) refresh fast next 300 as select a, sum(b), count(1) from t_mv_txn group by a")
+
+	tk.MustExec("begin")
+	tk.MustGetErrMsg("refresh materialized view mv_txn complete", "cannot run REFRESH MATERIALIZED VIEW in explicit transaction")
+	tk.MustExec("rollback")
+}
+
+func TestPurgeMaterializedViewLogDisallowExplicitTransaction(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec("create table t_mlog_purge_txn (a int not null, b int not null)")
+	tk.MustExec("create materialized view log on t_mlog_purge_txn (a, b) purge immediate")
+
+	tk.MustExec("begin")
+	tk.MustGetErrMsg(
+		"purge materialized view log on t_mlog_purge_txn",
+		"cannot run PURGE MATERIALIZED VIEW LOG in explicit transaction",
+	)
+	tk.MustExec("rollback")
+}
+
+func TestPurgeMaterializedViewLogDoesNotMarkDDLExecution(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec("create table t_mlog_purge_flag (id int primary key, v int)")
+	tk.MustExec("create materialized view log on t_mlog_purge_flag (id, v) purge immediate")
+	require.NotNil(t, tk.Session().Value(sessionctx.LastExecuteDDL))
+
+	tk.MustExec("insert into t_mlog_purge_flag values (1, 10), (2, 20)")
+	require.Nil(t, tk.Session().Value(sessionctx.LastExecuteDDL))
+
+	tk.MustExec("purge materialized view log on t_mlog_purge_flag")
+	require.Nil(t, tk.Session().Value(sessionctx.LastExecuteDDL))
+}
+
 func TestIndexColumnLength(t *testing.T) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 

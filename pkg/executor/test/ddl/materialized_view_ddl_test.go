@@ -23,10 +23,35 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	ddlsess "github.com/pingcap/tidb/pkg/ddl/session"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCreateMaterializedViewBuildReadTSQueryTypeAlignment(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int)")
+	tk.MustExec("insert into t values (1)")
+
+	ddlSe := ddlsess.NewSession(tk.Session())
+	ctx := context.Background()
+
+	tk.MustExec("select * from t")
+	expected := tk.Session().GetSessionVars().LastQueryInfo.StartTS
+	require.NotZero(t, expected)
+
+	rows, err := ddlSe.Execute(ctx,
+		"SELECT COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(@@tidb_last_query_info, '$.start_ts')) AS UNSIGNED), CAST(0 AS UNSIGNED))",
+		"create-materialized-view-build-read-ts-ut",
+	)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	readTS := rows[0].GetUint64(0)
+	require.Equal(t, expected, readTS)
+}
 
 func TestMaterializedViewDDLBasic(t *testing.T) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
@@ -74,9 +99,15 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 	err = tk.ExecToErr("create materialized view mv_bad (a, s) as select a, sum(b) from t group by a")
 	require.ErrorContains(t, err, "must contain count(*)/count(1)")
 
-	// Count(column), non-deterministic WHERE and unsupported aggregate should fail.
-	err = tk.ExecToErr("create materialized view mv_bad_count_col (a, c) as select a, count(b) from t group by a")
-	require.ErrorContains(t, err, "only supports count(*)/count(1)")
+	// count(column) is supported (but CREATE MATERIALIZED VIEW still requires count(*|1) in the SELECT list).
+	tk.MustExec("create materialized view mv_count_col (a, cnt_b, cnt) as select a, count(b), count(1) from t group by a")
+	tk.MustQuery("select a, cnt_b, cnt from mv_count_col order by a").Check(testkit.Rows("1 2 2", "2 1 1"))
+
+	// Aggregate function names are case-insensitive in CREATE MATERIALIZED VIEW.
+	tk.MustExec("create materialized view mv_upper_agg (a, s, cnt) as select a, SUM(b), COUNT(1) from t group by a")
+	tk.MustQuery("select a, s, cnt from mv_upper_agg order by a").Check(testkit.Rows("1 15 2", "2 7 1"))
+
+	// Non-deterministic WHERE and unsupported aggregate should fail.
 	err = tk.ExecToErr("create materialized view mv_bad_avg (a, avgv, c) as select a, avg(b), count(1) from t group by a")
 	require.ErrorContains(t, err, "unsupported aggregate function")
 	err = tk.ExecToErr("create materialized view mv_bad_where (a, c) as select a, count(1) from t where rand() > 0 group by a")
@@ -92,6 +123,8 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 	tk.MustExec("create table t_minmax_bad (a int not null, b int not null, c int not null, index idx_cab(c, a, b))")
 	tk.MustExec("create materialized view log on t_minmax_bad (a, b, c) purge immediate")
 	err = tk.ExecToErr("create materialized view mv_bad_minmax_index (a, b, minc, c1) as select a, b, min(c), count(1) from t_minmax_bad group by a, b")
+	require.ErrorContains(t, err, "requires base table index whose leading columns cover all GROUP BY columns")
+	err = tk.ExecToErr("create materialized view mv_bad_minmax_index_upper (a, b, minc, c1) as select a, b, MIN(c), COUNT(1) from t_minmax_bad group by a, b")
 	require.ErrorContains(t, err, "requires base table index whose leading columns cover all GROUP BY columns")
 	tk.MustExec("create table t_minmax_ok (a int not null, b int not null, c int not null, index idx_bac(b, a, c))")
 	tk.MustExec("create materialized view log on t_minmax_ok (a, b, c) purge immediate")
@@ -118,6 +151,8 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 	tk.MustExec("create materialized view log on t_mlog_missing (a) purge immediate")
 	err = tk.ExecToErr("create materialized view mv_bad_mlog_cols (a, s, c) as select a, sum(b), count(1) from t_mlog_missing group by a")
 	require.ErrorContains(t, err, "does not contain column b")
+	err = tk.ExecToErr("create materialized view mv_bad_mlog_cols_count (a, cnt_b, cnt) as select a, count(b), count(1) from t_mlog_missing group by a")
+	require.ErrorContains(t, err, "does not contain column b")
 
 	// Nullable group-by key should use UNIQUE KEY.
 	tk.MustExec("create table t_nullable (a int, b int)")
@@ -135,9 +170,11 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 	tk.MustExec("create index idx_mv_s on mv (s)")
 	tk.MustExec("drop index idx_mv_s on mv")
 
-	// ALTER TABLE ... SET TIFLASH REPLICA is allowed on MV table, but still forbidden on base.
+	// ALTER TABLE ... SET TIFLASH REPLICA is allowed on both base table and MV table.
 	err = tk.ExecToErr("alter table t set tiflash replica 1")
-	require.ErrorContains(t, err, "ALTER TABLE on base table with materialized view dependencies")
+	if err != nil {
+		require.NotContains(t, err.Error(), "ALTER TABLE on base table with materialized view dependencies")
+	}
 	err = tk.ExecToErr("alter table mv set tiflash replica 1")
 	if err != nil {
 		require.NotContains(t, err.Error(), "ALTER TABLE on materialized view table")
@@ -149,6 +186,8 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 
 	// Drop MV and then drop MV LOG.
 	tk.MustExec("drop materialized view mv")
+	tk.MustExec("drop materialized view mv_count_col")
+	tk.MustExec("drop materialized view mv_upper_agg")
 	tk.MustExec("drop materialized view mv_alias")
 	tk.MustExec("drop materialized view mv_nullable")
 	tk.MustExec("drop materialized view mv_minmax_ok")
@@ -164,6 +203,64 @@ func TestMaterializedViewDDLBasic(t *testing.T) {
 	baseTable, err = is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t"))
 	require.NoError(t, err)
 	require.True(t, baseTable.Meta().MaterializedViewBase == nil || (baseTable.Meta().MaterializedViewBase.MLogID == 0 && len(baseTable.Meta().MaterializedViewBase.MViewIDs) == 0))
+}
+
+func TestCreateMaterializedViewRefreshInfoRunningAndSuccess(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int not null, b int not null)")
+	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
+	tk.MustExec("create materialized view log on t (a, b) purge immediate")
+
+	const pauseBuildFailpoint = "github.com/pingcap/tidb/pkg/ddl/pauseCreateMaterializedViewBuild"
+	require.NoError(t, failpoint.Enable(pauseBuildFailpoint, "pause"))
+	enabled := true
+	defer func() {
+		if enabled {
+			require.NoError(t, failpoint.Disable(pauseBuildFailpoint))
+		}
+	}()
+
+	ddlDone := make(chan error, 1)
+	go func() {
+		tkDDL := testkit.NewTestKit(t, store)
+		tkDDL.MustExec("use test")
+		ddlDone <- tkDDL.ExecToErr("create materialized view mv_state (a, s, cnt) refresh fast next 300 as select a, sum(b), count(1) from t group by a")
+	}()
+
+	var initTS uint64
+	require.Eventually(t, func() bool {
+		rows := tk.MustQuery("select LAST_REFRESH_RESULT, LAST_REFRESH_TYPE, LAST_SUCCESSFUL_REFRESH_READ_TSO from mysql.tidb_mview_refresh").Rows()
+		if len(rows) != 1 {
+			return false
+		}
+		if fmt.Sprint(rows[0][0]) != "running" || fmt.Sprint(rows[0][1]) != "complete" {
+			return false
+		}
+		ts, err := strconv.ParseUint(fmt.Sprint(rows[0][2]), 10, 64)
+		if err != nil || ts == 0 {
+			return false
+		}
+		initTS = ts
+		return true
+	}, 30*time.Second, 100*time.Millisecond)
+
+	require.NoError(t, failpoint.Disable(pauseBuildFailpoint))
+	enabled = false
+
+	err := <-ddlDone
+	require.NoError(t, err)
+	tk.MustQuery("select a, s, cnt from mv_state order by a").Check(testkit.Rows("1 15 2", "2 7 1"))
+
+	rows := tk.MustQuery("select LAST_REFRESH_RESULT, LAST_REFRESH_TYPE, LAST_SUCCESSFUL_REFRESH_READ_TSO, LAST_REFRESH_FAILED_REASON is null from mysql.tidb_mview_refresh").Rows()
+	require.Len(t, rows, 1)
+	require.Equal(t, "success", fmt.Sprint(rows[0][0]))
+	require.Equal(t, "complete", fmt.Sprint(rows[0][1]))
+	finalTS, err := strconv.ParseUint(fmt.Sprint(rows[0][2]), 10, 64)
+	require.NoError(t, err)
+	require.Greater(t, finalTS, initTS)
+	require.Equal(t, "1", fmt.Sprint(rows[0][3]))
 }
 
 func TestCreateMaterializedViewBuildFailureRollback(t *testing.T) {

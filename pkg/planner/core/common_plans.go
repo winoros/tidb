@@ -863,6 +863,20 @@ type DDL struct {
 	Statement ast.DDLNode
 }
 
+// RefreshMaterializedView represents a "REFRESH MATERIALIZED VIEW ..." plan.
+type RefreshMaterializedView struct {
+	baseSchemaProducer
+
+	Statement *ast.RefreshMaterializedViewStmt
+}
+
+// PurgeMaterializedViewLog represents a "PURGE MATERIALIZED VIEW LOG ..." plan.
+type PurgeMaterializedViewLog struct {
+	baseSchemaProducer
+
+	Statement *ast.PurgeMaterializedViewLogStmt
+}
+
 // SelectInto represents a select-into plan.
 type SelectInto struct {
 	baseSchemaProducer

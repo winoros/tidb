@@ -184,6 +184,10 @@ func (b *executorBuilder) build(p base.Plan) exec.Executor {
 		return b.buildAdminPlugins(v)
 	case *plannercore.DDL:
 		return b.buildDDL(v)
+	case *plannercore.RefreshMaterializedView:
+		return b.buildRefreshMaterializedView(v)
+	case *plannercore.PurgeMaterializedViewLog:
+		return b.buildPurgeMaterializedViewLog(v)
 	case *plannercore.Deallocate:
 		return b.buildDeallocate(v)
 	case *plannercore.Delete:
@@ -1319,6 +1323,22 @@ func (b *executorBuilder) buildDDL(v *plannercore.DDL) exec.Executor {
 		stmt:         v.Statement,
 		is:           b.is,
 		tempTableDDL: temptable.GetTemporaryTableDDL(b.ctx),
+	}
+	return e
+}
+
+func (b *executorBuilder) buildRefreshMaterializedView(v *plannercore.RefreshMaterializedView) exec.Executor {
+	e := &RefreshMaterializedViewExec{
+		BaseExecutor: exec.NewBaseExecutor(b.ctx, v.Schema(), v.ID()),
+		stmt:         v.Statement,
+	}
+	return e
+}
+
+func (b *executorBuilder) buildPurgeMaterializedViewLog(v *plannercore.PurgeMaterializedViewLog) exec.Executor {
+	e := &PurgeMaterializedViewLogExec{
+		BaseExecutor: exec.NewBaseExecutor(b.ctx, v.Schema(), v.ID()),
+		stmt:         v.Statement,
 	}
 	return e
 }
