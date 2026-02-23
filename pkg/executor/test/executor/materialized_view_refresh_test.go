@@ -87,8 +87,8 @@ func TestMaterializedViewRefreshFastBasic(t *testing.T) {
 	tk.MustExec("create table t (a int not null, b int not null)")
 	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
 	tk.MustExec("create materialized view log on t (a, b) purge immediate")
-	tk.MustExec("create materialized view mv (a, cnt) refresh fast next 300 as select a, count(1) from t group by a")
-	tk.MustQuery("select a, cnt from mv order by a").Check(testkit.Rows("1 2", "2 1"))
+	tk.MustExec("create materialized view mv (a, cnt, s) refresh fast next 300 as select a, count(1), sum(b) from t group by a")
+	tk.MustQuery("select a, cnt, s from mv order by a").Check(testkit.Rows("1 2 15", "2 1 7"))
 
 	is := dom.InfoSchema()
 	mvTable, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("mv"))
@@ -104,11 +104,11 @@ func TestMaterializedViewRefreshFastBasic(t *testing.T) {
 	// Make MV stale by changing base table with insert/update/delete.
 	tk.MustExec("insert into t values (1, 3), (3, 4)")
 	tk.MustExec("delete from t where a = 2 and b = 7")
-	tk.MustExec("update t set a = 2 where a = 1 and b = 5")
-	tk.MustQuery("select a, cnt from mv order by a").Check(testkit.Rows("1 2", "2 1"))
+	tk.MustExec("update t set b = 6 where a = 1 and b = 5")
+	tk.MustQuery("select a, cnt, s from mv order by a").Check(testkit.Rows("1 2 15", "2 1 7"))
 
 	tk.MustExec("refresh materialized view mv fast")
-	tk.MustQuery("select a, cnt from mv order by a").Check(testkit.Rows("1 2", "2 1", "3 1"))
+	tk.MustQuery("select a, cnt, s from mv order by a").Check(testkit.Rows("1 3 19", "3 1 4"))
 
 	newTSRow := tk.MustQuery(fmt.Sprintf("select LAST_SUCCESSFUL_REFRESH_READ_TSO from mysql.tidb_mview_refresh where MVIEW_ID = %d", mviewID)).Rows()
 	require.Len(t, newTSRow, 1)
