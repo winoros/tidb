@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -816,4 +817,32 @@ func assertChangedMask(t *testing.T, chk *chunk.Chunk, ft *types.FieldType, expe
 	err := markChangedRowsByColumn(mask, chk.Column(0), chk.Column(1), ft)
 	require.NoError(t, err)
 	require.Equal(t, expected, mask)
+}
+
+func TestBuildHandleDatumsUsesSourceLayout(t *testing.T) {
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+	chk.AppendInt64(0, 10)  // delta column
+	chk.AppendInt64(1, 100) // mv column
+	chk.AppendInt64(2, 200) // mv column
+	chk.AppendInt64(3, 777) // trailing handle-only column, e.g. _tidb_rowid
+
+	w := &tableResultWriter{
+		exec: &MVDeltaMergeAggExec{
+			TargetHandleCols: plannerutil.NewIntHandleCols(&expression.Column{
+				Index:   3,
+				RetType: ftInt,
+				ID:      -1,
+			}),
+		},
+		inputFieldTypes: fts,
+		handleDatums:    make([]types.Datum, len(fts)),
+	}
+
+	datums, err := w.buildHandleDatums(chk.GetRow(0))
+	require.NoError(t, err)
+	handle, err := w.exec.TargetHandleCols.BuildHandleByDatums(nil, datums)
+	require.NoError(t, err)
+	require.Equal(t, int64(777), handle.IntValue())
 }

@@ -1375,14 +1375,25 @@ func (b *executorBuilder) buildMVDeltaMerge(v *plannercore.MVDeltaMerge) exec.Ex
 		return nil
 	}
 
-	deltaAggColCount := len(sourceFieldTypes) - v.MVColumnCount
+	deltaAggColCount := v.DeltaColumnCount
 	if deltaAggColCount <= 0 {
 		b.err = errors.Errorf(
-			"MVDeltaMerge delta aggregate column count must be positive, got %d (source=%d mv=%d)",
+			"MVDeltaMerge delta aggregate column count must be positive, got %d",
 			deltaAggColCount,
-			len(sourceFieldTypes),
-			v.MVColumnCount,
 		)
+		return nil
+	}
+	if deltaAggColCount+v.MVColumnCount > len(sourceFieldTypes) {
+		b.err = errors.Errorf(
+			"MVDeltaMerge layout exceeds source schema: delta columns=%d, mv columns=%d, source schema len=%d",
+			deltaAggColCount,
+			v.MVColumnCount,
+			len(sourceFieldTypes),
+		)
+		return nil
+	}
+	if v.MVTablePKCols == nil {
+		b.err = errors.New("MVDeltaMerge MVTablePKCols is nil")
 		return nil
 	}
 
@@ -1392,11 +1403,6 @@ func (b *executorBuilder) buildMVDeltaMerge(v *plannercore.MVDeltaMerge) exec.Ex
 		return nil
 	}
 	targetInfo := mvTable.Meta()
-	targetHandleCols, err := buildMVDeltaMergeTargetHandleCols(targetInfo)
-	if err != nil {
-		b.err = err
-		return nil
-	}
 
 	aggMappings, err := buildMVDeltaMergeAggMappings(
 		b.ctx,
@@ -1417,49 +1423,10 @@ func (b *executorBuilder) buildMVDeltaMerge(v *plannercore.MVDeltaMerge) exec.Ex
 		DeltaAggColCount:     deltaAggColCount,
 		TargetTable:          mvTable,
 		TargetInfo:           targetInfo,
-		TargetHandleCols:     targetHandleCols,
+		TargetHandleCols:     v.MVTablePKCols,
 		MinMaxRecompute:      nil,
 		TargetWritableColIDs: nil,
 	}
-}
-
-func buildMVDeltaMergeTargetHandleCols(targetInfo *model.TableInfo) (plannerutil.HandleCols, error) {
-	if targetInfo == nil {
-		return nil, errors.New("MVDeltaMerge target table info is nil")
-	}
-
-	if targetInfo.PKIsHandle {
-		pkCol := targetInfo.GetPkColInfo()
-		if pkCol == nil {
-			return nil, errors.New("MVDeltaMerge target table reports PKIsHandle but primary key column is nil")
-		}
-		return plannerutil.NewIntHandleCols(&expression.Column{
-			Index:   pkCol.Offset,
-			RetType: &pkCol.FieldType,
-			ID:      pkCol.ID,
-		}), nil
-	}
-
-	if targetInfo.IsCommonHandle {
-		pkIdx := tables.FindPrimaryIndex(targetInfo)
-		if pkIdx == nil {
-			return nil, errors.New("MVDeltaMerge target table reports IsCommonHandle but primary index is nil")
-		}
-		tblCols := make([]*expression.Column, len(targetInfo.Columns))
-		for i := range targetInfo.Columns {
-			colInfo := targetInfo.Columns[i]
-			tblCols[i] = &expression.Column{
-				Index:   i,
-				RetType: &colInfo.FieldType,
-				ID:      colInfo.ID,
-			}
-		}
-		return plannerutil.NewCommonHandleCols(targetInfo, pkIdx, tblCols), nil
-	}
-
-	return nil, errors.New(
-		"MVDeltaMerge fast refresh requires target materialized view primary key to be table handle",
-	)
 }
 
 type mvDeltaMergeAggMappingItem struct {
@@ -1495,7 +1462,8 @@ func buildMVDeltaMergeAggMappings(
 
 	sourceColumnCount := len(sourceFieldTypes)
 	mvColumnOffsetBase := deltaAggColCount
-	if sourceColumnCount != mvColumnOffsetBase+mvColumnCount {
+	mvColumnEnd := mvColumnOffsetBase + mvColumnCount
+	if sourceColumnCount < mvColumnEnd {
 		return nil, errors.Errorf(
 			"MVDeltaMerge schema layout mismatch: source columns=%d, delta columns=%d, mv columns=%d",
 			sourceColumnCount,
@@ -1511,13 +1479,13 @@ func buildMVDeltaMergeAggMappings(
 
 	for _, aggInfo := range aggInfos {
 		outputColID := mvColumnOffsetBase + aggInfo.MVOffset
-		if outputColID < mvColumnOffsetBase || outputColID >= sourceColumnCount {
+		if outputColID < mvColumnOffsetBase || outputColID >= mvColumnEnd {
 			return nil, errors.Errorf(
 				"MVDeltaMerge aggregate output column id %d (mv offset %d) is out of range [%d,%d)",
 				outputColID,
 				aggInfo.MVOffset,
 				mvColumnOffsetBase,
-				sourceColumnCount,
+				mvColumnEnd,
 			)
 		}
 		if _, exists := seenOutputColID[outputColID]; exists {

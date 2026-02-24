@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/collate"
 )
 
@@ -32,9 +33,11 @@ func (noopWriter) WriteChunk(context.Context, *MVDeltaMergeAggChunkResult) error
 type tableResultWriter struct {
 	exec *MVDeltaMergeAggExec
 
-	writableCols   []*table.Column
-	writableColIDs []int
-	aggWritableIDs []int
+	writableCols    []*table.Column
+	writableColIDs  []int
+	aggWritableIDs  []int
+	inputFieldTypes []*types.FieldType
+	handleDatums    []types.Datum
 
 	oldRow  []types.Datum
 	newRow  []types.Datum
@@ -73,8 +76,11 @@ func (e *MVDeltaMergeAggExec) buildTableResultWriter() (MVDeltaMergeAggResultWri
 	}
 	for i := 0; i < e.TargetHandleCols.NumCols(); i++ {
 		handleDatumIdx := e.TargetHandleCols.GetCol(i).Index
-		if handleDatumIdx < 0 || handleDatumIdx >= len(writableCols) {
-			return nil, errors.Errorf("TargetHandleCols col index %d out of writable datum range [0,%d)", handleDatumIdx, len(writableCols))
+		if handleDatumIdx < 0 || handleDatumIdx >= len(childTypes) {
+			return nil, errors.Errorf("TargetHandleCols col index %d out of source datum range [0,%d)", handleDatumIdx, len(childTypes))
+		}
+		if childTypes[handleDatumIdx] == nil {
+			return nil, errors.Errorf("TargetHandleCols col index %d type is unavailable", handleDatumIdx)
 		}
 	}
 
@@ -117,13 +123,15 @@ func (e *MVDeltaMergeAggExec) buildTableResultWriter() (MVDeltaMergeAggResultWri
 	}
 
 	return &tableResultWriter{
-		exec:           e,
-		writableCols:   writableCols,
-		writableColIDs: colIDs,
-		aggWritableIDs: aggWritableIDs,
-		oldRow:         make([]types.Datum, len(writableCols)),
-		newRow:         make([]types.Datum, len(writableCols)),
-		touched:        make([]bool, len(writableCols)),
+		exec:            e,
+		writableCols:    writableCols,
+		writableColIDs:  colIDs,
+		aggWritableIDs:  aggWritableIDs,
+		inputFieldTypes: childTypes,
+		handleDatums:    make([]types.Datum, len(childTypes)),
+		oldRow:          make([]types.Datum, len(writableCols)),
+		newRow:          make([]types.Datum, len(writableCols)),
+		touched:         make([]bool, len(writableCols)),
 	}, nil
 }
 
@@ -155,7 +163,11 @@ func (w *tableResultWriter) WriteChunk(ctx context.Context, result *MVDeltaMerge
 			if err := w.buildTouched(); err != nil {
 				return err
 			}
-			handle, err := w.exec.TargetHandleCols.BuildHandleByDatums(stmtCtx, w.oldRow)
+			handleDatums, err := w.buildHandleDatums(result.Input.GetRow(op.RowIdx))
+			if err != nil {
+				return err
+			}
+			handle, err := w.exec.TargetHandleCols.BuildHandleByDatums(stmtCtx, handleDatums)
 			if err != nil {
 				return err
 			}
@@ -163,7 +175,11 @@ func (w *tableResultWriter) WriteChunk(ctx context.Context, result *MVDeltaMerge
 				return err
 			}
 		case MVDeltaMergeAggRowOpDelete:
-			handle, err := w.exec.TargetHandleCols.BuildHandleByDatums(stmtCtx, w.oldRow)
+			handleDatums, err := w.buildHandleDatums(result.Input.GetRow(op.RowIdx))
+			if err != nil {
+				return err
+			}
+			handle, err := w.exec.TargetHandleCols.BuildHandleByDatums(stmtCtx, handleDatums)
 			if err != nil {
 				return err
 			}
@@ -193,6 +209,23 @@ func (w *tableResultWriter) buildRows(result *MVDeltaMergeAggChunkResult, rowIdx
 		w.newRow[writableIdx] = oldDatum
 	}
 	return nil
+}
+
+func (w *tableResultWriter) buildHandleDatums(row chunk.Row) ([]types.Datum, error) {
+	if len(w.inputFieldTypes) != len(w.handleDatums) {
+		return nil, errors.Errorf(
+			"input field types size %d does not match handle datum buffer size %d",
+			len(w.inputFieldTypes),
+			len(w.handleDatums),
+		)
+	}
+	for i, tp := range w.inputFieldTypes {
+		if tp == nil {
+			return nil, errors.Errorf("input field type at index %d is unavailable", i)
+		}
+		w.handleDatums[i] = row.GetDatum(i, tp)
+	}
+	return w.handleDatums, nil
 }
 
 func (w *tableResultWriter) buildTouched() error {
