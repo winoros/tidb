@@ -38,6 +38,7 @@ type tableResultWriter struct {
 	aggWritableIDs  []int
 	inputFieldTypes []*types.FieldType
 	handleDatums    []types.Datum
+	handleInputIdxs []int
 
 	oldRow  []types.Datum
 	newRow  []types.Datum
@@ -74,6 +75,7 @@ func (e *MVDeltaMergeAggExec) buildTableResultWriter() (MVDeltaMergeAggResultWri
 	if len(colIDs) != len(writableCols) {
 		return nil, errors.Errorf("TargetWritableColIDs size %d does not match target writable columns %d", len(colIDs), len(writableCols))
 	}
+	handleInputIdxs := make([]int, e.TargetHandleCols.NumCols())
 	for i := 0; i < e.TargetHandleCols.NumCols(); i++ {
 		handleDatumIdx := e.TargetHandleCols.GetCol(i).Index
 		if handleDatumIdx < 0 || handleDatumIdx >= len(childTypes) {
@@ -82,6 +84,7 @@ func (e *MVDeltaMergeAggExec) buildTableResultWriter() (MVDeltaMergeAggResultWri
 		if childTypes[handleDatumIdx] == nil {
 			return nil, errors.Errorf("TargetHandleCols col index %d type is unavailable", handleDatumIdx)
 		}
+		handleInputIdxs[i] = handleDatumIdx
 	}
 
 	output2Writable := make([]int, len(childTypes))
@@ -129,6 +132,7 @@ func (e *MVDeltaMergeAggExec) buildTableResultWriter() (MVDeltaMergeAggResultWri
 		aggWritableIDs:  aggWritableIDs,
 		inputFieldTypes: childTypes,
 		handleDatums:    make([]types.Datum, len(childTypes)),
+		handleInputIdxs: handleInputIdxs,
 		oldRow:          make([]types.Datum, len(writableCols)),
 		newRow:          make([]types.Datum, len(writableCols)),
 		touched:         make([]bool, len(writableCols)),
@@ -219,11 +223,12 @@ func (w *tableResultWriter) buildHandleDatums(row chunk.Row) ([]types.Datum, err
 			len(w.handleDatums),
 		)
 	}
-	for i, tp := range w.inputFieldTypes {
+	for _, idx := range w.handleInputIdxs {
+		tp := w.inputFieldTypes[idx]
 		if tp == nil {
-			return nil, errors.Errorf("input field type at index %d is unavailable", i)
+			return nil, errors.Errorf("input field type at index %d is unavailable", idx)
 		}
-		w.handleDatums[i] = row.GetDatum(i, tp)
+		w.handleDatums[idx] = row.GetDatum(idx, tp)
 	}
 	return w.handleDatums, nil
 }

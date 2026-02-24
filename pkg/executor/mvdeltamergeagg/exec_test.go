@@ -838,6 +838,7 @@ func TestBuildHandleDatumsUsesSourceLayout(t *testing.T) {
 		},
 		inputFieldTypes: fts,
 		handleDatums:    make([]types.Datum, len(fts)),
+		handleInputIdxs: []int{3},
 	}
 
 	datums, err := w.buildHandleDatums(chk.GetRow(0))
