@@ -1454,17 +1454,26 @@ func buildFullUpdateLookupTemplateSelect(
 	}
 
 	fields := make([]*ast.SelectField, 0, len(mvCols))
-	for mvOffset, mvCol := range mvCols {
-		// Full-update fallback only returns group keys and MIN/MAX aggregate columns.
-		if kind, ok := aggKindByMVOffset[mvOffset]; ok && kind != AggMin && kind != AggMax {
-			continue
-		}
-		outColName := mvCol.Name.O
-		if baseColName, ok := groupKeyBaseColByMVOffset[mvOffset]; ok {
-			outColName = baseColName
-		}
+	// Keep full-update template output order stable for executor-side consumption:
+	// group keys first, then MIN/MAX aggregates.
+	for _, mvOffset := range groupKeyOffsets {
+		mvCol := mvCols[mvOffset]
+		outColName := groupKeyBaseColByMVOffset[mvOffset]
 		fields = append(fields, &ast.SelectField{
 			Expr:   qualColExpr(fullUpdateInnerAlias, outColName),
+			AsName: mvCol.Name,
+		})
+	}
+	for mvOffset, mvCol := range mvCols {
+		if _, ok := groupKeySet[mvOffset]; ok {
+			continue
+		}
+		kind, ok := aggKindByMVOffset[mvOffset]
+		if !ok || (kind != AggMin && kind != AggMax) {
+			continue
+		}
+		fields = append(fields, &ast.SelectField{
+			Expr:   qualColExpr(fullUpdateInnerAlias, mvCol.Name.O),
 			AsName: mvCol.Name,
 		})
 	}
@@ -1565,16 +1574,18 @@ func buildFullUpdateLookupInnerSelect(
 	}
 
 	fields := make([]*ast.SelectField, 0, len(mvCols))
+	for _, mvOffset := range groupKeyOffsets {
+		baseColExpr, err := groupKeyBaseColExprAtOffset(mvSel, mvOffset)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, &ast.SelectField{
+			Expr:   baseColExpr,
+			AsName: pmodel.NewCIStr(groupKeyBaseColByMVOffset[mvOffset]),
+		})
+	}
 	for i, mvCol := range mvCols {
 		if _, ok := groupKeySet[i]; ok {
-			baseColExpr, err := groupKeyBaseColExprAtOffset(mvSel, i)
-			if err != nil {
-				return nil, err
-			}
-			fields = append(fields, &ast.SelectField{
-				Expr:   baseColExpr,
-				AsName: pmodel.NewCIStr(groupKeyBaseColByMVOffset[i]),
-			})
 			continue
 		}
 		ac, ok := aggByMVOffset[i]
