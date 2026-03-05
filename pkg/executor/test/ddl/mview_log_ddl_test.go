@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/errno"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -34,7 +36,7 @@ func TestCreateMaterializedViewLogBasic(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("create table t (a int, b int)")
 
-	tk.MustExec("create materialized view log on t (a) purge start with '2026-01-02 03:04:05' next 600")
+	tk.MustExec("create materialized view log on t (a) purge start with cast('2026-01-02 03:04:05' as datetime) next cast('2026-01-02 03:14:05' as datetime)")
 
 	// Physical table created.
 	tk.MustQuery("select count(*) from information_schema.tables where table_schema='test' and table_name='$mlog$t'").Check(testkit.Rows("1"))
@@ -53,8 +55,8 @@ func TestCreateMaterializedViewLogBasic(t *testing.T) {
 	require.Equal(t, baseTable.Meta().ID, mlogInfo.BaseTableID)
 	require.Equal(t, []pmodel.CIStr{pmodel.NewCIStr("a")}, mlogInfo.Columns)
 	require.Equal(t, "DEFERRED", mlogInfo.PurgeMethod)
-	require.Equal(t, "'2026-01-02 03:04:05'", mlogInfo.PurgeStartWith)
-	require.Equal(t, "600", mlogInfo.PurgeNext)
+	require.Equal(t, "CAST('2026-01-02 03:04:05' AS DATETIME)", mlogInfo.PurgeStartWith)
+	require.Equal(t, "CAST('2026-01-02 03:14:05' AS DATETIME)", mlogInfo.PurgeNext)
 
 	// Meta columns should exist on the log table.
 	dmlTypeColName := pmodel.NewCIStr("_MLOG$_DML_TYPE")
@@ -75,6 +77,53 @@ func TestCreateMaterializedViewLogBasic(t *testing.T) {
 
 	// Duplicated MV LOG should fail (same derived table name).
 	tk.MustGetErrMsg("create materialized view log on t (a)", "[schema:1050]Table 'test.$mlog$t' already exists")
+}
+
+func TestCreateMaterializedViewLogPreSplitOptions(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	originSplit := atomic.LoadUint32(&ddl.EnableSplitTableRegion)
+	atomic.StoreUint32(&ddl.EnableSplitTableRegion, 1)
+	defer atomic.StoreUint32(&ddl.EnableSplitTableRegion, originSplit)
+	tk.MustExec("set @@session.tidb_scatter_region='table'")
+	tk.MustExec("create table t_mlog_presplit (a int, b int)")
+
+	tk.MustExec("create materialized view log on t_mlog_presplit (a) shard_row_id_bits = 2 pre_split_regions = 2 purge immediate")
+
+	showCreate := tk.MustQuery("show create table `$mlog$t_mlog_presplit`").Rows()[0][1].(string)
+	require.Contains(t, showCreate, "SHARD_ROW_ID_BITS=2")
+	require.Contains(t, showCreate, "PRE_SPLIT_REGIONS=2")
+
+	is := dom.InfoSchema()
+	mlogTable, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("$mlog$t_mlog_presplit"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), mlogTable.Meta().ShardRowIDBits)
+	require.Equal(t, uint64(2), mlogTable.Meta().PreSplitRegions)
+
+	regions := tk.MustQuery("show table `$mlog$t_mlog_presplit` regions").Rows()
+	regionNames := make([]string, 0, len(regions))
+	for _, row := range regions {
+		regionNames = append(regionNames, fmt.Sprint(row[1]))
+	}
+	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_2305843009213693952", mlogTable.Meta().ID))
+	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_4611686018427387904", mlogTable.Meta().ID))
+	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_6917529027641081856", mlogTable.Meta().ID))
+}
+
+func TestCreateMaterializedViewLogPurgeExprTypeValidation(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int, b int)")
+
+	err := tk.ExecToErr("create materialized view log on t (a) purge start with 1 next now()")
+	require.ErrorContains(t, err, "PURGE START WITH expression must return DATETIME/TIMESTAMP")
+
+	err = tk.ExecToErr("create materialized view log on t (a) purge next 600")
+	require.ErrorContains(t, err, "PURGE NEXT expression must return DATETIME/TIMESTAMP")
+
+	tk.MustExec("create materialized view log on t (a) purge start with now() next now()")
 }
 
 func TestCreateMaterializedViewLogMetaColumnNameConflict(t *testing.T) {
@@ -135,7 +184,7 @@ func TestTruncateMaterializedViewRelatedTablesRejected(t *testing.T) {
 	tk.MustExec("create table t_truncate_mv (a int not null, b int)")
 	tk.MustExec("create materialized view log on t_truncate_mv (a, b)")
 
-	tk.MustExec("create materialized view mv_truncate_mv (a, cnt) refresh fast next 300 as select a, count(1) from t_truncate_mv group by a")
+	tk.MustExec("create materialized view mv_truncate_mv (a, cnt) refresh fast next now() as select a, count(1) from t_truncate_mv group by a")
 
 	err := tk.ExecToErr("truncate table mv_truncate_mv")
 	require.ErrorContains(t, err, "TRUNCATE TABLE on materialized view table")
@@ -150,7 +199,7 @@ func TestMaterializedViewRelatedTablesDDLRejected(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("create table t_ddl_mv (a int not null, b int)")
 	tk.MustExec("create materialized view log on t_ddl_mv (a, b)")
-	tk.MustExec("create materialized view mv_ddl_mv (a, cnt) refresh fast next 300 as select a, count(1) from t_ddl_mv group by a")
+	tk.MustExec("create materialized view mv_ddl_mv (a, cnt) refresh fast next now() as select a, count(1) from t_ddl_mv group by a")
 
 	err := tk.ExecToErr("alter table t_ddl_mv add column c int")
 	require.ErrorContains(t, err, "ALTER TABLE on base table with materialized view dependencies")
