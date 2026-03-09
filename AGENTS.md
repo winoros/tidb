@@ -21,23 +21,22 @@ This file provides guidance to agents working in this repository.
 
 | Task | Required action |
 | --- | --- |
-| Added/moved/renamed/removed Go files, changed Bazel files, updated Bazel test targets, or changed `go.mod`/`go.sum` | MUST run `make bazel_prepare` and include resulting Bazel metadata changes in the PR (for example `BUILD.bazel`, `**/*.bazel`, and `**/*.bzl`). |
-| Running package unit tests | SHOULD run targeted tests and avoid full-package runs unless needed (see `docs/agents/testing-flow.md` -> `Unit tests`). |
+| Added/moved/renamed/removed/edited Go files, changed Bazel files, updated Bazel test targets, or changed `go.mod`/`go.sum` | MUST run `make bazel_prepare` and include resulting Bazel metadata changes in the PR (for example `BUILD.bazel`, `**/*.bazel`, and `**/*.bzl`). |
+| Running package unit tests | SHOULD run targeted tests (`go test -run <TestName> -tags=intest,deadlock`) and avoid full-package runs unless needed. |
 | Unit tests in a package that uses failpoints | MUST enable failpoints before tests and disable afterward (see `docs/agents/testing-flow.md` -> `Failpoint decision for unit tests`). |
-| Recording integration tests | MUST use the recording command in `docs/agents/testing-flow.md` -> `Integration tests` (not `-record`; `-record` is for unit-test suites that explicitly support it). |
-| RealTiKV tests | MUST start playground in background, run tests, then clean up playground/data (see `docs/agents/testing-flow.md` -> `RealTiKV tests`). |
+| Recording integration tests | MUST use the recording command in `docs/agents/testing-flow.md` -> `Integration tests` (`pushd tests/integrationtest && ./run-tests.sh -r <TestName> && popd`; not `-record`). |
+| RealTiKV tests | MUST start playground in background, run tests, then clean up playground/data (see `docs/agents/testing-flow.md`). |
 | Bug fix | MUST add a regression test and verify it fails before fix and passes after fix. |
 | Fmt-only PR | MUST NOT run costly `realtikvtest`; local compilation is enough. |
 | During local coding iterations (not claiming completion) | SHOULD use the `WIP` verification profile from `.agents/skills/tidb-verify-profile` to run only scoped checks. |
 | Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, this includes `make lint`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
-| Before finishing | SHOULD self-review diff quality before finishing. |
+| Before finishing | SHOULD self-review diff quality before finishing, following `tidb-code-style` skill's `comment-guide.md`. |
 | Expensive optional sweeps (for example `make bazel_lint_changed`, broad package runs) | MUST run only when required by change scope, CI reproduction, or explicit user request. |
 
 ### Skills
 
-- Repository-level skills are maintained under `.agents/skills` (relative to the repository root / current working directory).
-- Keep skill content and references together under each skill folder (for example: `.agents/skills/<skill>/SKILL.md` and `.agents/skills/<skill>/references/`).
-- `.github/skills` is kept only as a migration note path and should not be used as the primary location for new skill updates.
+- Skills are maintained under `.agents/skills/<skill>/SKILL.md`, with references in `.agents/skills/<skill>/references/`.
+- `.github/skills` is deprecated; do not use for new skills.
 - Policy belongs in `AGENTS.md`; detailed command playbooks SHOULD live in `docs/agents/*`, and skills SHOULD provide entrypoint workflows that reference those playbooks.
 - Operational testing/build skills are indexed in `.agents/skills/README.md` to avoid duplicated lists drifting in multiple docs.
 
@@ -79,7 +78,7 @@ Run `make bazel_prepare` before building when any of the following is true:
 
 - New workspace or fresh clone.
 - Bazel-related files changed (for example `WORKSPACE`, `DEPS.bzl`, `BUILD.bazel`, `MODULE.bazel`, `MODULE.bazel.lock`).
-- Any Go source file is added/removed/renamed/moved in the PR.
+- Any Go source file is added/removed/renamed/moved/edited in the PR.
 - Go module dependencies changed (for example `go.mod`, `go.sum`), including adding third-party dependencies.
 - Bazel test targets were updated (for example `shard_count` changed, test `srcs` list edited, or `tests/realtikvtest/**/BUILD.bazel` modified).
 - Local Bazel dependency/toolchain errors occurred.
@@ -129,34 +128,11 @@ Command details for package, integration-test, and RealTiKV surfaces live in `do
 
 ## Code Style Guide
 
-### Go and backend code
-
-- Because TiDB is a complex system, code SHOULD remain maintainable for future readers with basic TiDB familiarity, including readers who are not experts in the specific subsystem/feature.
-- Follow existing package-local conventions first and keep style consistent with nearby files.
-- Code SHOULD be self-documenting through clear naming and structure.
-  - Example: when implementing a well-known algorithm, naming SHOULD be clear enough to make the approach recognizable; if naming alone may not make intent obvious, add a brief comment.
-- Keep changes focused; avoid unrelated refactors, renames, or moves in the same PR.
-- Keep error handling actionable and contextual; avoid silently swallowing errors.
-- For new source files (for example `*.go`), include the standard TiDB license header (copyright + Apache 2.0) by copying from a nearby file and updating year if needed.
-- Comments SHOULD explain non-obvious intent, constraints, invariants, concurrency guarantees, SQL/compatibility contracts, or important performance trade-offs, and SHOULD NOT restate what the code already makes clear.
-- Keep exported-symbol doc comments, and prefer semantic constraints over name restatement.
-
-### Tests and testdata
-
-- Prefer extending existing test suites and fixtures over creating new scaffolding.
-- Keep test changes minimal and deterministic; avoid broad golden/testdata churn unless required.
-- Follow `.agents/skills/tidb-test-guidelines` for placement, naming, `shard_count` guidance, planner-specific casetest rules, and related testdata conventions.
-- When recording outputs, verify changed result files before reporting completion.
-
-### Docs and command snippets
-
-- Commands in docs SHOULD be copy-pasteable from repository root unless explicitly scoped.
-- Use explicit placeholders such as `<package_name>`, `<TestName>`, and `<dir>`.
-- Documentation updates SHOULD keep terminology, policy wording, and command conventions consistent across related docs.
-- Keep guidance executable and concrete; avoid ambiguous phrasing.
-- Issues and PRs MUST be written in English (title and description).
+Full code style rules (Go conventions, test/testdata style, docs style, and the comment style) live in the `tidb-code-style` skill. That skill MUST be consulted when writing, reviewing, or modifying any code, tests, comments, or documentation.
 
 ## Issue and PR Rules
+
+- Issues and PRs MUST be written in English (title and description).
 
 ### Issue rules
 

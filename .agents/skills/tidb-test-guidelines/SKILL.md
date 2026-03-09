@@ -1,6 +1,6 @@
 ---
 name: tidb-test-guidelines
-description: Decide where to place TiDB tests and how to write them (basic structure, naming, testdata usage). Use when asked about test locations, writing conventions, shard_count limits, casetest categorization, or when reviewing test changes in code review.
+description: Primary guide for where to place TiDB tests and how to write them (basic structure, naming, fixtures, testdata usage, recording workflow, shard_count, and casetest categorization). Use when asked about test locations, writing conventions, or when reviewing test changes in code review.
 ---
 
 # TiDB Test Placement and Writing
@@ -17,6 +17,7 @@ description: Decide where to place TiDB tests and how to write them (basic struc
 
 - Benchmarks (`func BenchmarkXxx`) follow the same placement and naming rules, but do not count toward the directory test-count target.
 - Prefer table-driven tests for related scenarios in the same behavior area.
+- Prefer extending existing test suites and fixtures over creating new scaffolding.
 - Reuse existing helper setups and test fixtures; avoid re-creating schemas unless required.
 - Prefer one `store` + one `tk` per test; when a single test covers multiple scenarios, use distinct table names and restore any session/system variables to their original values.
 - If a test must use multiple sessions or domains (for example, cross-session cache behavior), keep the extra stores/testkits but document why in the test.
@@ -36,7 +37,10 @@ description: Decide where to place TiDB tests and how to write them (basic struc
 
 ## Package-specific notes
 
-- Use existing testdata patterns (`*_in.json`, `*_out.json`, `*_xut.json`) in the same directory when extending suites. Use `-record -tags=intest,deadlock` only when the Go test suite explicitly supports `-record` and you need to regenerate outputs. For `tests/integrationtest`, use the recording command in `docs/agents/testing-flow.md` -> `Integration tests` (not `-record`).
+- Apply the same rules (placement, shard_count, naming) to other packages beyond `pkg/planner`.
+- Keep planner testdata organized by separating DDL setup from SQL-only test inputs, and follow the existing file-naming conventions in the target test package.
+- Use existing testdata patterns (`*_in.json`, `*_out.json`, `*_xut.json`) in the same directory when extending suites. Use `-record -tags=intest,deadlock` only when the Go test suite explicitly supports `-record` and you need to regenerate outputs. For `tests/integrationtest`, use the recording command in `docs/agents/testing-flow.md` -> `Integration tests` (`pushd tests/integrationtest && ./run-tests.sh -r <TestName> && popd`; not `-record`).
+- When recording outputs, review the changed result files before reporting completion.
 - For `pkg/planner/core/casetest/rule` predicate pushdown cases, keep SQL in `predicate_pushdown_suite_in.json` and record both `EXPLAIN format='brief'` and query results via the test runner (see `rule_predicate_pushdown_test.go`).
 - When moving benchmarks between packages, update any `TestBenchDaily` wrappers that list them and keep `Makefile` `bench-daily` entries aligned with the new package location.
 - When updating tests in any `pkg/*` package, update the corresponding case map under `references/` if it exists; do not block on missing case maps.
