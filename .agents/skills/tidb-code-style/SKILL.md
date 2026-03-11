@@ -34,6 +34,7 @@ description: Code style and conventions for Go code, tests, testdata, comments, 
 - `//nolint` directives MUST include the linter name and a brief reason (for example `//nolint:errcheck // intentionally ignoring Close error on read-only file`).
 - For new source files (for example `*.go`), include the standard TiDB license header (copyright + Apache 2.0) by copying from a nearby file and updating year if needed.
 - Comment style (general and maintenance comments) MUST follow `references/comment-guide.md`. Writing clear, sufficient comments is a core quality requirement — do not skip necessary comments for changed code to save time or reduce diff size.
+- Follow `references/comment-review-checklist.md` when reviewing comments in a diff, and use `references/commenting-examples.md` for guidance on when and how to write maintenance comments.
 
 ## Tests and testdata
 
@@ -50,3 +51,5 @@ description: Code style and conventions for Go code, tests, testdata, comments, 
 ## Reference files
 
 - **Comment guide**: `references/comment-guide.md`
+- **Commenting examples**: `references/commenting-examples.md`
+- **Comment review checklist**: `references/comment-review-checklist.md`

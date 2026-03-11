@@ -30,7 +30,7 @@ This file provides guidance to agents working in this repository.
 | Fmt-only PR | MUST NOT run costly `realtikvtest`; local compilation is enough. |
 | During local coding iterations (not claiming completion) | SHOULD use the `WIP` verification profile from `.agents/skills/tidb-verify-profile` to run only scoped checks. |
 | Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, this includes `make lint`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
-| Before finishing | SHOULD self-review diff quality before finishing, following `tidb-code-style` skill's `comment-guide.md`. |
+| Before finishing | MUST run `make lint` if there are code changes. MUST self-review diff quality, following `tidb-code-style` skill. |
 | Expensive optional sweeps (for example `make bazel_lint_changed`, broad package runs) | MUST run only when required by change scope, CI reproduction, or explicit user request. |
 
 ### Skills

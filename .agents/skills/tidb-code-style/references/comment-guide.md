@@ -1,225 +1,265 @@
-# Comment Guide
+# Commenting Standards
 
-## General Rules
+This file is the normative source for comment rules in Go and protobuf source files.
 
-These rules apply to all comments in the codebase. The Maintenance Comments section below adds structure for a specific subset of changes.
+For examples, see `./commenting-examples.md`.
+For a compact review checklist, see `./comment-review-checklist.md`.
 
-### Core Principles
+If either file conflicts with this one, this file wins.
 
-- Comments SHOULD explain non-obvious intent, constraints, invariants, concurrency guarantees, SQL/compatibility contracts, or important performance trade-offs, and SHOULD NOT restate what the code already makes clear.
-- Explain **why**, not **what**. If the code communicates what it does, the comment should add the reasoning or constraint behind the choice.
-- Keep exported-symbol doc comments, and prefer semantic constraints over name restatement.
+## Scope
 
-### Formatting
+- This file applies to Go and protobuf source files.
+- Reuse the content rules in other languages when helpful, but do not blindly apply Go doc-comment conventions outside Go.
+- Exported-symbol requirements in this file are Go-specific.
 
-**Block comments** (standalone line above code) use complete sentences with capitalization and terminal punctuation:
+## Intent
+
+Comments preserve maintenance-critical knowledge that the code alone does not reliably communicate.
+
+The goal is not to maximize comment count. The goal is to avoid forcing future readers to reconstruct hidden contracts from tests, PR text, issue history, or scattered helper logic.
+
+## Default Posture
+
+- Do not narrate routine code.
+- For routine local code, prefer no new comment over a weak comment.
+- When a change touches a high-risk surface or introduces a non-obvious contract, prefer a short contract comment over silence.
+- In those cases, omission is a correctness and maintenance problem, not a style nit.
+- A maintenance comment is not a special tag or syntax. It is an ordinary doc comment or block comment whose content preserves a maintenance contract that would otherwise be easy to lose.
+
+## Mandatory Comment Triggers
+
+You **must** add or update a comment when a change does any of the following:
+
+- changes a caller-visible guarantee, invariant, precondition, postcondition, or side effect
+- introduces or changes a conservative boundary, approximation, lossy transformation, unsupported case, or intentional incompleteness
+- makes two related outputs, helpers, code paths, or result shapes intentionally different in scope or guarantees
+- encodes a non-obvious semantic boundary, compatibility rule, or conservative classification in a table, matrix, enum, allowlist, denylist, switch, threshold, or "magic" constant
+- relies on ordering, ownership, lifecycle, invalidation, caching, visibility, atomicity, or lock assumptions that are not obvious from the code
+- changes persisted metadata, on-disk layouts, wire formats, protobuf meaning, schema semantics, or mixed-version / rolling-upgrade behavior
+- relies on a proof idea, phase structure, or state-transition argument concentrated in one complex function
+- would require a reviewer to read tests, PR text, issue history, or multiple helpers to recover the contract
+
+If a trigger fires, silence is usually worse than a short precise comment.
+
+## Quick Decision Flow
+
+Check in this order:
+
+1. **Is this an exported Go symbol?**
+   - If yes, it must have a doc comment even when no mandatory trigger fires.
+   - Then decide whether that doc comment also needs to carry any maintenance contract from the triggers below.
+
+2. **Did a mandatory trigger fire?**
+   - If yes, add or update a comment.
+   - Do not skip the comment just because the code looks locally readable.
+
+3. **What is the shortest sufficient form?**
+   Prefer the smallest form that preserves the contract:
+   - inline comment
+   - short local block comment
+   - doc comment on a function or type
+   - overview/design comment
+
+4. **Where should the comment live?**
+   Put it at the narrowest scope that explains the contract once.
+
+5. **Is the rationale uncertain?**
+   - Do not guess.
+   - Document the observable contract, boundary, ordering, or compatibility rule instead of speculating about motivation.
+
+6. **No exported-symbol requirement applies, no trigger fired, and no nearby comment became stale?**
+   - Do not add a new comment.
+
+## Sufficiency Test
+
+A comment is sufficient only if a future maintainer can answer the relevant questions **without reading tests first**:
+
+- What guarantee or invariant matters here?
+- Where is the conservative, unsupported, or compatibility boundary?
+- Why are nearby similar-looking choices, outputs, or paths **not** equivalent?
+- What must remain in sync if this logic changes?
+
+If the answer would still require reverse-engineering from tests or helper call graphs, the comment is too weak or placed too low.
+
+## Comment Escalation Ladder
+
+When a comment is required, prefer the shortest sufficient form:
+
+1. **Inline comment**
+   Use for a single local fact.
+
+   Example:
+   ```go
+   resp, err := client.Send(ctx, req) // nil resp is valid when err != nil
+   ```
+
+2. **Short local block comment**
+   Use for one branch, boundary, or ordering constraint.
+   A few lines are usually enough.
+
+3. **Doc comment on a function, type, or enum**
+   Use when the contract is owned by one entrypoint or declaration.
+
+4. **Overview/design comment**
+   Use only when one model or boundary spans multiple helpers and no narrower anchor can explain it once.
+
+Do not jump to a file-level overview when a short function or type comment would be enough.
+
+## Core Rules
+
+- Explain **why**, not **what**.
+- Do not restate what the code already makes clear.
+- Exported Go symbols **must** have doc comments. Keep them accurate when behavior, guarantees, or signatures change.
+- Prefer semantic constraints, invariants, and caller-visible guarantees over name restatement.
+- When changing behavior, update or remove nearby stale comments in the same diff. Incorrect comments are bugs.
+- Do not invent intent, history, or performance rationale that is not supported by the code, tests, nearby design docs, or the task context.
+- If a reviewer would reasonably ask "why is this not simpler?" and the answer is non-obvious, capture that answer in a short comment near the owning scope.
+
+## Formatting
+
+**Block comments** use complete sentences with capitalization and terminal punctuation.
 
 ```go
-// BuildKeyRanges constructs the key ranges for the given index scan.
+// BuildKeyRanges constructs key ranges for the given index scan.
+//
 // It returns an empty slice when no valid range can be derived.
 ```
 
-**Inline comments** (end of code line) are lowercase without terminal punctuation:
+**Inline comments** are brief fragments, usually lowercase, and do not need terminal punctuation.
 
 ```go
 resp, err := client.Send(ctx, req) // nil resp is valid when err != nil
 ```
 
-### Placement Principles
+Additional formatting rules:
 
-Choose the location that explains the concept once and avoids duplication:
+- Do not translate the code line by line into comments.
+- In Go doc comments, start with the documented symbol name when practical.
+- Keep wording concrete. Name the guarantee, boundary, incompatibility, or invariant directly.
+- Prefer a short accurate comment over no comment when a mandatory trigger fires.
+- Prefer a short accurate comment over a long narrative when a short comment is sufficient.
+
+## Placement
+
+Choose the narrowest location that explains the contract once and avoids duplication.
 
 | Location | Focus |
-|----------|-------|
-| Package / file level | High-level design, module purpose. MUST be understandable without prior knowledge of the code. |
-| Struct / type declaration | Purpose, lifecycle, invariants, field relationships. For interfaces, MUST document the overall contract on the type and describe each method's behavior and preconditions. |
-| Function declaration | Inputs, outputs, contract, preconditions. Do NOT re-explain the data structures. |
-| Function body | Algorithm phases, non-obvious branches, reasoning behind specific logic. |
+|---|---|
+| Overview / design level | High-level design, semantic model, compatibility boundary, conservative boundary, or other maintenance context readers need before the relevant code |
+| Struct / type declaration | Purpose, lifecycle, invariants, field relationships, ownership, initialization expectations, and overall contract |
+| Function declaration | Inputs, outputs, preconditions, side effects, and caller-visible guarantees |
+| Function body | Algorithm phases, surprising branches, local reasoning, ordering constraints, or non-obvious safety / performance constraints |
 
-### Protobuf
+Additional placement rules:
 
-TiDB's protobuf definitions mostly live in external repositories (for example `tipb`, `kvproto`). When adding or modifying `.proto` messages in-tree, follow the same principles as struct comments: document purpose, field semantics, and enum value meanings including intentionally unused or reserved values.
+- Use overview/design comments sparingly.
+- Prefer the narrowest scope that explains the contract once.
+- Place an overview/design comment near the top of the file only when no narrower location can express the design clearly without duplication or loss of context.
+- Do not add an overview/design comment for length alone or as a generic file summary.
+- A **comment set** may span two nearby scopes when that is clearer than repetition. For example, a type comment may define two concepts and a function comment may document the caller-visible split between them.
+- Do not duplicate the full explanation at overview, type, and function level. State the governing distinction once; keep local comments shorter.
+- If a classification table or enum defines a wider contract than its declaration alone reveals, document the contract on the owner that interprets it, not only on the data declaration.
+
+## Interfaces and Schemas
+
+- For interfaces, document the overall contract on the type.
+- Document individual methods only when behavior, preconditions, ownership, concurrency, or error semantics are not obvious from the name and signature.
+- For stateful structs, document ownership, initialization, who mutates the fields, and when the state becomes invalid or obsolete when that information matters for safe maintenance.
+- For schema-like definitions such as protobuf messages, enums, wire-format structs, persisted metadata layouts, or on-disk state, document purpose, field semantics, enum meanings, versioning constraints, and reserved or intentionally unused values when they affect compatibility.
 
 ## Maintenance Comments
 
-For most code, the general rules above are sufficient.
-This section adds structure for the subset of changes where a plain doc comment is not enough.
+For most code, the general rules above are sufficient. Use maintenance comments only when a plain doc comment would fail to preserve a maintenance-critical contract.
 
 ### When to Use
 
-Use maintenance comments when a change introduces any of the following:
+Add maintenance documentation when a change does any of the following:
 
-- A proof strategy or semantic model that spans multiple helpers in one file.
-- A sound-but-conservative algorithm where missing precision is intentional.
-- An allowlist/denylist/classification table whose omissions change optimization behavior.
-- Two nearby helpers or result shapes that sound similar but guarantee different things.
-- A hidden coupling between code structure and tests/update workflow that future maintainers could easily miss.
+- introduces or changes a conservative boundary, unsupported case, or intentional loss of precision
+- introduces or changes a classification table, rule matrix, allowlist, or denylist
+- defines related outputs, helpers, or result shapes with different guarantees or scopes
+- relies on a semantic model or invariant that spans multiple helpers in one file
+- relies on a phase structure, state-transition argument, or safety proof concentrated in one complex function
+- introduces hidden coupling where future edits must update multiple pieces together
+- introduces a rule that is easy to violate by "simplifying" similar-looking code
+
+### High-Risk Surfaces
+
+Bias toward documenting the contract when a change touches any of the following:
+
+- persisted metadata or on-disk layouts
+- wire, RPC, protobuf, or schema compatibility
+- rolling-upgrade or mixed-version behavior
+- version-gated or feature-gated semantics
+- ownership, lifecycle, invalidation, or caching boundaries
+- concurrency ordering, lock assumptions, memory visibility, or retry semantics
+- planner, optimizer, classification, or pruning logic with conservative precision boundaries
+- asymmetry between fast paths, fallback paths, sync / async paths, or local / distributed paths
 
 ### When NOT to Use
 
-Do not apply this section to every comment. These common cases need only standard doc comments:
+Do not use maintenance comments for:
 
-- A function/type whose name and signature already make the contract clear (standard godoc is enough).
-- A single-branch edge-case comment that does not affect cross-cutting invariants.
-- TODO/FIXME notes about future cleanup — use `// TODO(owner-or-issue): description` so TODOs can be tracked and prioritized.
-- One-liner clarifications on non-obvious syntax, library usage, or performance micro-optimization.
+- a function or type whose contract is already clear from an ordinary doc comment
+- a single local edge-case note that does not affect wider guarantees
+- TODO/FIXME notes about future cleanup; use `TODO(owner-or-issue): description`
+- one-line clarifications on non-obvious syntax, library usage, or small performance details
+- generic reminders such as "update tests too" when the coupling is already obvious from the diff
 
-If the code has no conservative boundary, no split guarantees, and no hidden test coupling, a plain doc comment satisfies the general rules and this section does not apply.
+If the code has no conservative boundary, no split guarantees, no hidden coupling, and no reviewer would need outside context to understand it, a normal doc comment or no new comment is enough.
+
+### Required Content
+
+For a change that needs maintenance documentation, the chosen comment set must make the following discoverable **without reading tests first**:
+
+1. the guarantee, invariant, or contract being enforced
+2. any intentionally conservative, incomplete, lossy, or unsupported boundary
+3. any distinction between related outputs, branches, phases, or result shapes that future readers might otherwise collapse
+4. any non-obvious ordering, ownership, lifecycle, or compatibility constraint
+5. any hidden coupling that future edits must update together, but only when that coupling is a real maintenance risk
+
+Not every individual comment must restate all five points. The requirement applies to the chosen comment set as a whole.
 
 ### Placement Rules
 
 Prefer the closest location that explains the whole maintenance contract once:
 
-1. File-level overview comment.
-   Use when one conceptual model drives multiple helpers in the file.
-   Place it below imports and above the first helper/type.
-2. Entrypoint-level comment.
-   Use when one exported API or one internal owner helper owns the contract.
-   Place it on the function/type that callers will start from.
-3. Local branch/block comment.
-   Use only for one surprising branch that would still be unclear after the higher-level comment.
+1. **Overview/design comment**
 
-Classification tables are not local-branch exceptions. If an allowlist/denylist
-defines a file-wide safety or precision boundary, document that contract at
-file level or on the entrypoint that consults the table, not only on
-the table declaration itself.
+   Use when one conceptual model, compatibility boundary, algorithm, or conservative boundary governs the relevant code.
 
-Do not duplicate the full explanation in all three places. Write the overview once, then let shorter local comments point back to the key distinction.
+2. **Entrypoint-level comment**
 
-### Required Content
+   Use when one exported API, one type, or one internal owner helper owns the contract.
 
-A maintenance comment should make these questions easy to answer:
+3. **Local branch/block comment**
 
-1. What guarantee is this code proving or enforcing?
-2. What boundary is intentionally conservative, incomplete, or unsupported?
-3. What kind of future change must update code, comment, and tests together?
+   Use only for one surprising branch, proof step, or ordering argument that would still be unclear after the higher-level comment.
 
-If the change defines two related outputs with different scopes, name that distinction directly instead of relying on test names or PR context.
+Additional placement rules:
 
-See Examples A–C below for real-world applications of these questions.
-These examples illustrate the upper end of comment detail; most code only needs the General Rules above.
+- Classification tables are not local-branch exceptions. If a table defines a wider safety, compatibility, or precision boundary, document that contract at overview/design level or on the entrypoint that consults the table, not only on the table declaration itself.
+- Do not duplicate the full explanation in all three places. Write the governing distinction once, then let shorter local comments point back to it.
 
-### Anti-Patterns
+## Anti-Patterns
 
-Avoid these, because they cause rework later:
+Avoid these patterns:
 
-- Hiding the real contract only in tests or PR descriptions.
-- Using issue-id-only comments such as `// special case for #12345`.
-- Writing only local comments when the important distinction spans the whole file.
-- Attaching the only allowlist/denylist contract to a table declaration when the
-  boundary applies to the file or the entrypoint logic that reads the table.
-- Explaining the happy path but not the conservative boundary.
-- Adding long prose to `AGENTS.md` instead of putting examples/runbook detail under `docs/agents/`.
+- hiding the real contract only in tests, PR descriptions, or issue threads
+- writing only local comments when the important distinction spans the whole design or entrypoint
+- attaching the only classification-table contract to the table declaration when the real boundary belongs to the code that interprets the table
+- explaining the happy path but not the conservative or unsupported boundary
+- repeating type or data-structure invariants in function comments when the declaration already documents them
+- inventing motivation, performance claims, or historical reasons that are not grounded in the current task context
+- omitting a short comment only because a longer comment would feel excessive
 
-### Example A: Two Related Guarantees
-
-`columnStatsUsageCollector` (type comment) and `CollectColumnStatsUsage` (function comment) live in
-`pkg/planner/core/rule/collect_column_stats_usage.go` ~390 lines apart, but coordinate to establish
-one contract: the set of histogram-needed columns is strictly narrower than predicate columns.
-
-Type comment (on `columnStatsUsageCollector`):
-
-```go
-// columnStatsUsageCollector collects predicate columns and/or histogram-needed columns from logical plan.
-// Predicate columns are the columns whose statistics are utilized when making query plans, which usually occur in where conditions, join conditions and so on.
-// Histogram-needed columns are the columns whose histograms are utilized when making query plans, which usually occur in the conditions pushed down to DataSource.
-// The set of histogram-needed columns is the subset of that of predicate columns.
-```
-
-Function comment (on `CollectColumnStatsUsage`, same file):
-
-```go
-// CollectColumnStatsUsage collects column stats usage from logical plan.
-// predicate indicates whether to collect predicate columns and histNeeded indicates whether to collect histogram-needed columns.
-// The predicate columns are always collected while the histNeeded columns are depending on whether we use sync load.
-// First return value: predicate columns
-```
-
-The type comment defines the two concepts and their subset relationship; the function comment
-explains the caller-facing split. Together they prevent a maintainer from collapsing the two
-concepts and accidentally loading full histogram stats for every predicate column.
-
-### Example B: Conservative Classification Table
-
-`ruleTableEntry` in `pkg/planner/core/joinorder/conflict_detector.go` is a classification-table
-contract used by join-order conflict detection. The comment does not only define the enum values;
-it also explains why one case is intentionally unused today, what practical consequence that has,
-and what future feature work would have to revisit it:
-
-```go
-// ruleTableEntry encodes whether a given algebraic property holds for a pair of
-// join types (see Table 2 and Table 3 in the paper):
-//
-//	0 — property does NOT hold; a conflict rule must be generated.
-//	1 — property holds unconditionally.
-//	2 — property holds only when the null-rejection condition is satisfied.
-//
-// Currently, value 2 is unused because:
-//  1. TiDB does not support FULL OUTER JOIN, which is the main source of
-//     conditional entries in the paper's tables.
-//  2. extractJoinGroup() only admits non-inner joins that have at least one
-//     equi-condition, which implicitly guarantees null-rejection on both sides.
-//     This allows assoc(LEFT, LEFT) and assoc(RIGHT, RIGHT) to be treated as
-//     unconditional (value 1). If non-inner joins without equi-conditions are
-//     admitted in the future, null-rejection checks must be added here.
-//
-// The value 2 is retained as a placeholder for future extension.
-type ruleTableEntry int
-```
-
-This names the guarantee, the conservative boundary, the practical consequence (assoc entries
-become unconditional), and the future extension point — all in one place.
-
-### Example C: State-Transition Safety Comment
-
-`delayForAsyncCommit` in `pkg/ddl/ddl.go` uses a two-level comment structure.
-The doc comment names the safety property; a body comment inside the MDL branch
-explains the transaction-interleaving scenario that proves the property:
-
-Doc comment:
-
-```go
-// delayForAsyncCommit sleeps `SafeWindow + AllowedClockDrift` before a DDL job finishes.
-// It should be called before any DDL that could break data consistency.
-// This provides a safe window for async commit and 1PC to commit with an old schema.
-func delayForAsyncCommit() {
-```
-
-Body comment (inside the `if vardef.IsMDLEnabled()` branch):
-
-```go
-	// If metadata lock is enabled. The transaction of DDL must begin after
-	// pre-write of the async commit transaction, then the commit ts of DDL
-	// must be greater than the async commit transaction. In this case, the
-	// corresponding schema of the async commit transaction is correct.
-	// suppose we're adding index:
-	// - schema state -> StateWriteOnly with version V
-	// - some txn T started using async commit and version V,
-	//   and T do pre-write before or after V+1
-	// - schema state -> StateWriteReorganization with version V+1
-	// - T commit finish, with TS
-	// - 'wait schema synced' finish
-	// - schema state -> Done with version V+2, commit-ts of this
-	//   transaction must > TS, so it's safe for T to commit.
-```
-
-The doc comment tells readers *what* safety property is protected.
-The body comment shows *why* it works by walking through the interleaved transaction scenario.
-A future maintainer can see which transition order matters and why a seemingly simpler timing
-change could be wrong.
-
-### Review Checklist
-
-Before finishing a change that used this section, verify:
-
-- A maintainer can find the contract without reading tests first.
-- The comment names the conservative boundary explicitly.
-- The comment tells the reader what future edits require synchronized test updates.
-- Nearby helper names and comments do not imply a stronger guarantee than the code actually provides.
+If an issue or PR matters, summarize the reason in the comment first, then add the reference as supporting context.
 
 ## Comment Maintenance
 
-- **Incorrect comments are bugs.** Fix factually wrong comments immediately when discovered, with the same priority as a code bug.
-- **Add knowledge when discovered.** When you learn something non-obvious while debugging or reviewing, capture it in a comment at the relevant location.
-- **Fix grammar/spelling that impairs reading.** Ignore cosmetic-only issues that do not affect comprehension.
-- **Avoid comment-only churn.** Do not reformat or reword comments that are already clear, unless there is a concrete readability improvement.
+- Incorrect comments are bugs. Fix factually wrong comments immediately.
+- When changing behavior, update or remove nearby stale comments in the same diff.
+- When a new invariant, boundary, or ordering constraint becomes clear during debugging or review, capture it at the relevant location.
+- Fix grammar or spelling when it impairs comprehension.
+- Avoid comment-only churn. Do not broadly reword comments that are already clear unless there is a concrete readability or accuracy improvement.
