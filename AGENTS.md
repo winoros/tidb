@@ -12,7 +12,7 @@ This file provides guidance to agents working in this repository.
 ## Non-negotiables
 
 1. Correctness first. TiDB is a distributed SQL database; seemingly small changes can alter SQL semantics, consistency, or cluster behavior.
-2. Comments preserve maintenance-critical knowledge that the code alone does not reliably communicate.
+2. Comments preserve maintenance-critical knowledge that the code alone does not reliably communicate. Maintainers should be able to understand your changes without referring to any doc.
 3. No speculative behavior. Do not invent APIs, defaults, protocol behavior, or test workflows.
 4. Keep diffs minimal. Avoid unrelated refactors, broad renames, or formatting-only churn unless explicitly requested.
 5. Leave verifiable evidence. Run targeted checks and report exact commands.
@@ -31,7 +31,7 @@ This file provides guidance to agents working in this repository.
 | Fmt-only PR | MUST NOT run costly `realtikvtest`; local compilation is enough. |
 | During local coding iterations (not claiming completion) | SHOULD use the `WIP` verification profile from `.agents/skills/tidb-verify-profile` to run only scoped checks. |
 | Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, this includes `make lint`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
-| Before finishing | MUST run `make lint` if there are code changes. MUST self-review diff quality, following `tidb-code-style` skill's `comment-review-checklist.md`. |
+| Before finishing | MUST run `make lint` if there are code changes. MUST self-review diff quality, following `tidb-code-style` skill's `comment-guide.md`. |
 | Expensive optional sweeps (for example `make bazel_lint_changed`, broad package runs) | MUST run only when required by change scope, CI reproduction, or explicit user request. |
 
 ### Skills
