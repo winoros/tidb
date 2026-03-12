@@ -19,8 +19,6 @@ Use while still iterating and not claiming the task is complete.
 - Run only the smallest scoped checks that validate the changed behavior.
 - Prefer targeted unit tests (`go test -run <TestName> -tags=intest,deadlock`).
 - Avoid slow sweeps by default (`make lint`, package-wide runs, `realtikvtest`).
-- Do self-review of diff quality, focusing on comment quality. Use `tidb-code-style` skill's comment guide for guidance on comment quality.
-  - Recall that good comments are crucial for reviewers and future maintainers, especially when the code is non-obvious or has important context.
   
 ### `Ready` (completion gate)
 
@@ -29,7 +27,7 @@ Mandatory trigger phrases are defined in `AGENTS.md` -> `Quick Decision Matrix`.
 
 1. Map changed paths to required test surfaces via `AGENTS.md` -> `Task -> Validation Matrix`.
 2. Run minimum required targeted tests for those surfaces.
-3. If code changed, run `make lint`.
+3. If code changed, run `make lint`. Do a self-review of comment quality using the `tidb-code-style` skill's comment review guidance.
 4. Follow `AGENTS.md` -> `Agent Output Contract` for final reporting.
 
 ### `Heavy` (explicitly required)

@@ -31,7 +31,7 @@ This file provides guidance to agents working in this repository.
 | Fmt-only PR | MUST NOT run costly `realtikvtest`; local compilation is enough. |
 | During local coding iterations (not claiming completion) | SHOULD use the `WIP` verification profile from `.agents/skills/tidb-verify-profile` to run only scoped checks. |
 | Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, this includes `make lint`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
-| Before finishing | SHOULD self-review diff quality before finishing, following `tidb-code-style` skill's `code-comment-style-guide.md`. |
+| Before finishing | SHOULD self-review diff quality before finishing, following `tidb-code-style` skill's comment review guidance (`code-comment-review-guide.md`). |
 | Expensive optional sweeps (for example `make bazel_lint_changed`, broad package runs) | MUST run only when required by change scope, CI reproduction, or explicit user request. |
 
 ### Skills
@@ -163,7 +163,8 @@ Full code style rules (Go conventions, test/testdata style, docs style, and the 
 When finishing a task, report:
 
 1. Files changed.
-2. Validation profile used (`WIP`, `Ready`, or `Heavy`) and why.
-3. Risks: correctness, compatibility, performance.
-4. Exact commands run for validation.
-5. What was not verified locally.
+2. Whether comment quality meets `tidb-code-style` skill's guidance.
+3. Validation profile used (`WIP`, `Ready`, or `Heavy`) and why.
+4. Risks: correctness, compatibility, performance.
+5. Exact commands run for validation.
+6. What was not verified locally.
