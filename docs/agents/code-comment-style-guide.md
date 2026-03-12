@@ -185,18 +185,23 @@ func TestStaleReadUsesConsistentSchemaAndDataSnapshot(t *testing.T) {
 
 ### Top-Level Design Comment
 
+A top-level design comment can live on the declaration that defines the abstraction
+boundary. For example:
+
 ```go
-// Package stmtctx defines statement-scoped execution state shared by planning,
-// execution, and diagnostics.
+// MutateBuffers is a memory pool for table-related allocations that exists to
+// reuse statement-local buffers across row mutations.
 //
-// A StatementContext is reset before each statement. It records warnings,
-// execution counters, memory and disk trackers, plan metadata, and snapshot-
-// dependent state that must not leak across statements.
+// It is used by AddRecord, UpdateRecord, and DeleteRecord. Callers borrow one
+// logical buffer at a time through GetXXXBufferWithCap and must finish using it
+// before asking for another, because the inner slices are intentionally reused.
 //
-// The package exists as a boundary between session state and lower execution
-// layers so that planner and executor code can share statement-local state
-// without introducing unnecessary package dependencies.
-package stmtctx
+// This design keeps hot write paths from repeatedly allocating short-lived
+// slices while still confining the reused state to one statement's table
+// mutation flow.
+type MutateBuffers struct {
+    ...
+}
 ```
 
 ### API or Interface Comment
