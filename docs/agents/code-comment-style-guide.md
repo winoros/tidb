@@ -1,13 +1,5 @@
 # TiDB Code Comment Style Guide
 
-## Basic Style Rules
-
-- Prefer descriptive comments, not imperative comments.
-- Write comments in American English with standard grammar and punctuation.
-- Prefer full sentences for comments that describe behavior, contracts, lifecycle, or invariants.
-- Keep comments close to the code they describe.
-- Wrap long comments when practical and avoid noisy prose.
-
 ## Block vs Inline Comments
 
 Block comments belong above the code they describe and should use full sentences.
@@ -25,7 +17,7 @@ stmtTS := sc.GetStmtReadTS() // this timestamp fixes visibility for the whole st
 retryable = false            // do not retry after the schema version has changed.
 ```
 
-## Comment Placement Principles
+## Comment Guidance by Code Element
 
 ### Type and Data Structure Comments
 
