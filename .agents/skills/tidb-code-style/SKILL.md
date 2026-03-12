@@ -7,8 +7,8 @@ description: Code style and conventions for Go code, tests, testdata, code comme
 
 ## Go and backend code
 
-- Because TiDB is a complex system, code MUST remain maintainable for future readers with basic TiDB familiarity, including readers who are not experts in the specific subsystem/feature.
 - Follow existing package-local conventions first and keep style consistent with nearby files.
+- Keep diffs minimal. Avoid unrelated refactors, broad renames, moves, or formatting-only churn unless explicitly requested. However, this MUST NOT justify omitting necessary comments.
 - Code MUST be self-documenting through clear naming and structure.
   - Example: when implementing a well-known algorithm, naming MUST be clear enough to make the approach recognizable; if naming alone may not make intent obvious, add a brief comment.
   ```go
@@ -18,7 +18,6 @@ description: Code style and conventions for Go code, tests, testdata, code comme
   // Self-documenting: intent is obvious from the name.
   func allColumnsNotNull(cols []*Column) bool { ... }
   ```
-- Keep changes focused; avoid unrelated refactors, renames, or moves in the same PR.
 - Keep error handling actionable and contextual; avoid silently swallowing errors.
   ```go
   // Bad: caller loses all context about where the error originated.
