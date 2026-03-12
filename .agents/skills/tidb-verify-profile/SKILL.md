@@ -27,8 +27,9 @@ Mandatory trigger phrases are defined in `AGENTS.md` -> `Quick Decision Matrix`.
 
 1. Map changed paths to required test surfaces via `AGENTS.md` -> `Task -> Validation Matrix`.
 2. Run minimum required targeted tests for those surfaces.
-3. If code changed, run `make lint`. Do a self-review of comment quality using the `tidb-code-style` skill's comment review guidance.
-4. Follow `AGENTS.md` -> `Agent Output Contract` for final reporting.
+3. If code changed, run `make lint`.
+4. Before finishing, self-review diff quality following the `tidb-code-style` skill's `code-comment-review-guide.md`.
+5. Follow `AGENTS.md` -> `Agent Output Contract` for final reporting.
 
 ### `Heavy` (explicitly required)
 
