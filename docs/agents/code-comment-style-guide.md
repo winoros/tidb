@@ -1,18 +1,12 @@
 # TiDB Code Comment Style Guide
 
-## Scope
-
-This style guide applies to code comments in TiDB.
-
-## Core Style Rules
+## Basic Style Rules
 
 - Prefer descriptive comments, not imperative comments.
 - Write comments in American English with standard grammar and punctuation.
 - Prefer full sentences for comments that describe behavior, contracts, lifecycle, or invariants.
 - Keep comments close to the code they describe.
-- Use Markdown sparingly when it improves readability.
 - Wrap long comments when practical and avoid noisy prose.
-- Use relative links for files inside the same repository.
 
 ## Block vs Inline Comments
 
@@ -29,12 +23,6 @@ Inline comments are acceptable for short local clarifications, but should still 
 ```go
 stmtTS := sc.GetStmtReadTS() // this timestamp fixes visibility for the whole statement.
 retryable = false            // do not retry after the schema version has changed.
-```
-
-Avoid chatty or redundant inline comments.
-
-```go
-x++ // Increment x.
 ```
 
 ## Comment Placement Principles
@@ -167,18 +155,7 @@ This is particularly important in:
 - auto-increment and auto-random behavior
 - locking and transaction isolation details
 
-### 4. Explain Optimizer and Executor Trade-offs
-
-Planner and executor code should document why a rule or fallback exists.
-Good comments mention:
-
-- when a rewrite or pushdown is legal
-- when a transformation is disabled for correctness
-- which properties must be preserved, such as ordering or cardinality assumptions
-- whether the rule is heuristic or cost-based
-- what happens when statistics are missing or stale
-
-### 5. Explain Reset and Reuse Semantics
+### 4. Explain Reset and Reuse Semantics
 
 TiDB contains many objects that are reused for performance.
 Whenever reuse is non-obvious, comments should document:
@@ -188,7 +165,7 @@ Whenever reuse is non-obvious, comments should document:
 - who owns the reset
 - whether stale state can leak across statements or sessions
 
-### 6. Explain Test Intent, Not Just Test Steps
+### 5. Explain Test Intent, Not Just Test Steps
 
 Test comments should describe the protected invariant, regression, or compatibility rule.
 A future maintainer should understand what behavior must not change.
