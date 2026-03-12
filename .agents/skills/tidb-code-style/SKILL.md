@@ -1,48 +1,14 @@
 ---
 name: tidb-code-style
-description: Code style and conventions for Go code, tests, testdata, code comments, and documentation in TiDB. Use when writing, reviewing, or modifying any code, tests, code comments, or docs.
+description: Entry point to the canonical code style docs under docs/agents for Go code, tests, docs, and code comments in TiDB.
 ---
 
 # TiDB Code Style Guide
 
-## Go and backend code
+Canonical code style guidance now lives under `docs/agents/`:
 
-- Follow existing package-local conventions first and keep style consistent with nearby files.
-- Keep diffs minimal. Avoid unrelated refactors, broad renames, moves, or formatting-only churn unless explicitly requested. However, this MUST NOT justify omitting necessary comments.
-- Code MUST be self-documenting through clear naming and structure.
-  - Example: when implementing a well-known algorithm, naming MUST be clear enough to make the approach recognizable; if naming alone may not make intent obvious, add a brief comment.
-  ```go
-  // Unclear: name does not convey what is being checked.
-  func check(cols []*Column) bool { ... }
+- `docs/agents/code-style-guide.md`
+- `docs/agents/code-comment-style-guide.md`
+- `docs/agents/code-comment-review-guide.md`
 
-  // Self-documenting: intent is obvious from the name.
-  func allColumnsNotNull(cols []*Column) bool { ... }
-  ```
-- Keep error handling actionable and contextual; avoid silently swallowing errors.
-  ```go
-  // Bad: caller loses all context about where the error originated.
-  if err != nil {
-      return err
-  }
-
-  // Good: wraps with context so the call chain is traceable.
-  if err != nil {
-      return errors.Annotate(err, "failed to resolve table schema")
-  }
-  ```
-- `//nolint` directives MUST include the linter name and a brief reason (for example `//nolint:errcheck // intentionally ignoring Close error on read-only file`).
-- For new source files (for example `*.go`), include the standard TiDB license header (copyright + Apache 2.0) by copying from a nearby file and updating year if needed.
-- Code comment style MUST follow `references/code-comment-style-guide.md`. Writing clear, sufficient comments is a core quality requirement — do not skip necessary comments for changed code to save time or reduce diff size.
-- Follow `references/code-comment-review-guide.md` when reviewing comments in a diff.
-
-## Tests and testdata
-
-- Keep test changes minimal and deterministic; avoid broad golden/testdata churn unless required.
-- Follow `tidb-test-guidelines` for test placement, naming, fixture reuse, `shard_count`, planner testdata layout, and recording workflow details.
-
-## Docs and command snippets
-
-- Commands in docs SHOULD be copy-pasteable from repository root unless explicitly scoped.
-- Use explicit placeholders such as `<package_name>`, `<TestName>`, and `<dir>`.
-- Documentation updates SHOULD keep terminology, policy wording, and command conventions consistent across related docs.
-- Keep guidance executable and concrete; avoid ambiguous phrasing.
+Use those documents as the source of truth when writing, reviewing, or modifying code, tests, comments, or documentation.
