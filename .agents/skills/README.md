@@ -15,7 +15,7 @@ Current workflow and guidance skills:
 - `tidb-realtikv-runner`: run RealTiKV tests with startup/cleanup discipline.
 - `tidb-test-diff-triage`: triage unexpected test diffs (failpoint vs upstream vs local regression).
 - `tidb-test-guidelines`: test placement, naming, writing conventions, and shard_count guidance.
-- `tidb-code-style`: Go/test/docs/comment style guide.
+- `tidb-code-style`: Go/test/docs style guide, including the code comment style guide.
 
 Use `AGENTS.md` for repository policy, validation/reporting requirements, and the pre-flight checklist.
 Use `docs/agents/testing-flow.md` for canonical build/test command playbooks.

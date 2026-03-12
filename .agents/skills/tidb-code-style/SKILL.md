@@ -1,6 +1,6 @@
 ---
 name: tidb-code-style
-description: Code style and conventions for Go code, tests, testdata, comments, and documentation in TiDB. Use when writing, reviewing, or modifying any code, tests, comments, or docs.
+description: Code style and conventions for Go code, tests, testdata, code comments, and documentation in TiDB. Use when writing, reviewing, or modifying any code, tests, code comments, or docs.
 ---
 
 # TiDB Code Style Guide
@@ -33,8 +33,8 @@ description: Code style and conventions for Go code, tests, testdata, comments, 
   ```
 - `//nolint` directives MUST include the linter name and a brief reason (for example `//nolint:errcheck // intentionally ignoring Close error on read-only file`).
 - For new source files (for example `*.go`), include the standard TiDB license header (copyright + Apache 2.0) by copying from a nearby file and updating year if needed.
-- Comment style MUST follow `references/comment-guide.md`. Writing clear, sufficient comments is a core quality requirement — do not skip necessary comments for changed code to save time or reduce diff size.
-- Follow `references/comment-guide.md` when reviewing comments in a diff.
+- Code comment style MUST follow `references/code-comment-style-guide.md`. Writing clear, sufficient comments is a core quality requirement — do not skip necessary comments for changed code to save time or reduce diff size.
+- Follow `references/code-comment-style-guide.md` when reviewing comments in a diff.
 
 ## Tests and testdata
 
@@ -50,4 +50,4 @@ description: Code style and conventions for Go code, tests, testdata, comments, 
 
 ## Reference files
 
-- **Comment guide**: `references/comment-guide.md`
+- **Code comment style guide**: `references/code-comment-style-guide.md`

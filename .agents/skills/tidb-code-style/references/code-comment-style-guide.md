@@ -1,8 +1,8 @@
-# Commenting Standards
+# TiDB Code Comment Style Guide
 
 ## Scope
 
-These standards apply to TiDB code and comments in Go, protobuf definitions, and parser grammar files.
+This style guide applies to code comments in TiDB, including comments in Go, protobuf definitions, and parser grammar files.
 
 The goal is not to add more comments everywhere, but to preserve the knowledge that is hardest to recover from code alone: distributed-system semantics, MySQL compatibility constraints, lifecycle, scoping, invariants, and non-obvious trade-offs.
 
