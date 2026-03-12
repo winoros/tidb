@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/planner/planctx"
+	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/ranger"
 	"github.com/pingcap/tidb/pkg/util/ranger/context"
@@ -148,7 +149,6 @@ func implIsNotNull(rangerctx *context.RangerContext, targetCol *expression.Colum
 // AlwaysMeetConstraints checks whether the filters always meet the constraints from the predefined predicates in index meta.
 // This check is only applied to the pre condition that is single IS NOT NULL.
 // e.g. for partial index idx(b) where a IS NOT NULL, if the filter is b = ? and a is not null/a > 10, then we can guarantee that a IS NOT NULL is always true.
-// Because the `IsNullRejected` has correctness issues. So we implement a simpler version here.
 func AlwaysMeetConstraints(sctx planctx.PlanContext, prePredicates, filters []expression.Expression) bool {
 	if len(prePredicates) != 1 {
 		return false
@@ -171,49 +171,7 @@ func AlwaysMeetConstraints(sctx planctx.PlanContext, prePredicates, filters []ex
 		if !ok {
 			continue
 		}
-		if checkIsNullRejected(sctx, col, sf) {
-			return true
-		}
-	}
-	return false
-}
-
-func checkIsNullRejected(sctx planctx.PlanContext, targetCol *expression.Column, filter *expression.ScalarFunction) bool {
-	if filter.FuncName.L == ast.LogicOr {
-		leavesAllRejected := true
-		for _, arg := range filter.GetArgs() {
-			sf, ok := arg.(*expression.ScalarFunction)
-			if !ok || !checkIsNullRejected(sctx, targetCol, sf) {
-				leavesAllRejected = false
-				break
-			}
-		}
-		return leavesAllRejected
-	}
-	if filter.FuncName.L == ast.LogicAnd {
-		for _, arg := range filter.GetArgs() {
-			sf, ok := arg.(*expression.ScalarFunction)
-			if ok && checkIsNullRejected(sctx, targetCol, sf) {
-				return true
-			}
-		}
-		return false
-	}
-	if filter.FuncName.L == ast.IsNull {
-		col, ok := filter.GetArgs()[0].(*expression.Column)
-		if ok && col.Equal(sctx.GetExprCtx().GetEvalCtx(), targetCol) {
-			return false
-		}
-	}
-	if _, ok := expression.CompareOpMap[filter.FuncName.L]; ok {
-		if filter.FuncName.L == ast.NullEQ {
-			return false
-		}
-		col, ok := filter.GetArgs()[0].(*expression.Column)
-		if !ok {
-			col, ok = filter.GetArgs()[1].(*expression.Column)
-		}
-		if ok && col.Equal(sctx.GetExprCtx().GetEvalCtx(), targetCol) {
+		if plannerutil.IsNullRejected(sctx, expression.NewSchema(col), sf, true) {
 			return true
 		}
 	}

@@ -59,6 +59,13 @@ func TestOuter2Inner(t *testing.T) {
 		tk.MustHavePlan(`select /* issue:49616 */ /*+ tidb_inlj(t2, t1) */ *
   from t2 left join t1 on t1.k=t2.k
   where a>0 or (a=0 and b>0)`, "IndexJoin")
+		tk.MustExec("drop table if exists t1, t2")
+		tk.MustExec("create table t1 (k int)")
+		tk.MustExec("create table t2 (k int)")
+		tk.MustQuery(`explain format = 'brief' select /* issue:null_reject_not_abs */ * from t1 left join t2 on t1.k = t2.k where not abs(t2.k)`).
+			CheckContain("inner join")
+		tk.MustQuery(`explain format = 'brief' select /* issue:null_reject_not_abs */ * from t1 left join t2 on t1.k = t2.k where not coalesce(t2.k, 0)`).
+			CheckContain("left outer join")
 
 		tk.MustExec("drop table if exists t_outer, t")
 		tk.MustExec(`CREATE TABLE t_outer (

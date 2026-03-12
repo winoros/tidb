@@ -19,13 +19,76 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
-	"github.com/pingcap/tidb/pkg/planner/planctx"
+	"github.com/pingcap/tidb/pkg/types"
 )
 
-// allConstants checks if only the expression has only constants.
+// The builtins below are the only ones whose NULL propagation we currently use
+// in the null-reject proof. Any builtin not listed here is treated
+// conservatively as NULL-hiding until its 3VL contract is reviewed and tested.
+var nullRejectUnaryAnyNullPreservingFuncs = map[string]struct{}{
+	ast.Abs:        {},
+	ast.BitNeg:     {},
+	ast.Cast:       {},
+	ast.UnaryMinus: {},
+}
+
+var nullRejectBinaryAnyNullPreservingFuncs = map[string]struct{}{
+	ast.And:        {},
+	ast.Div:        {},
+	ast.EQ:         {},
+	ast.GE:         {},
+	ast.GT:         {},
+	ast.IntDiv:     {},
+	ast.LE:         {},
+	ast.LeftShift:  {},
+	ast.LT:         {},
+	ast.Minus:      {},
+	ast.Mod:        {},
+	ast.Mul:        {},
+	ast.NE:         {},
+	ast.Or:         {},
+	ast.Plus:       {},
+	ast.Regexp:     {},
+	ast.RightShift: {},
+	ast.Strcmp:     {},
+	ast.Xor:        {},
+}
+
+var nullRejectTernaryAnyNullPreservingFuncs = map[string]struct{}{
+	ast.Like:  {},
+	ast.Ilike: {},
+}
+
+var nullRejectAllArgsNullPreservingFuncs = map[string]struct{}{
+	ast.Coalesce: {},
+	ast.Ifnull:   {},
+}
+
+type nullRejectTruthSet uint8
+
+const (
+	nullRejectTruthFalse nullRejectTruthSet = 1 << iota
+	nullRejectTruthTrue
+	nullRejectTruthNull
+)
+
+// nullRejectAnalyzer reasons over one target schema: all columns in `schema`
+// are assumed to become NULL together, while every other input remains unknown.
+//
+// The analyzer never substitutes concrete NULL values into the expression tree.
+// Instead, it tracks a conservative 3VL truth set for predicates and a
+// must-NULL proof for scalar expressions. This keeps `NOT`, `AND`/`OR`, and
+// NULL-hiding builtins sound without the ad-hoc rewrites used before.
+type nullRejectAnalyzer struct {
+	ctx    base.PlanContext
+	schema *expression.Schema
+}
+
+// allConstants checks whether `expr` can be folded without depending on
+// runtime parameters or non-deterministic state.
 func allConstants(ctx expression.BuildContext, expr expression.Expression) bool {
 	if expression.MaybeOverOptimized4PlanCache(ctx, expr) {
-		return false // expression contains non-deterministic parameter
+		return false
 	}
 	switch v := expr.(type) {
 	case *expression.ScalarFunction:
@@ -41,86 +104,296 @@ func allConstants(ctx expression.BuildContext, expr expression.Expression) bool 
 	return false
 }
 
-// isNullRejectedInList checks null filter for IN list using OR logic.
-// Reason is that null filtering through evaluation by isNullRejectedSimpleExpr
-// has problems with IN list. For example, constant in (outer-table.col1, inner-table.col2)
-// is not null rejecting since constant in (outer-table.col1, NULL) is not false/unknown.
-func isNullRejectedInList(ctx base.PlanContext, expr *expression.ScalarFunction,
-	innerSchema *expression.Schema, skipPlanCacheCheck bool) bool {
-	for i, arg := range expr.GetArgs() {
-		if i > 0 {
-			newArgs := make([]expression.Expression, 0, 2)
-			newArgs = append(newArgs, expr.GetArgs()[0])
-			newArgs = append(newArgs, arg)
-			eQCondition, err := expression.NewFunction(ctx.GetExprCtx(), ast.EQ,
-				expr.GetType(ctx.GetExprCtx().GetEvalCtx()), newArgs...)
-			if err != nil {
-				return false
-			}
-			if !(isNullRejectedSimpleExpr(ctx, innerSchema, eQCondition, skipPlanCacheCheck)) {
-				return false
-			}
-		}
+func foldNullRejectConstant(ctx base.PlanContext, expr expression.Expression) (*expression.Constant, bool) {
+	if !allConstants(ctx.GetExprCtx(), expr) {
+		return nil, false
 	}
-	return true
+	folded := expression.FoldConstant(ctx.GetExprCtx(), expr)
+	c, ok := folded.(*expression.Constant)
+	if !ok || c.ParamMarker != nil || c.DeferredExpr != nil {
+		return nil, false
+	}
+	return c, true
 }
 
-// IsNullRejected takes care of complex predicates like this:
-// IsNullRejected(A OR B) = IsNullRejected(A) AND IsNullRejected(B)
-// IsNullRejected(A AND B) = IsNullRejected(A) OR IsNullRejected(B)
+func newNullRejectNullConstant() *expression.Constant {
+	return &expression.Constant{
+		Value:   types.Datum{},
+		RetType: types.NewFieldType(mysql.TypeNull),
+	}
+}
+
+func isNullRejectAnyNullPreservingFunc(funcName string) bool {
+	if _, ok := nullRejectUnaryAnyNullPreservingFuncs[funcName]; ok {
+		return true
+	}
+	if _, ok := nullRejectBinaryAnyNullPreservingFuncs[funcName]; ok {
+		return true
+	}
+	_, ok := nullRejectTernaryAnyNullPreservingFuncs[funcName]
+	return ok
+}
+
+func truthSetFromConstant(ctx base.PlanContext, c *expression.Constant) nullRejectTruthSet {
+	if c.Value.IsNull() {
+		return nullRejectTruthNull
+	}
+	isTrue, err := c.Value.ToBool(ctx.GetSessionVars().StmtCtx.TypeCtxOrDefault())
+	if err != nil {
+		return nullRejectTruthFalse | nullRejectTruthTrue
+	}
+	if isTrue == 0 {
+		return nullRejectTruthFalse
+	}
+	return nullRejectTruthTrue
+}
+
+func (s nullRejectTruthSet) has(flag nullRejectTruthSet) bool {
+	return s&flag != 0
+}
+
+func combineBinaryTruthSet(lhs, rhs nullRejectTruthSet, combine func(nullRejectTruthSet, nullRejectTruthSet) nullRejectTruthSet) nullRejectTruthSet {
+	var ret nullRejectTruthSet
+	for _, lv := range []nullRejectTruthSet{nullRejectTruthFalse, nullRejectTruthTrue, nullRejectTruthNull} {
+		if !lhs.has(lv) {
+			continue
+		}
+		for _, rv := range []nullRejectTruthSet{nullRejectTruthFalse, nullRejectTruthTrue, nullRejectTruthNull} {
+			if !rhs.has(rv) {
+				continue
+			}
+			ret |= combine(lv, rv)
+		}
+	}
+	return ret
+}
+
+func andTruthValue(lhs, rhs nullRejectTruthSet) nullRejectTruthSet {
+	switch lhs {
+	case nullRejectTruthFalse:
+		return nullRejectTruthFalse
+	case nullRejectTruthTrue:
+		return rhs
+	default:
+		if rhs == nullRejectTruthFalse {
+			return nullRejectTruthFalse
+		}
+		return nullRejectTruthNull
+	}
+}
+
+func orTruthValue(lhs, rhs nullRejectTruthSet) nullRejectTruthSet {
+	switch lhs {
+	case nullRejectTruthTrue:
+		return nullRejectTruthTrue
+	case nullRejectTruthFalse:
+		return rhs
+	default:
+		if rhs == nullRejectTruthTrue {
+			return nullRejectTruthTrue
+		}
+		return nullRejectTruthNull
+	}
+}
+
+func xorTruthValue(lhs, rhs nullRejectTruthSet) nullRejectTruthSet {
+	if lhs == nullRejectTruthNull || rhs == nullRejectTruthNull {
+		return nullRejectTruthNull
+	}
+	if lhs == rhs {
+		return nullRejectTruthFalse
+	}
+	return nullRejectTruthTrue
+}
+
+func notTruthValue(v nullRejectTruthSet) nullRejectTruthSet {
+	switch v {
+	case nullRejectTruthFalse:
+		return nullRejectTruthTrue
+	case nullRejectTruthTrue:
+		return nullRejectTruthFalse
+	default:
+		return nullRejectTruthNull
+	}
+}
+
+func applyUnaryTruthSet(arg nullRejectTruthSet, apply func(nullRejectTruthSet) nullRejectTruthSet) nullRejectTruthSet {
+	var ret nullRejectTruthSet
+	for _, v := range []nullRejectTruthSet{nullRejectTruthFalse, nullRejectTruthTrue, nullRejectTruthNull} {
+		if !arg.has(v) {
+			continue
+		}
+		ret |= apply(v)
+	}
+	return ret
+}
+
+func (a nullRejectAnalyzer) truthifyScalar(expr expression.Expression) nullRejectTruthSet {
+	if c, ok := a.analyzeConstant(expr); ok {
+		return truthSetFromConstant(a.ctx, c)
+	}
+	if a.mustNull(expr) {
+		return nullRejectTruthNull
+	}
+	return nullRejectTruthFalse | nullRejectTruthTrue
+}
+
+func (a nullRejectAnalyzer) analyzeConstant(expr expression.Expression) (*expression.Constant, bool) {
+	if c, ok := foldNullRejectConstant(a.ctx, expr); ok {
+		return c, true
+	}
+	switch x := expr.(type) {
+	case *expression.Column:
+		if a.schema.Contains(x) {
+			return newNullRejectNullConstant(), true
+		}
+		return nil, false
+	case *expression.ScalarFunction:
+		args := make([]expression.Expression, len(x.GetArgs()))
+		allConst := true
+		hasNullConst := false
+		allListArgsNull := x.FuncName.L == ast.In && len(x.GetArgs()) > 1
+		for i, arg := range x.GetArgs() {
+			c, ok := a.analyzeConstant(arg)
+			if !ok {
+				allConst = false
+				if i > 0 && x.FuncName.L == ast.In {
+					allListArgsNull = false
+				}
+				continue
+			}
+			args[i] = c
+			if c.Value.IsNull() {
+				hasNullConst = true
+			}
+			if i > 0 && x.FuncName.L == ast.In && !c.Value.IsNull() {
+				allListArgsNull = false
+			}
+		}
+		if allConst {
+			exact := expression.NewFunctionInternal(a.ctx.GetExprCtx(), x.FuncName.L, x.RetType.Clone(), args...)
+			return foldNullRejectConstant(a.ctx, exact)
+		}
+		if x.FuncName.L == ast.In {
+			if leftConst, ok := a.analyzeConstant(x.GetArgs()[0]); ok && leftConst.Value.IsNull() {
+				return newNullRejectNullConstant(), true
+			}
+			if allListArgsNull {
+				return newNullRejectNullConstant(), true
+			}
+		}
+		if hasNullConst && isNullRejectAnyNullPreservingFunc(x.FuncName.L) {
+			return newNullRejectNullConstant(), true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
+}
+
+func (a nullRejectAnalyzer) mustNull(expr expression.Expression) bool {
+	if c, ok := a.analyzeConstant(expr); ok {
+		return c.Value.IsNull()
+	}
+	switch x := expr.(type) {
+	case *expression.Column:
+		return a.schema.Contains(x)
+	case *expression.ScalarFunction:
+		switch x.FuncName.L {
+		case ast.LogicAnd, ast.LogicOr, ast.LogicXor, ast.UnaryNot, ast.IsNull, ast.IsTruthWithNull, ast.IsTruthWithoutNull, ast.IsFalsity:
+			return a.analyzeBool(expr) == nullRejectTruthNull
+		default:
+			if isNullRejectAnyNullPreservingFunc(x.FuncName.L) {
+				for _, arg := range x.GetArgs() {
+					if a.mustNull(arg) {
+						return true
+					}
+				}
+				return false
+			}
+			if _, ok := nullRejectAllArgsNullPreservingFuncs[x.FuncName.L]; ok {
+				for _, arg := range x.GetArgs() {
+					if !a.mustNull(arg) {
+						return false
+					}
+				}
+				return len(x.GetArgs()) > 0
+			}
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func (a nullRejectAnalyzer) analyzeBool(expr expression.Expression) nullRejectTruthSet {
+	if c, ok := a.analyzeConstant(expr); ok {
+		return truthSetFromConstant(a.ctx, c)
+	}
+	sf, ok := expr.(*expression.ScalarFunction)
+	if !ok {
+		return a.truthifyScalar(expr)
+	}
+	switch sf.FuncName.L {
+	case ast.LogicAnd:
+		return combineBinaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), a.analyzeBool(sf.GetArgs()[1]), andTruthValue)
+	case ast.LogicOr:
+		return combineBinaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), a.analyzeBool(sf.GetArgs()[1]), orTruthValue)
+	case ast.LogicXor:
+		return combineBinaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), a.analyzeBool(sf.GetArgs()[1]), xorTruthValue)
+	case ast.UnaryNot:
+		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), notTruthValue)
+	case ast.IsNull:
+		if a.mustNull(sf.GetArgs()[0]) {
+			return nullRejectTruthTrue
+		}
+		return nullRejectTruthFalse | nullRejectTruthTrue
+	case ast.IsTruthWithNull:
+		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
+			switch v {
+			case nullRejectTruthTrue:
+				return nullRejectTruthTrue
+			case nullRejectTruthFalse:
+				return nullRejectTruthFalse
+			default:
+				return nullRejectTruthNull
+			}
+		})
+	case ast.IsTruthWithoutNull:
+		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
+			if v == nullRejectTruthTrue {
+				return nullRejectTruthTrue
+			}
+			return nullRejectTruthFalse
+		})
+	case ast.IsFalsity:
+		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
+			if v == nullRejectTruthFalse {
+				return nullRejectTruthTrue
+			}
+			return nullRejectTruthFalse
+		})
+	case ast.NullEQ, ast.In:
+		return nullRejectTruthFalse | nullRejectTruthTrue | nullRejectTruthNull
+	default:
+		return a.truthifyScalar(expr)
+	}
+}
+
+// IsNullRejected checks whether a predicate can never evaluate to TRUE after
+// every column in `innerSchema` becomes NULL.
+//
+// The static proof is intentionally conservative for builtins whose NULL
+// contract is not listed above. That may miss some optimizations, but it keeps
+// null-reject reasoning sound across `NOT`, DNF/CNF combinations, and
+// NULL-hiding functions.
 func IsNullRejected(ctx base.PlanContext, innerSchema *expression.Schema, predicate expression.Expression,
 	skipPlanCacheCheck bool) bool {
-	predicate = expression.PushDownNot(ctx.GetNullRejectCheckExprCtx(), predicate)
-	if expression.ContainOuterNot(predicate) {
-		return false
-	}
-
-	switch expr := predicate.(type) {
-	case *expression.ScalarFunction:
-		if expr.FuncName.L == ast.LogicAnd {
-			if IsNullRejected(ctx, innerSchema, expr.GetArgs()[0], skipPlanCacheCheck) {
-				return true
-			}
-			return IsNullRejected(ctx, innerSchema, expr.GetArgs()[1], skipPlanCacheCheck)
-		} else if expr.FuncName.L == ast.LogicOr {
-			if !(IsNullRejected(ctx, innerSchema, expr.GetArgs()[0], skipPlanCacheCheck)) {
-				return false
-			}
-			return IsNullRejected(ctx, innerSchema, expr.GetArgs()[1], skipPlanCacheCheck)
-		} else if expr.FuncName.L == ast.In {
-			return isNullRejectedInList(ctx, expr, innerSchema, skipPlanCacheCheck)
-		}
-		return isNullRejectedSimpleExpr(ctx, innerSchema, expr, skipPlanCacheCheck)
-	default:
-		return isNullRejectedSimpleExpr(ctx, innerSchema, predicate, skipPlanCacheCheck)
-	}
-}
-
-// isNullRejectedSimpleExpr check whether a condition is null-rejected
-// A condition would be null-rejected in one of following cases:
-// If it is a predicate containing a reference to an inner table (null producing side) that evaluates
-// to UNKNOWN or FALSE when one of its arguments is NULL.
-func isNullRejectedSimpleExpr(ctx planctx.PlanContext, schema *expression.Schema, expr expression.Expression,
-	skipPlanCacheCheck bool) bool {
-	// The expression should reference at least one field in innerSchema or all constants.
-	if !expression.ExprReferenceSchema(expr, schema) && !allConstants(ctx.GetExprCtx(), expr) {
-		return false
-	}
-	exprCtx := ctx.GetNullRejectCheckExprCtx()
-	sc := ctx.GetSessionVars().StmtCtx
-	result, err := expression.EvaluateExprWithNull(exprCtx, schema, expr, skipPlanCacheCheck)
-	if err != nil {
-		return false
-	}
-	x, ok := result.(*expression.Constant)
-	if ok {
-		if x.Value.IsNull() {
-			return true
-		} else if isTrue, err := x.Value.ToBool(sc.TypeCtxOrDefault()); err == nil && isTrue == 0 {
-			return true
-		}
-	}
-	return false
+	// The static proof never evaluates parameterized expressions, so keeping the
+	// legacy flag only preserves the public API shape used by existing callers.
+	_ = skipPlanCacheCheck
+	analyzer := nullRejectAnalyzer{ctx: ctx, schema: innerSchema}
+	return !analyzer.analyzeBool(predicate).has(nullRejectTruthTrue)
 }
 
 // ResetNotNullFlag resets the not null flag of [start, end] columns in the schema.
