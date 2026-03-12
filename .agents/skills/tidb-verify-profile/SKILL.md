@@ -19,7 +19,9 @@ Use while still iterating and not claiming the task is complete.
 - Run only the smallest scoped checks that validate the changed behavior.
 - Prefer targeted unit tests (`go test -run <TestName> -tags=intest,deadlock`).
 - Avoid slow sweeps by default (`make lint`, package-wide runs, `realtikvtest`).
-
+- Do self-review of diff quality, focusing on comment quality. Use `tidb-code-style` skill's comment guide for guidance on comment quality.
+  - Recall that good comments are crucial for reviewers and future maintainers, especially when the code is non-obvious or has important context.
+  
 ### `Ready` (completion gate)
 
 Use when claiming task completion or PR readiness.
