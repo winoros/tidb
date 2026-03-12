@@ -30,7 +30,7 @@ This file provides guidance to agents working in this repository.
 | Bug fix | MUST add a regression test and verify it fails before fix and passes after fix. |
 | Fmt-only PR | MUST NOT run costly `realtikvtest`; local compilation is enough. |
 | During local coding iterations (not claiming completion) | SHOULD use the `WIP` verification profile from `.agents/skills/tidb-verify-profile` to run only scoped checks. |
-| Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, `Ready` includes `make lint`. Before finishing, `Ready` also includes a self-review of diff quality following the `docs/agents/code-comment-review-guide.md`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
+| Claiming task completion / PR readiness | MUST use the `Ready` verification profile from `.agents/skills/tidb-verify-profile`; if there are code changes, `Ready` includes `make lint`. Before finishing, `Ready` also includes a self-review of diff quality following `docs/agents/code-comment-style-guide.md`. `Ready` is mandatory before making final-status claims such as "fixed", "done", "all tests pass", "ready for review", or "ready for PR". |
 | Expensive optional sweeps (for example `make bazel_lint_changed`, broad package runs) | MUST run only when required by change scope, CI reproduction, or explicit user request. |
 
 ### Skills
@@ -162,7 +162,7 @@ Full code style rules (Go conventions, test/testdata style, docs style, and the 
 When finishing a task, report:
 
 1. Files changed.
-2. Whether comment quality meets `docs/agents/code-comment-style-guide.md` and `docs/agents/code-comment-review-guide.md`.
+2. Whether comment quality meets `docs/agents/code-comment-style-guide.md` if there are code changes.
 3. Validation profile used (`WIP`, `Ready`, or `Heavy`) and why.
 4. Risks: correctness, compatibility, performance.
 5. Exact commands run for validation.

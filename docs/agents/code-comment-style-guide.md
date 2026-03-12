@@ -2,9 +2,7 @@
 
 ## Scope
 
-This style guide applies to code comments in TiDB, including comments in Go, protobuf definitions, and parser grammar files.
-
-The goal is not to add more comments everywhere, but to preserve the knowledge that is hardest to recover from code alone: distributed-system semantics, MySQL compatibility constraints, lifecycle, scoping, invariants, and non-obvious trade-offs.
+This style guide applies to code comments in TiDB.
 
 ## Core Style Rules
 
@@ -306,3 +304,24 @@ for {
     ...
 }
 ```
+
+## Comment Maintenance and Review Checklist
+
+### Comment Maintenance
+
+- Add comments when you discover missing knowledge that would slow down the next reader.
+- Treat incorrect comments as bugs and fix them immediately.
+- Update comments in the same change when behavior, invariants, or scope changes.
+- Fix grammar or wording when it materially improves clarity.
+- In review, prefix minor wording suggestions with `nit:`.
+
+### Review Checklist
+
+When reviewing a diff, recall our guide and ask:
+
+- Does it have enough comments? Do we need to add crucial comments so someone without domain knowledge can understand the diff?
+- Do its comments meet the style guidance in this document?
+- Do its comments explain a contract, invariant, scope boundary, or non-obvious trade-off?
+- Would a reader understand the behavior without referring to another doc, test, or PR history?
+- Do its comments say why the code exists, not just what the code literally does?
+- Is the comment around the changed context still true after this change?

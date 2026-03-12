@@ -30,8 +30,7 @@ Normative repository policy remains in root `AGENTS.md`.
   ```
 - `//nolint` directives MUST include the linter name and a brief reason (for example `//nolint:errcheck // intentionally ignoring Close error on read-only file`).
 - For new source files (for example `*.go`), include the standard TiDB license header (copyright + Apache 2.0) by copying from a nearby file and updating year if needed.
-- Code comment style MUST follow `docs/agents/code-comment-style-guide.md`. Writing clear, sufficient comments is a core quality requirement; do not skip necessary comments for changed code to save time or reduce diff size.
-- Follow `docs/agents/code-comment-review-guide.md` when reviewing comments in a diff.
+- Code comment style and review MUST follow `docs/agents/code-comment-style-guide.md`. Writing clear, sufficient comments is a core quality requirement; do not skip comments for changed code to save time or reduce diff size.
 
 ## Tests and Testdata
 
