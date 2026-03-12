@@ -12,7 +12,7 @@ This file provides guidance to agents working in this repository.
 ## Non-negotiables
 
 1. Correctness first. TiDB is a distributed SQL database; seemingly small changes can alter SQL semantics, consistency, or cluster behavior.
-2. Comments preserve maintenance-critical knowledge that the code alone does not reliably communicate. Maintainers should be able to understand your changes without referring to any doc.
+2. Comments preserve maintenance-critical knowledge that the code alone does not reliably communicate. Maintainers MUST be able to understand your changes without referring to external documentation.
 3. No speculative behavior. Do not invent APIs, defaults, protocol behavior, or test workflows.
 4. Keep diffs minimal. Avoid unrelated refactors, broad renames, or formatting-only churn unless explicitly requested. However, this MUST NOT justify omitting necessary comments.
 5. Leave verifiable evidence. Run targeted checks and report exact commands.
