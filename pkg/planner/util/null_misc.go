@@ -23,8 +23,20 @@ import (
 )
 
 // The builtins below are the only ones whose NULL propagation we currently use
-// in the null-reject proof. Any builtin not listed here is treated
-// conservatively as NULL-hiding until its 3VL contract is reviewed and tested.
+// in the null-reject proof.
+//
+// The unary/binary/ternary any-null-preserving buckets are the strong case:
+// once any analyzed argument is proven NULL, the result is NULL regardless of
+// how the remaining arguments evaluate. `mustNull` and `analyzeConstant` may
+// therefore stop as soon as they find one NULL child.
+//
+// The all-args-null-preserving bucket is weaker: only the fact that every
+// argument is NULL forces the result to NULL. A subset of NULL arguments may be
+// hidden by non-NULL inputs, as with `COALESCE` and `IFNULL`, so the proof must
+// wait until all arguments are known NULL before concluding NULL.
+//
+// Any builtin not listed here is treated conservatively as NULL-hiding until
+// its 3VL contract is reviewed and covered by tests.
 var nullRejectUnaryAnyNullPreservingFuncs = map[string]struct{}{
 	ast.Abs:        {},
 	ast.BitNeg:     {},
@@ -275,13 +287,23 @@ func (a nullRejectAnalyzer) analyzeConstant(expr expression.Expression) (*expres
 			return foldNullRejectConstant(a.ctx, exact)
 		}
 		if x.FuncName.L == ast.In {
+			// `NULL IN (...)` is always NULL in SQL 3VL, even if the list contains
+			// more NULLs or values from non-target inputs. Once the left operand is
+			// proven NULL, later reasoning does not need to inspect the list.
 			if leftConst, ok := a.analyzeConstant(x.GetArgs()[0]); ok && leftConst.Value.IsNull() {
 				return newNullRejectNullConstant(), true
 			}
+			// `expr IN (NULL, ..., NULL)` is also always NULL: every membership test
+			// becomes `expr = NULL`, which can never yield TRUE, and the presence of
+			// at least one NULL comparison keeps the final result at NULL instead of
+			// FALSE. This shortcut is sound even when `expr` itself stays unknown.
 			if allListArgsNull {
 				return newNullRejectNullConstant(), true
 			}
 		}
+		// For any-null-preserving builtins, one exact NULL child is enough to pin
+		// the whole result to NULL. We use this only for builtins whose contract
+		// was explicitly reviewed in the registry above.
 		if hasNullConst && isNullRejectAnyNullPreservingFunc(x.FuncName.L) {
 			return newNullRejectNullConstant(), true
 		}
@@ -303,6 +325,11 @@ func (a nullRejectAnalyzer) mustNull(expr expression.Expression) bool {
 		case ast.LogicAnd, ast.LogicOr, ast.LogicXor, ast.UnaryNot, ast.IsNull, ast.IsTruthWithNull, ast.IsTruthWithoutNull, ast.IsFalsity:
 			return a.analyzeBool(expr) == nullRejectTruthNull
 		default:
+			// The builtin registry is split by the strongest sound proof we can use.
+			// Any-null-preserving builtins expose NULL as soon as one child must be
+			// NULL, while all-args-null-preserving builtins may still hide isolated
+			// NULLs behind other inputs and only become must-NULL after every child
+			// is forced to NULL.
 			if isNullRejectAnyNullPreservingFunc(x.FuncName.L) {
 				for _, arg := range x.GetArgs() {
 					if a.mustNull(arg) {
@@ -344,11 +371,18 @@ func (a nullRejectAnalyzer) analyzeBool(expr expression.Expression) nullRejectTr
 	case ast.UnaryNot:
 		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), notTruthValue)
 	case ast.IsNull:
+		// `IS NULL` is a total predicate. If the child must be NULL, the result is
+		// exactly TRUE; otherwise we keep both TRUE and FALSE because non-target
+		// inputs may still decide whether the child becomes NULL.
 		if a.mustNull(sf.GetArgs()[0]) {
 			return nullRejectTruthTrue
 		}
 		return nullRejectTruthFalse | nullRejectTruthTrue
 	case ast.IsTruthWithNull:
+		// `... IS TRUE` with `keepNull` preserves UNKNOWN: TRUE stays TRUE, FALSE
+		// stays FALSE, and NULL remains NULL. This mapping mirrors the builtin's
+		// runtime contract, so the proof can transform the child's truth set
+		// pointwise without losing soundness.
 		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
 			switch v {
 			case nullRejectTruthTrue:
@@ -360,6 +394,10 @@ func (a nullRejectAnalyzer) analyzeBool(expr expression.Expression) nullRejectTr
 			}
 		})
 	case ast.IsTruthWithoutNull:
+		// `... IS TRUE` without `keepNull` collapses both FALSE and UNKNOWN to
+		// FALSE. The proof must preserve that distinction because this branch is
+		// what lets `NOT ABS(inner_col)` become null-rejected while `IS TRUE`
+		// itself still stays two-valued.
 		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
 			if v == nullRejectTruthTrue {
 				return nullRejectTruthTrue
@@ -367,6 +405,8 @@ func (a nullRejectAnalyzer) analyzeBool(expr expression.Expression) nullRejectTr
 			return nullRejectTruthFalse
 		})
 	case ast.IsFalsity:
+		// `... IS FALSE` is also two-valued here: only a definite FALSE child maps
+		// to TRUE, while TRUE and UNKNOWN both map to FALSE.
 		return applyUnaryTruthSet(a.analyzeBool(sf.GetArgs()[0]), func(v nullRejectTruthSet) nullRejectTruthSet {
 			if v == nullRejectTruthFalse {
 				return nullRejectTruthTrue
@@ -374,6 +414,12 @@ func (a nullRejectAnalyzer) analyzeBool(expr expression.Expression) nullRejectTr
 			return nullRejectTruthFalse
 		})
 	case ast.NullEQ, ast.In:
+		// This is the proof's fallback top element for operators whose exact
+		// result depends on correlations we intentionally do not model after the
+		// earlier constant/must-NULL shortcuts fail. Returning the full truth set
+		// stays sound because null-reject only relies on proving TRUE impossible;
+		// the extra UNKNOWN state is conservative precision loss, not a claim that
+		// `<=>` itself can evaluate to NULL at runtime.
 		return nullRejectTruthFalse | nullRejectTruthTrue | nullRejectTruthNull
 	default:
 		return a.truthifyScalar(expr)
