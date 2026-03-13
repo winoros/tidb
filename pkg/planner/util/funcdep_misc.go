@@ -22,30 +22,18 @@ import (
 )
 
 // ExtractNotNullFromConds extracts not-null columns from conditions.
+// It uses the set-based (per-variable) null-rejection algorithm: for each
+// CNF conjunct, it finds columns whose individual NULL would make the
+// conjunct non-TRUE. This is more precise than the previous evaluate-with-null
+// approach for expressions like COALESCE(a, b) > 5, which no longer
+// incorrectly marks both a and b as NOT NULL.
 func ExtractNotNullFromConds(conditions []expression.Expression, p base.LogicalPlan) intset.FastIntSet {
-	// extract the column NOT NULL rejection characteristic from selection condition.
-	// CNF considered only, DNF doesn't have its meanings (cause that condition's eval may don't take effect)
-	//
-	// Take this case: select * from t where (a = 1) and (b is null):
-	//
-	// If we wanna where phrase eval to true, two pre-condition: {a=1} and {b is null} both need to be true.
-	// Hence, we assert that:
-	//
-	// 1: `a` must not be null since `NULL = 1` is evaluated as NULL.
-	// 2: `b` must be null since only `NULL is NULL` is evaluated as true.
-	//
-	// As a result,	`a` will be extracted as not-null column to abound the FDSet.
+	// CNF: each conjunct must be TRUE independently, so any column that is
+	// null-rejected by ANY conjunct is known to be NOT NULL.
 	notnullColsUniqueIDs := intset.NewFastIntSet()
 	for _, condition := range conditions {
-		cols := expression.ExtractColumnsMapFromExpressions(nil, condition)
-		if len(cols) == 0 {
-			continue
-		}
-		if IsNullRejected(p.SCtx(), p.Schema(), condition, false) {
-			for _, col := range cols {
-				notnullColsUniqueIDs.Insert(int(col.UniqueID))
-			}
-		}
+		cols := NullRejectedCols(p.Schema(), condition)
+		notnullColsUniqueIDs = notnullColsUniqueIDs.Union(cols)
 	}
 	return notnullColsUniqueIDs
 }
