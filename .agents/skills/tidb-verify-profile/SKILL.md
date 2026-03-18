@@ -19,7 +19,7 @@ Use while still iterating and not claiming the task is complete.
 - Run only the smallest scoped checks that validate the changed behavior.
 - Prefer targeted unit tests (`go test -run <TestName> -tags=intest,deadlock`).
 - Avoid slow sweeps by default (`make lint`, package-wide runs, `realtikvtest`).
-
+  
 ### `Ready` (completion gate)
 
 Use when claiming task completion or PR readiness.
@@ -28,7 +28,8 @@ Mandatory trigger phrases are defined in `AGENTS.md` -> `Quick Decision Matrix`.
 1. Map changed paths to required test surfaces via `AGENTS.md` -> `Task -> Validation Matrix`.
 2. Run minimum required targeted tests for those surfaces.
 3. If code changed, run `make lint`.
-4. Follow `AGENTS.md` -> `Agent Output Contract` for final reporting.
+4. Before finishing, self-review diff quality following `docs/agents/code-comment-style-guide.md`.
+5. Follow `AGENTS.md` -> `Agent Output Contract` for final reporting.
 
 ### `Heavy` (explicitly required)
 

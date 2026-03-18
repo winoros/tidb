@@ -76,8 +76,8 @@ Use from repository root.
 grep -n "Issue Number:" AGENTS.md
 grep -n "Task -> Validation Matrix\|Testing Policy\|make bazel_prepare" AGENTS.md
 
-# Ensure normative keywords are not wrapped in backticks in policy docs.
-rg -n -P '\x60(MUST(?: NOT)?|SHOULD|MAY)\x60' AGENTS.md docs/agents/agents-review-guide.md
+# Ensure normative keywords are not wrapped in backticks in policy docs and skill Markdown files.
+rg -n -P '\x60(MUST(?: NOT)?|SHOULD(?: NOT)?|MAY)\x60' AGENTS.md docs/agents/agents-review-guide.md .agents/skills --glob '*.md'
 
 # Check cross-doc source-of-truth boundaries in docs/agents/
 grep -R -n 'root `AGENTS.md`' --include="*.md" docs/agents
