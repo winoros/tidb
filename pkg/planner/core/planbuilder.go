@@ -4288,6 +4288,14 @@ func (b *PlanBuilder) buildInsert(ctx context.Context, insert *ast.InsertStmt) (
 		}
 		return nil, err
 	}
+	op := "INSERT"
+	if insert.IsReplace {
+		op = "REPLACE"
+	}
+	sessionVars := b.ctx.GetSessionVars()
+	if err := CheckMViewUpdatable(sessionVars, tableInfo, tableInfo.Name.O, op); err != nil {
+		return nil, err
+	}
 	// Build Schema with DBName otherwise ColumnRef with DBName cannot match any Column in Schema.
 	schema, names, err := expression.TableInfo2SchemaAndNames(b.ctx.GetExprCtx(), tn.Schema, tableInfo)
 	if err != nil {
@@ -5399,6 +5407,30 @@ func (b *PlanBuilder) buildRefreshMaterializedView(_ context.Context, stmt *ast.
 	b.visitInfo = appendVisitInfo(b.visitInfo, mysql.AlterPriv, dbName, stmt.ViewName.Name.L, "", authErr)
 
 	p := &RefreshMaterializedView{Statement: stmt}
+	return p, nil
+}
+
+func (b *PlanBuilder) buildPurgeMaterializedViewLog(_ context.Context, stmt *ast.PurgeMaterializedViewLogStmt) (base.Plan, error) {
+	dbName := stmt.Table.Schema.L
+	if dbName == "" {
+		dbName = b.ctx.GetSessionVars().CurrentDB
+	}
+	if dbName == "" {
+		return nil, plannererrors.ErrNoDB
+	}
+
+	var authErr error
+	if user := b.ctx.GetSessionVars().User; user != nil {
+		authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs(
+			"ALTER",
+			user.AuthUsername,
+			user.AuthHostname,
+			stmt.Table.Name.L,
+		)
+	}
+	b.visitInfo = appendVisitInfo(b.visitInfo, mysql.AlterPriv, dbName, stmt.Table.Name.L, "", authErr)
+
+	p := &PurgeMaterializedViewLog{Statement: stmt}
 	return p, nil
 }
 
