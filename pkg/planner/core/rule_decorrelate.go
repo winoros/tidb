@@ -548,7 +548,6 @@ func (s *DecorrelateSolver) optimize(ctx context.Context, p base.LogicalPlan, gr
 		}
 	}
 NoOptimize:
-	// CTE's logical optimization is independent.
 	if _, ok := p.(*logicalop.LogicalCTE); ok {
 		return p, planChanged, nil
 	}

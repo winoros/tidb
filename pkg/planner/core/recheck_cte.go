@@ -34,6 +34,20 @@ func findCTEs(
 	isRootTree bool,
 ) {
 	if cteReader, ok := p.(*logicalop.LogicalCTE); ok {
+		if cteReader.OnlyUsedAsStorage {
+			if len(cteReader.Children()) > 0 {
+				for _, child := range cteReader.Children() {
+					findCTEs(child, visited, false)
+				}
+				return
+			}
+			cte := cteReader.Cte
+			findCTEs(cte.SeedPartLogicalPlan, visited, false)
+			if cte.RecursivePartLogicalPlan != nil {
+				findCTEs(cte.RecursivePartLogicalPlan, visited, false)
+			}
+			return
+		}
 		cte := cteReader.Cte
 		if !isRootTree {
 			// Set it to false since it's referenced by other CTEs.

@@ -50,14 +50,26 @@ type PhysicalCTE struct {
 
 // ExhaustPhysicalPlans4LogicalCTE will be called by LogicalCTE in logicalOp pkg.
 func ExhaustPhysicalPlans4LogicalCTE(p *logicalop.LogicalCTE, prop *property.PhysicalProperty) ([]base.PhysicalPlan, bool, error) {
+	if p.OnlyUsedAsStorage && p.Cte.RecursivePartLogicalPlan != nil && prop.TaskTp == property.MppTaskType {
+		return nil, true, nil
+	}
 	pcte := PhysicalCTE{CTE: p.Cte}.Init(p.SCtx(), p.StatsInfo())
-	if prop.IsFlashProp() {
+	if prop.IsFlashProp() && p.Cte.RecursivePartLogicalPlan == nil {
 		pcte.StorageSender = PhysicalExchangeSender{
 			ExchangeType: tipb.ExchangeType_Broadcast,
 		}.Init(p.SCtx(), p.StatsInfo())
 	}
 	pcte.SetSchema(p.Schema())
-	pcte.SetChildrenReqProps([]*property.PhysicalProperty{prop.CloneEssentialFields()})
+	childLen := p.ChildLen()
+	childReqProps := make([]*property.PhysicalProperty, 0, childLen)
+	for range childLen {
+		if p.Cte.RecursivePartLogicalPlan != nil {
+			childReqProps = append(childReqProps, &property.PhysicalProperty{TaskTp: property.RootTaskType, ExpectedCnt: prop.ExpectedCnt, CTEProducerStatus: property.SomeCTEFailedMpp})
+		} else {
+			childReqProps = append(childReqProps, prop.CloneEssentialFields())
+		}
+	}
+	pcte.SetChildrenReqProps(childReqProps)
 	return []base.PhysicalPlan{(*PhysicalCTEStorage)(pcte)}, true, nil
 }
 

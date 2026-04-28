@@ -94,11 +94,19 @@ func (p *PhysicalSequence) Attach2Task(tasks ...base.Task) base.Task {
 // ExhaustPhysicalPlans4LogicalSequence generates PhysicalSequence plans from LogicalSequence.
 func ExhaustPhysicalPlans4LogicalSequence(super base.LogicalPlan, prop *property.PhysicalProperty) ([]base.PhysicalPlan, bool, error) {
 	g, ls := base.GetGEAndLogicalOp[*logicalop.LogicalSequence](super)
+	hasRecursiveCTE := false
+	for i := 0; i < ls.ChildLen()-1; i++ {
+		if cte, ok := ls.Children()[i].(*logicalop.LogicalCTE); ok && cte.Cte.RecursivePartLogicalPlan != nil {
+			hasRecursiveCTE = true
+			break
+		}
+	}
 	possibleChildrenProps := make([][]*property.PhysicalProperty, 0, 2)
 	anyType := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, MPPPartitionTp: property.AnyType, CanAddEnforcer: true,
 		CTEProducerStatus: prop.CTEProducerStatus, NoCopPushDown: prop.NoCopPushDown}
 	if prop.TaskTp == property.MppTaskType {
-		if prop.CTEProducerStatus == property.SomeCTEFailedMpp {
+		if prop.CTEProducerStatus == property.SomeCTEFailedMpp ||
+			!ls.SCtx().GetSessionVars().EnableMPPSharedCTEExecution || hasRecursiveCTE {
 			return nil, true, nil
 		}
 		anyType.CTEProducerStatus = property.AllCTECanMpp
@@ -110,6 +118,7 @@ func ExhaustPhysicalPlans4LogicalSequence(super base.LogicalPlan, prop *property
 	}
 
 	if prop.TaskTp != property.MppTaskType && prop.CTEProducerStatus != property.SomeCTEFailedMpp &&
+		ls.SCtx().GetSessionVars().EnableMPPSharedCTEExecution && !hasRecursiveCTE &&
 		ls.SCtx().GetSessionVars().IsMPPAllowed() && prop.IsSortItemEmpty() {
 		possibleChildrenProps = append(possibleChildrenProps, []*property.PhysicalProperty{anyType, anyType.CloneEssentialFields()})
 	}

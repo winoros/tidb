@@ -238,7 +238,7 @@ func optimizeRecursive(p base.LogicalPlan) (base.LogicalPlan, error) {
 	if p == nil {
 		return nil, nil
 	}
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
+	if cte, ok := p.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return p, nil
 	}
 

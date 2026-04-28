@@ -17,6 +17,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -68,6 +69,96 @@ func TestPredicatePushDown(t *testing.T) {
 		})
 		require.Equal(t, output[ith], ToString(p), fmt.Sprintf("for %s %d", ca, ith))
 	}
+	checkCTESequencePredicatePushDown(t, s)
+}
+
+func checkCTESequencePredicatePushDown(t *testing.T, s *coretestsdk.PlannerSuite) {
+	nonRecursiveSQL := "with cte as (select a, b from t) select * from cte c1 join cte c2 on c1.a = c2.a where c1.a > 1 and c2.b > 1"
+	lp := buildLogicalPlanForCTESequenceTest(t, s, nonRecursiveSQL)
+	seq := requireLogicalSequence(t, lp)
+	require.Len(t, seq.Children(), 2)
+	storage := requireStorageCTE(t, seq.Children()[0])
+	require.True(t, storage.Cte.UseSequence)
+	require.False(t, storage.Cte.RecursivePartLogicalPlan != nil)
+	require.Len(t, storage.Children(), 1)
+
+	optimized, err := logicalOptimize(context.Background(), rule.FlagPredicatePushDown, lp)
+	require.NoError(t, err)
+	seq = requireLogicalSequence(t, optimized)
+	storage = requireStorageCTE(t, seq.Children()[0])
+	ds := findFirstDataSource(storage.Children()[0])
+	require.NotNil(t, ds)
+	require.True(t, exprsContain(ds.SCtx().GetExprCtx().GetEvalCtx(), ds.AllConds, "test.t.a"))
+	require.True(t, exprsContain(ds.SCtx().GetExprCtx().GetEvalCtx(), ds.AllConds, "test.t.b"))
+	require.Empty(t, storage.Cte.PushDownPredicates)
+
+	recursiveSQL := "with recursive cte(a) as (select a from t where a = 1 union all select cte.a + 1 from cte where cte.a < 3) select * from cte where a < 2"
+	lp = buildLogicalPlanForCTESequenceTest(t, s, recursiveSQL)
+	seq = requireLogicalSequence(t, lp)
+	storage = requireStorageCTE(t, seq.Children()[0])
+	require.True(t, storage.Cte.UseSequence)
+	require.NotNil(t, storage.Cte.RecursivePartLogicalPlan)
+	require.Len(t, storage.Children(), 2)
+
+	optimized, err = logicalOptimize(context.Background(), rule.FlagPredicatePushDown, lp)
+	require.NoError(t, err)
+	seq = requireLogicalSequence(t, optimized)
+	storage = requireStorageCTE(t, seq.Children()[0])
+	ds = findFirstDataSource(storage.Children()[0])
+	require.NotNil(t, ds)
+	require.True(t, exprsContain(ds.SCtx().GetExprCtx().GetEvalCtx(), ds.AllConds, "eq(test.t.a, 1)"))
+	require.False(t, exprsContain(ds.SCtx().GetExprCtx().GetEvalCtx(), ds.AllConds, "lt(test.t.a, 2)"))
+
+	mixedSQL := "with recursive c1 as (select a from t), c2(a) as (select a from c1 union all select c2.a + 1 from c2 where c2.a < 3) select * from c1 join c2 on c1.a = c2.a"
+	lp = buildLogicalPlanForCTESequenceTest(t, s, mixedSQL)
+	seq = requireLogicalSequence(t, lp)
+	require.Len(t, seq.Children(), 3)
+	require.Len(t, requireStorageCTE(t, seq.Children()[0]).Children(), 1)
+	require.Len(t, requireStorageCTE(t, seq.Children()[1]).Children(), 2)
+}
+
+func buildLogicalPlanForCTESequenceTest(t *testing.T, s *coretestsdk.PlannerSuite, sql string) base.LogicalPlan {
+	stmt, err := s.GetParser().ParseOneStmt(sql, "", "")
+	require.NoError(t, err)
+	nodeW := resolve.NewNodeW(stmt)
+	err = Preprocess(context.Background(), s.GetSCtx(), nodeW, WithPreprocessorReturn(&PreprocessorReturn{InfoSchema: s.GetIS()}))
+	require.NoError(t, err)
+	p, err := BuildLogicalPlanForTest(context.Background(), s.GetSCtx(), nodeW, s.GetIS())
+	require.NoError(t, err)
+	lp, ok := p.(base.LogicalPlan)
+	require.True(t, ok)
+	return lp
+}
+
+func requireLogicalSequence(t *testing.T, lp base.LogicalPlan) *logicalop.LogicalSequence {
+	seq, ok := lp.(*logicalop.LogicalSequence)
+	require.True(t, ok, "expected LogicalSequence, got %T", lp)
+	return seq
+}
+
+func requireStorageCTE(t *testing.T, lp base.LogicalPlan) *logicalop.LogicalCTE {
+	cte, ok := lp.(*logicalop.LogicalCTE)
+	require.True(t, ok, "expected LogicalCTE, got %T", lp)
+	require.True(t, cte.OnlyUsedAsStorage)
+	return cte
+}
+
+func findFirstDataSource(lp base.LogicalPlan) *logicalop.DataSource {
+	if ds, ok := lp.(*logicalop.DataSource); ok {
+		return ds
+	}
+	for _, child := range lp.Children() {
+		if ds := findFirstDataSource(child); ds != nil {
+			return ds
+		}
+	}
+	return nil
+}
+
+func exprsContain(ectx expression.EvalContext, exprs []expression.Expression, substr string) bool {
+	return slices.ContainsFunc(exprs, func(expr expression.Expression) bool {
+		return strings.Contains(expr.StringWithCtx(ectx, errors.RedactLogDisable), substr)
+	})
 }
 
 // Issue: 31399

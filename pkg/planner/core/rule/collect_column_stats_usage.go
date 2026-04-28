@@ -388,10 +388,12 @@ func (c *columnStatsUsageCollector) collectFromPlan(askedColGroups [][]*expressi
 	case *logicalop.LogicalPartitionUnionAll:
 		c.collectPredicateColumnsForUnionAll(&x.LogicalUnionAll)
 	case *logicalop.LogicalCTE:
-		// Visit SeedPartLogicalPlan and RecursivePartLogicalPlan first.
-		c.collectFromPlan(nil, x.Cte.SeedPartLogicalPlan, nil, nil)
-		if x.Cte.RecursivePartLogicalPlan != nil {
-			c.collectFromPlan(nil, x.Cte.RecursivePartLogicalPlan, nil, nil)
+		if !x.Cte.UseSequence {
+			// Visit SeedPartLogicalPlan and RecursivePartLogicalPlan first.
+			c.collectFromPlan(nil, x.Cte.SeedPartLogicalPlan, nil, nil)
+			if x.Cte.RecursivePartLogicalPlan != nil {
+				c.collectFromPlan(nil, x.Cte.RecursivePartLogicalPlan, nil, nil)
+			}
 		}
 		// Schema change from seedPlan/recursivePlan to self.
 		columns := x.Schema().Columns

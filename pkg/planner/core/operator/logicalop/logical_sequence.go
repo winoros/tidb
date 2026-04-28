@@ -56,17 +56,32 @@ func (p *LogicalSequence) Schema() *expression.Schema {
 // HashCode inherits the BaseLogicalPlan.LogicalPlan.<0th> implementation.
 
 // PredicatePushDown implements the base.LogicalPlan.<1st> interface.
-// Currently, we only maintain the main query tree.
 func (p *LogicalSequence) PredicatePushDown(predicates []expression.Expression) ([]expression.Expression, base.LogicalPlan, error) {
 	lastIdx := p.ChildLen() - 1
 	remained, newLastChild, err := p.Children()[lastIdx].PredicatePushDown(predicates)
+	if err != nil {
+		return nil, p, err
+	}
 	p.SetChild(lastIdx, newLastChild)
-	return remained, p, err
+	for i := lastIdx - 1; i >= 0; i-- {
+		_, newChild, err := p.Children()[i].PredicatePushDown(nil)
+		if err != nil {
+			return nil, p, err
+		}
+		p.SetChild(i, newChild)
+	}
+	return remained, p, nil
 }
 
 // PruneColumns implements the base.LogicalPlan.<2nd> interface.
 func (p *LogicalSequence) PruneColumns(parentUsedCols []*expression.Column) (base.LogicalPlan, error) {
 	var err error
+	for i := range p.ChildLen() - 1 {
+		p.Children()[i], err = p.Children()[i].PruneColumns(p.Children()[i].Schema().Columns)
+		if err != nil {
+			return nil, err
+		}
+	}
 	p.Children()[p.ChildLen()-1], err = p.Children()[p.ChildLen()-1].PruneColumns(parentUsedCols)
 	if err != nil {
 		return nil, err

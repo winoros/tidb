@@ -4617,13 +4617,7 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p b
 }
 
 func (b *PlanBuilder) tryToBuildSequence(ctes []*cteInfo, p base.LogicalPlan) base.LogicalPlan {
-	if !b.ctx.GetSessionVars().EnableMPPSharedCTEExecution {
-		return p
-	}
 	for i := len(ctes) - 1; i >= 0; i-- {
-		if !ctes[i].nonRecursive {
-			return p
-		}
 		if ctes[i].isInline || ctes[i].cteClass == nil {
 			ctes = slices.Delete(ctes, i, i+1)
 		}
@@ -4633,6 +4627,12 @@ func (b *PlanBuilder) tryToBuildSequence(ctes []*cteInfo, p base.LogicalPlan) ba
 	}
 	lctes := make([]base.LogicalPlan, 0, len(ctes)+1)
 	for _, cte := range ctes {
+		// Producer plans with Apply still rely on the enclosing query's outer-row schema.
+		// Keep them on the existing independent optimization path until Sequence preserves that schema.
+		if containsLogicalApply(cte.cteClass.SeedPartLogicalPlan) ||
+			(cte.cteClass.RecursivePartLogicalPlan != nil && containsLogicalApply(cte.cteClass.RecursivePartLogicalPlan)) {
+			continue
+		}
 		lcte := logicalop.LogicalCTE{
 			Cte:               cte.cteClass,
 			CteAsName:         cte.def.Name,
@@ -4640,14 +4640,39 @@ func (b *PlanBuilder) tryToBuildSequence(ctes []*cteInfo, p base.LogicalPlan) ba
 			SeedStat:          cte.seedStat,
 			OnlyUsedAsStorage: true,
 		}.Init(b.ctx, b.getSelectOffset())
+		cte.cteClass.UseSequence = true
 		lcte.SetSchema(getResultCTESchema(cte.seedLP.Schema(), b.ctx.GetSessionVars()))
+		lcte.SetOutputNames(cte.seedLP.OutputNames())
+		if cte.cteClass.RecursivePartLogicalPlan != nil {
+			lcte.SetChildren(cte.cteClass.SeedPartLogicalPlan, cte.cteClass.RecursivePartLogicalPlan)
+		} else {
+			lcte.SetChildren(cte.cteClass.SeedPartLogicalPlan)
+		}
 		lctes = append(lctes, lcte)
+	}
+	if len(lctes) == 0 {
+		return p
 	}
 	b.optFlag |= rule.FlagPushDownSequence
 	seq := logicalop.LogicalSequence{}.Init(b.ctx, b.getSelectOffset())
 	seq.SetChildren(append(lctes, p)...)
 	seq.SetOutputNames(p.OutputNames().Shallow())
 	return seq
+}
+
+func containsLogicalApply(p base.LogicalPlan) bool {
+	if p == nil {
+		return false
+	}
+	if _, ok := p.(*logicalop.LogicalApply); ok {
+		return true
+	}
+	for _, child := range p.Children() {
+		if containsLogicalApply(child) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *PlanBuilder) buildTableDual() *logicalop.LogicalTableDual {

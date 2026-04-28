@@ -108,7 +108,17 @@ func (s *PartitionProcessor) rewriteDataSource(lp base.LogicalPlan) (base.Logica
 		p.SetChildren(ds)
 		return p, nil
 	case *logicalop.LogicalCTE:
-		return lp, nil
+		if !p.OnlyUsedAsStorage || p.Cte.RecursivePartLogicalPlan != nil {
+			return lp, nil
+		}
+		children := lp.Children()
+		for i, child := range children {
+			newChild, err := s.rewriteDataSource(child)
+			if err != nil {
+				return nil, err
+			}
+			p.SetChild(i, newChild)
+		}
 	default:
 		children := lp.Children()
 		for i, child := range children {

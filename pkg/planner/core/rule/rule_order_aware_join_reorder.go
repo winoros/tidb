@@ -44,7 +44,7 @@ func (r *OrderAwareJoinReorder) optimizeRecursive(
 	if p == nil {
 		return false, false, nil
 	}
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
+	if cte, ok := p.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return false, false, nil
 	}
 	if len(orderCols) == 0 {

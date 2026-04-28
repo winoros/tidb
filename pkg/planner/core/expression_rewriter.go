@@ -1574,8 +1574,8 @@ func (er *expressionRewriter) handleScalarSubquery(ctx context.Context, planCtx 
 }
 
 func hasCTEConsumerInSubPlan(p base.LogicalPlan) bool {
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
-		return true
+	if cte, ok := p.(*logicalop.LogicalCTE); ok {
+		return !cte.OnlyUsedAsStorage
 	}
 	return slices.ContainsFunc(p.Children(), hasCTEConsumerInSubPlan)
 }

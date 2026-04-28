@@ -197,6 +197,11 @@ func TestCTEShareCorColumn(t *testing.T) {
 	tk.MustExec("create table t1(a int);")
 	tk.MustExec("insert into t1 values(1), (2);")
 	tk.MustQuery("SELECT * FROM t1 dt WHERE EXISTS( WITH RECURSIVE qn AS (SELECT a AS b UNION ALL SELECT b+1 FROM qn WHERE b=0 or b = 1) SELECT * FROM qn dtqn1 where exists (select /*+ NO_DECORRELATE() */ b from qn where dtqn1.b+1));").Check(testkit.Rows("1", "2"))
+
+	tk.MustExec("drop table if exists recursive_filter_t;")
+	tk.MustExec("create table recursive_filter_t(n int);")
+	tk.MustExec("insert into recursive_filter_t values(1);")
+	tk.MustQuery("with recursive r(n) as (select n from recursive_filter_t union all select n + 1 from r where n < 3) select n from r where n = 2 order by n;").Check(testkit.Rows("2"))
 }
 
 func TestCTEIterationMemTracker(t *testing.T) {

@@ -54,7 +54,7 @@ func (gc *GcSubstituter) Optimize(ctx context.Context, lp base.LogicalPlan) (bas
 // For the sake of simplicity, we don't collect the stored generate column because we can't get their expressions directly.
 // TODO: support stored generate column.
 func collectGenerateColumn(lp base.LogicalPlan, exprToColumn ExprColumnMap) {
-	if _, ok := lp.(*logicalop.LogicalCTE); ok {
+	if cte, ok := lp.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return
 	}
 	for _, child := range lp.Children() {

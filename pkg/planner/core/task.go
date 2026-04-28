@@ -2161,19 +2161,38 @@ func attach2Task4PhysicalWindow(pp base.PhysicalPlan, tasks ...base.Task) base.T
 // attach2Task4PhysicalCTEStorage implements the PhysicalPlan interface.
 func attach2Task4PhysicalCTEStorage(pp base.PhysicalPlan, tasks ...base.Task) base.Task {
 	p := pp.(*physicalop.PhysicalCTEStorage)
-	t := tasks[0].Copy()
-	if mpp, ok := t.(*physicalop.MppTask); ok {
+	if len(tasks) == 1 {
+		t := tasks[0].Copy()
+		if mpp, ok := t.(*physicalop.MppTask); ok {
+			p.SetChildren(t.Plan())
+			p.CTE.SeedPartPhysicalPlan = t.Plan()
+			p.CTE.RecursivePartPhysicalPlan = nil
+			nt := physicalop.NewMppTask(p,
+				mpp.GetPartitionType(), mpp.GetHashCols(),
+				mpp.GetTblColHists(), mpp.GetWarnings())
+			return nt
+		}
+		t = t.ConvertToRootTask(p.SCtx())
 		p.SetChildren(t.Plan())
-		nt := physicalop.NewMppTask(p,
-			mpp.GetPartitionType(), mpp.GetHashCols(),
-			mpp.GetTblColHists(), mpp.GetWarnings())
-		return nt
+		p.CTE.SeedPartPhysicalPlan = t.Plan()
+		p.CTE.RecursivePartPhysicalPlan = nil
+		ta := &physicalop.RootTask{}
+		ta.SetPlan(p)
+		ta.Warnings.CopyFrom(&t.(*physicalop.RootTask).Warnings)
+		return ta
 	}
-	t.ConvertToRootTask(p.SCtx())
-	p.SetChildren(t.Plan())
+	if len(tasks) != 2 {
+		return base.InvalidTask
+	}
+
+	seedTask := tasks[0].Copy().ConvertToRootTask(p.SCtx())
+	recurTask := tasks[1].Copy().ConvertToRootTask(p.SCtx())
+	p.SetChildren(seedTask.Plan(), recurTask.Plan())
+	p.CTE.SeedPartPhysicalPlan = seedTask.Plan()
+	p.CTE.RecursivePartPhysicalPlan = recurTask.Plan()
 	ta := &physicalop.RootTask{}
 	ta.SetPlan(p)
-	ta.Warnings.CopyFrom(&t.(*physicalop.RootTask).Warnings)
+	ta.Warnings.CopyFrom(&seedTask.(*physicalop.RootTask).Warnings, &recurTask.(*physicalop.RootTask).Warnings)
 	return ta
 }
 

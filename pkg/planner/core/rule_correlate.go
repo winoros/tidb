@@ -49,7 +49,6 @@ func (s *CorrelateSolver) Optimize(ctx context.Context, p base.LogicalPlan) (ret
 }
 
 func (s *CorrelateSolver) correlate(ctx context.Context, p base.LogicalPlan) (base.LogicalPlan, bool, error) {
-	// CTE's logical optimization is independent.
 	if _, ok := p.(*logicalop.LogicalCTE); ok {
 		return p, false, nil
 	}

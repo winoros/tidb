@@ -300,8 +300,7 @@ func (*OuterJoinEliminator) isInnerJoinKeysContainIndex(innerPlan base.LogicalPl
 }
 
 func (o *OuterJoinEliminator) doOptimize(p base.LogicalPlan, aggCols []*expression.Column, parentCols []*expression.Column) (base.LogicalPlan, error) {
-	// CTE's logical optimization is independent.
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
+	if cte, ok := p.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return p, nil
 	}
 	var err error

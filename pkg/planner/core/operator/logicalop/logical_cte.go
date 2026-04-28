@@ -72,6 +72,7 @@ type CTEClass struct {
 	PushDownPredicates []expression.Expression
 	ColumnMap          map[string]*expression.Column
 	IsOuterMostCTE     bool
+	UseSequence        bool
 }
 
 const emptyCTEClassSize = int64(unsafe.Sizeof(CTEClass{}))
@@ -105,11 +106,13 @@ func (cc *CTEClass) MemoryUsage() (sum int64) {
 
 // PredicatePushDown implements base.LogicalPlan.<1st> interface.
 func (p *LogicalCTE) PredicatePushDown(predicates []expression.Expression) ([]expression.Expression, base.LogicalPlan, error) {
+	if p.OnlyUsedAsStorage {
+		return p.predicatePushDownStorage(predicates)
+	}
 	if p.Cte.RecursivePartLogicalPlan != nil {
-		// Doesn't support recursive CTE yet.
 		return predicates, p.Self(), nil
 	}
-	if !p.Cte.IsOuterMostCTE {
+	if !p.Cte.UseSequence && !p.Cte.IsOuterMostCTE {
 		return predicates, p.Self(), nil
 	}
 	pushedPredicates := make([]expression.Expression, len(predicates))
@@ -138,9 +141,43 @@ func (p *LogicalCTE) PredicatePushDown(predicates []expression.Expression) ([]ex
 	return predicates, p.Self(), nil
 }
 
+func (p *LogicalCTE) predicatePushDownStorage(predicates []expression.Expression) ([]expression.Expression, base.LogicalPlan, error) {
+	if p.Cte.RecursivePartLogicalPlan == nil && len(p.Cte.PushDownPredicates) > 0 {
+		newCond := expression.ComposeDNFCondition(p.SCtx().GetExprCtx(), p.Cte.PushDownPredicates...)
+		seed := p.Cte.SeedPartLogicalPlan
+		if p.ChildLen() > 0 {
+			seed = p.Children()[0]
+		}
+		newSel := LogicalSelection{Conditions: []expression.Expression{newCond}}.Init(p.SCtx(), seed.QueryBlockOffset())
+		newSel.SetChildren(seed)
+		if p.ChildLen() > 0 {
+			p.SetChild(0, newSel)
+		} else {
+			p.SetChildren(newSel)
+		}
+		p.Cte.PushDownPredicates = p.Cte.PushDownPredicates[:0]
+		p.Cte.OptFlag = ruleutil.SetPredicatePushDownFlag(p.Cte.OptFlag)
+	}
+	for i, child := range p.Children() {
+		_, newChild, err := child.PredicatePushDown(nil)
+		if err != nil {
+			return nil, p.Self(), err
+		}
+		p.SetChild(i, newChild)
+	}
+	return predicates, p.Self(), nil
+}
+
 // PruneColumns implements the base.LogicalPlan.<2nd> interface.
 // LogicalCTE just do an empty function call. It's logical optimize is indivisual phase.
 func (p *LogicalCTE) PruneColumns(_ []*expression.Column) (base.LogicalPlan, error) {
+	if p.OnlyUsedAsStorage && p.Cte.RecursivePartLogicalPlan == nil && p.ChildLen() > 0 {
+		child, err := p.Children()[0].PruneColumns(p.Children()[0].Schema().Columns)
+		if err != nil {
+			return nil, err
+		}
+		p.SetChild(0, child)
+	}
 	return p, nil
 }
 
@@ -166,16 +203,40 @@ func (p *LogicalCTE) PushDownTopN(topNLogicalPlan base.LogicalPlan) base.Logical
 
 // PullUpConstantPredicates inherits BaseLogicalPlan.LogicalPlan.<9th> implementation.
 
-// RecursiveDeriveStats inherits BaseLogicalPlan.LogicalPlan.<10th> implementation.
+// RecursiveDeriveStats implements BaseLogicalPlan.LogicalPlan.<10th> interface.
+func (p *LogicalCTE) RecursiveDeriveStats(colGroups [][]*expression.Column) (*property.StatsInfo, bool, error) {
+	if !p.OnlyUsedAsStorage || p.Cte.RecursivePartLogicalPlan == nil || p.ChildLen() < 2 {
+		return p.BaseLogicalPlan.RecursiveDeriveStats(colGroups)
+	}
+	cumColGroups := p.ExtractColGroups(colGroups)
+	seedStats, seedReload, err := p.Children()[0].RecursiveDeriveStats(cumColGroups)
+	if err != nil {
+		return nil, false, err
+	}
+	if p.SeedStat != nil {
+		*p.SeedStat = *seedStats
+	}
+	recurStats, recurReload, err := p.Children()[1].RecursiveDeriveStats(cumColGroups)
+	if err != nil {
+		return nil, false, err
+	}
+	childStats := []*property.StatsInfo{seedStats, recurStats}
+	childSchemas := []*expression.Schema{p.Children()[0].Schema(), p.Children()[1].Schema()}
+	return p.DeriveStats(childStats, p.Schema(), childSchemas, []bool{seedReload, recurReload})
+}
 
 // DeriveStats implements the base.LogicalPlan.<11th> interface.
-func (p *LogicalCTE) DeriveStats(_ []*property.StatsInfo, selfSchema *expression.Schema, _ []*expression.Schema, reloads []bool) (*property.StatsInfo, bool, error) {
+func (p *LogicalCTE) DeriveStats(childStats []*property.StatsInfo, selfSchema *expression.Schema, childSchemas []*expression.Schema, reloads []bool) (*property.StatsInfo, bool, error) {
 	var reload bool
-	if len(reloads) == 1 {
-		reload = reloads[0]
+	for _, one := range reloads {
+		reload = reload || one
 	}
 	if !reload && p.StatsInfo() != nil {
 		return p.StatsInfo(), false, nil
+	}
+
+	if p.Cte.UseSequence {
+		return p.deriveStatsFromSequence(childStats, selfSchema, childSchemas)
 	}
 
 	var err error
@@ -238,6 +299,61 @@ func (p *LogicalCTE) DeriveStats(_ []*property.StatsInfo, selfSchema *expression
 	return p.StatsInfo(), true, nil
 }
 
+func (p *LogicalCTE) deriveStatsFromSequence(childStats []*property.StatsInfo, selfSchema *expression.Schema, childSchemas []*expression.Schema) (*property.StatsInfo, bool, error) {
+	seedStats := p.Cte.SeedPartLogicalPlan.StatsInfo()
+	seedSchema := p.Cte.SeedPartLogicalPlan.Schema()
+	if len(childStats) > 0 && childStats[0] != nil {
+		seedStats = childStats[0]
+	}
+	if len(childSchemas) > 0 && childSchemas[0] != nil {
+		seedSchema = childSchemas[0]
+	}
+	if seedStats == nil {
+		var err error
+		seedStats, _, err = p.Cte.SeedPartLogicalPlan.RecursiveDeriveStats(nil)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	p.SetStats(&property.StatsInfo{
+		RowCount: seedStats.RowCount,
+		ColNDVs:  make(map[int64]float64, selfSchema.Len()),
+	})
+	if p.SeedStat != nil {
+		*p.SeedStat = *seedStats
+	}
+	for i, col := range selfSchema.Columns {
+		p.StatsInfo().ColNDVs[col.UniqueID] += seedStats.ColNDVs[seedSchema.Columns[i].UniqueID]
+	}
+	if p.Cte.RecursivePartLogicalPlan != nil {
+		recurStats := p.Cte.RecursivePartLogicalPlan.StatsInfo()
+		recurSchema := p.Cte.RecursivePartLogicalPlan.Schema()
+		if len(childStats) > 1 && childStats[1] != nil {
+			recurStats = childStats[1]
+		}
+		if len(childSchemas) > 1 && childSchemas[1] != nil {
+			recurSchema = childSchemas[1]
+		}
+		if recurStats == nil {
+			var err error
+			recurStats, _, err = p.Cte.RecursivePartLogicalPlan.RecursiveDeriveStats(nil)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		for i, col := range selfSchema.Columns {
+			p.StatsInfo().ColNDVs[col.UniqueID] += recurStats.ColNDVs[recurSchema.Columns[i].UniqueID]
+		}
+		if p.Cte.IsDistinct {
+			p.StatsInfo().RowCount, _ = cardinality.EstimateColsNDVWithMatchedLen(
+				p.SCtx(), p.Schema().Columns, p.Schema(), p.StatsInfo())
+		} else {
+			p.StatsInfo().RowCount += recurStats.RowCount
+		}
+	}
+	return p.StatsInfo(), true, nil
+}
+
 // ExtractColGroups inherits BaseLogicalPlan.LogicalPlan.<12th> implementation.
 
 // PreparePossibleProperties implements base.LogicalPlan.<13th> interface.
@@ -283,9 +399,50 @@ func (p *LogicalCTE) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
 
 // Children inherits BaseLogicalPlan.LogicalPlan.<17th> implementation.
 
-// SetChildren inherits BaseLogicalPlan.LogicalPlan.<18th> implementation.
+// SetChildren implements BaseLogicalPlan.LogicalPlan.<18th> interface.
+func (p *LogicalCTE) SetChildren(children ...base.LogicalPlan) {
+	p.BaseLogicalPlan.SetChildren(children...)
+	p.syncStorageChildrenToCTEClass(children...)
+}
 
-// SetChild inherits BaseLogicalPlan.LogicalPlan.<19th> implementation.
+// SetChild implements BaseLogicalPlan.LogicalPlan.<19th> interface.
+func (p *LogicalCTE) SetChild(i int, child base.LogicalPlan) {
+	p.BaseLogicalPlan.SetChild(i, child)
+	if !p.OnlyUsedAsStorage {
+		return
+	}
+	if i == 0 {
+		p.syncSeedChild(child)
+	} else if i == 1 {
+		p.syncRecursiveChild(child)
+	}
+}
+
+func (p *LogicalCTE) syncStorageChildrenToCTEClass(children ...base.LogicalPlan) {
+	if !p.OnlyUsedAsStorage || p.Cte == nil {
+		return
+	}
+	if len(children) > 0 {
+		p.syncSeedChild(children[0])
+	}
+	if len(children) > 1 {
+		p.syncRecursiveChild(children[1])
+	}
+}
+
+func (p *LogicalCTE) syncSeedChild(child base.LogicalPlan) {
+	if p.Cte.SeedPartLogicalPlan != child {
+		p.Cte.SeedPartLogicalPlan = child
+		p.Cte.SeedPartPhysicalPlan = nil
+	}
+}
+
+func (p *LogicalCTE) syncRecursiveChild(child base.LogicalPlan) {
+	if p.Cte.RecursivePartLogicalPlan != child {
+		p.Cte.RecursivePartLogicalPlan = child
+		p.Cte.RecursivePartPhysicalPlan = nil
+	}
+}
 
 // RollBackTaskMap inherits BaseLogicalPlan.LogicalPlan.<20th> implementation.
 

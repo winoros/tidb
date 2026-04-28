@@ -213,8 +213,7 @@ func (*MaxMinEliminator) eliminateSingleMaxMin(agg *logicalop.LogicalAggregation
 
 // eliminateMaxMin tries to convert max/min to Limit+Sort operators.
 func (a *MaxMinEliminator) eliminateMaxMin(p base.LogicalPlan) base.LogicalPlan {
-	// CTE's logical optimization is indenpent.
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
+	if cte, ok := p.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return p
 	}
 	newChildren := make([]base.LogicalPlan, 0, len(p.Children()))

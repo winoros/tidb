@@ -324,7 +324,7 @@ func (s *JoinReOrderSolver) Optimize(_ context.Context, p base.LogicalPlan) (bas
 
 // optimizeRecursive recursively collects join groups and applies join reorder algorithm for each group.
 func (s *JoinReOrderSolver) optimizeRecursive(ctx base.PlanContext, p base.LogicalPlan) (base.LogicalPlan, error) {
-	if _, ok := p.(*logicalop.LogicalCTE); ok {
+	if cte, ok := p.(*logicalop.LogicalCTE); ok && (!cte.OnlyUsedAsStorage || cte.Cte.RecursivePartLogicalPlan != nil) {
 		return p, nil
 	}
 
