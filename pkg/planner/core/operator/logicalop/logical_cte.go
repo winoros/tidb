@@ -169,16 +169,32 @@ func (p *LogicalCTE) predicatePushDownStorage(predicates []expression.Expression
 }
 
 // PruneColumns implements the base.LogicalPlan.<2nd> interface.
-// LogicalCTE just do an empty function call. It's logical optimize is indivisual phase.
-func (p *LogicalCTE) PruneColumns(_ []*expression.Column) (base.LogicalPlan, error) {
+// LogicalCTE just does an empty function call. Its logical optimization is an individual phase.
+func (p *LogicalCTE) PruneColumns(parentUsedCols []*expression.Column) (base.LogicalPlan, error) {
 	if p.OnlyUsedAsStorage && p.Cte.RecursivePartLogicalPlan == nil && p.ChildLen() > 0 {
-		child, err := p.Children()[0].PruneColumns(p.Children()[0].Schema().Columns)
+		child, err := p.Children()[0].PruneColumns(p.storageSeedUsedColumns(parentUsedCols))
 		if err != nil {
 			return nil, err
 		}
 		p.SetChild(0, child)
 	}
 	return p, nil
+}
+
+func (p *LogicalCTE) storageSeedUsedColumns(parentUsedCols []*expression.Column) []*expression.Column {
+	seedUsedCols := make([]*expression.Column, 0, len(parentUsedCols))
+	for _, col := range parentUsedCols {
+		if seedCol, ok := p.Cte.ColumnMap[string(col.HashCode())]; ok {
+			seedUsedCols = append(seedUsedCols, seedCol)
+			continue
+		}
+		if idx := p.Schema().ColumnIndex(col); idx >= 0 && idx < p.Children()[0].Schema().Len() {
+			seedUsedCols = append(seedUsedCols, p.Children()[0].Schema().Columns[idx])
+			continue
+		}
+		seedUsedCols = append(seedUsedCols, col)
+	}
+	return seedUsedCols
 }
 
 // BuildKeyInfo inherits the BaseLogicalPlan.<4th> implementation.

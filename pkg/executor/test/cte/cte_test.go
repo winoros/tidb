@@ -202,6 +202,11 @@ func TestCTEShareCorColumn(t *testing.T) {
 	tk.MustExec("create table recursive_filter_t(n int);")
 	tk.MustExec("insert into recursive_filter_t values(1);")
 	tk.MustQuery("with recursive r(n) as (select n from recursive_filter_t union all select n + 1 from r where n < 3) select n from r where n = 2 order by n;").Check(testkit.Rows("2"))
+
+	tk.MustExec("drop table if exists sequence_prune_t;")
+	tk.MustExec("create table sequence_prune_t(a int, b int, c int);")
+	tk.MustExec("insert into sequence_prune_t values(1, 2, 2), (2, 3, 3), (4, 5, 9);")
+	tk.MustQuery("with c1 as (select * from sequence_prune_t), c2 as (select x.a, x.b, x.c from c1 x join c1 y on x.b = y.c) select * from c2 order by a;").Check(testkit.Rows("1 2 2", "2 3 3"))
 }
 
 func TestCTEIterationMemTracker(t *testing.T) {

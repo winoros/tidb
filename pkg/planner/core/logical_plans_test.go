@@ -115,6 +115,15 @@ func checkCTESequencePredicatePushDown(t *testing.T, s *coretestsdk.PlannerSuite
 	require.Len(t, seq.Children(), 3)
 	require.Len(t, requireStorageCTE(t, seq.Children()[0]).Children(), 1)
 	require.Len(t, requireStorageCTE(t, seq.Children()[1]).Children(), 2)
+
+	dependentSQL := "with c1 as (select * from t), c2 as (select c1.* from c1, c1 c2 where c1.b = c2.c) select * from c2 c1, c2 where c1.a = c2.b"
+	lp = buildLogicalPlanForCTESequenceTest(t, s, dependentSQL)
+	optimized, err = logicalOptimize(context.Background(), rule.FlagPredicatePushDown|rule.FlagPruneColumns|rule.FlagPruneColumnsAgain, lp)
+	require.NoError(t, err)
+	seq = requireLogicalSequence(t, optimized)
+	storage = requireStorageCTE(t, seq.Children()[1])
+	require.Len(t, storage.Children(), 1)
+	require.Equal(t, storage.Schema().Len(), storage.Children()[0].Schema().Len())
 }
 
 func buildLogicalPlanForCTESequenceTest(t *testing.T, s *coretestsdk.PlannerSuite, sql string) base.LogicalPlan {
