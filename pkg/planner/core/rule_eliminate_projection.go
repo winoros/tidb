@@ -172,7 +172,7 @@ func (pe *ProjectionEliminator) eliminate(p base.LogicalPlan, replace map[string
 		childFlag = true
 	}
 	for i, child := range p.Children() {
-		p.Children()[i] = pe.eliminate(child, replace, childFlag)
+		p.SetChild(i, pe.eliminate(child, replace, childFlag))
 	}
 
 	// Replace all columns in the schema with the replaced columns.
@@ -198,7 +198,7 @@ func (pe *ProjectionEliminator) eliminate(p base.LogicalPlan, replace map[string
 				foldedExpr.GetType(ctx.GetExprCtx().GetEvalCtx()).SetFlag((foldedExpr.GetType(ctx.GetExprCtx().GetEvalCtx()).GetFlag() & ^mysql.NotNullFlag) | (proj.Exprs[i].GetType(ctx.GetExprCtx().GetEvalCtx()).GetFlag() & mysql.NotNullFlag))
 				proj.Exprs[i] = foldedExpr
 			}
-			p.Children()[0] = child.Children()[0]
+			p.SetChild(0, child.Children()[0])
 		}
 	}
 
