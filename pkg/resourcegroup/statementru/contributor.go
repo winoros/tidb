@@ -20,6 +20,9 @@ import "sync"
 // their physical work starts. Producers must terminate every registered
 // contributor before Statement.Finish; finalization does not wait for them.
 type UnitContributorRegistrar interface {
+	// RequiredUnits returns the immutable statement-local unit selection so a
+	// producer can avoid installing owners for units that are not requested.
+	RequiredUnits() UnitMask
 	RegisterUnitContributor(UnitMask) UnitContributor
 }
 
@@ -49,6 +52,13 @@ type contributorCoordinator struct {
 
 type statementContributorRegistrar struct {
 	statement *Statement
+}
+
+func (r *statementContributorRegistrar) RequiredUnits() UnitMask {
+	if r == nil || r.statement == nil {
+		return 0
+	}
+	return r.statement.requiredUnits
 }
 
 func (r *statementContributorRegistrar) RegisterUnitContributor(units UnitMask) UnitContributor {

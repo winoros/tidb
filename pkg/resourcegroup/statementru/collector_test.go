@@ -102,6 +102,9 @@ func TestStatementUnitContributors(t *testing.T) {
 	t.Run("all contributors complete", func(t *testing.T) {
 		statement := newStatement()
 		registrar := statement.UnitContributorRegistrar()
+		if got := registrar.RequiredUnits(); got != CPUWork.Mask() {
+			t.Fatalf("unexpected required units: %v", got)
+		}
 		first := registrar.RegisterUnitContributor(CPUWork.Mask())
 		second := registrar.RegisterUnitContributor(CPUWork.Mask())
 		if first == nil || second == nil {

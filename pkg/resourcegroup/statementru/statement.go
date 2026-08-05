@@ -87,13 +87,14 @@ type FinishResult struct {
 // Statement owns one logical statement's collector and exactly-once finish.
 // Transparent retries keep using the same Statement.
 type Statement struct {
-	mode         Mode
-	collector    *Collector
-	reporter     Reporter
-	unit         statementUnitRecorder
-	evidence     statementEvidenceRecorder
-	contributors atomic.Pointer[contributorCoordinator]
-	registrar    statementContributorRegistrar
+	mode          Mode
+	requiredUnits UnitMask
+	collector     *Collector
+	reporter      Reporter
+	unit          statementUnitRecorder
+	evidence      statementEvidenceRecorder
+	contributors  atomic.Pointer[contributorCoordinator]
+	registrar     statementContributorRegistrar
 
 	finishOnce sync.Once
 	finish     FinishResult
@@ -144,9 +145,10 @@ func NewStatement(selection Selection) *Statement {
 		RetainDetails: retainDetails,
 	})
 	statement := &Statement{
-		mode:      selection.Mode,
-		collector: collector,
-		reporter:  selection.Reporter,
+		mode:          selection.Mode,
+		requiredUnits: selection.RequiredUnits,
+		collector:     collector,
+		reporter:      selection.Reporter,
 	}
 	statement.unit.collector = collector
 	statement.evidence.collector = collector
