@@ -62,6 +62,224 @@ func TestCollectorAdd(t *testing.T) {
 
 }
 
+func TestCollectorAcceptVectorAtomic(t *testing.T) {
+	weights := Weights{CPUWork: 1, ScanBytes: 1}
+	collector := NewCollector(Config{
+		RequiredUnits: CPUWork.Mask() | ScanBytes.Mask(),
+		Weights:       &weights,
+		RetainDetails: true,
+	})
+	first := UnitValues{CPUWork: 2, ScanBytes: 3}
+	if !collector.AcceptVector(first) {
+		t.Fatal("valid vector was rejected")
+	}
+	invalid := UnitValues{CPUWork: 5, ScanBytes: math.NaN()}
+	if collector.AcceptVector(invalid) {
+		t.Fatal("invalid vector was accepted")
+	}
+	result := collector.Finalize()
+	assertOutcome(t, result, StateInvalid, ReasonInvalidObservation)
+	units, ok := result.Units()
+	if !ok || units != first {
+		t.Fatalf("rejected vector changed accepted values: %+v, %v", units, ok)
+	}
+	if collector.AcceptVector(UnitValues{CPUWork: 1}) {
+		t.Fatal("late vector was accepted")
+	}
+}
+
+func TestStatementUnitContributors(t *testing.T) {
+	weights := Weights{CPUWork: 1}
+	newStatement := func() *Statement {
+		return NewStatement(Selection{
+			Mode:          ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: CPUWork.Mask(),
+			Weights:       &weights,
+		})
+	}
+
+	t.Run("all contributors complete", func(t *testing.T) {
+		statement := newStatement()
+		registrar := statement.UnitContributorRegistrar()
+		first := registrar.RegisterUnitContributor(CPUWork.Mask())
+		second := registrar.RegisterUnitContributor(CPUWork.Mask())
+		if first == nil || second == nil {
+			t.Fatal("contributors were not registered")
+		}
+		if !first.Complete(UnitValues{CPUWork: 2}) || !second.Complete(UnitValues{CPUWork: 3}) {
+			t.Fatal("complete vectors were rejected")
+		}
+		if first.Unavailable() {
+			t.Fatal("duplicate contributor completion was accepted")
+		}
+		finish, performed := statement.Finish(TerminalSuccess)
+		if !performed {
+			t.Fatal("statement did not finish")
+		}
+		assertOutcome(t, finish.Result, StateComplete, ReasonNone)
+		total, ok := finish.Result.TotalRU()
+		if !ok || total != 5 {
+			t.Fatalf("unexpected contributor total: %v, %v", total, ok)
+		}
+		if registrar.RegisterUnitContributor(CPUWork.Mask()) != nil {
+			t.Fatal("registration after seal succeeded")
+		}
+	})
+
+	t.Run("concurrent contributors are accepted exactly once", func(t *testing.T) {
+		statement := newStatement()
+		registrar := statement.UnitContributorRegistrar()
+		contributors := make([]UnitContributor, 64)
+		for i := range contributors {
+			contributors[i] = registrar.RegisterUnitContributor(CPUWork.Mask())
+			if contributors[i] == nil {
+				t.Fatal("contributor was not registered")
+			}
+		}
+		var wait sync.WaitGroup
+		wait.Add(len(contributors))
+		for _, contributor := range contributors {
+			go func() {
+				defer wait.Done()
+				if !contributor.Complete(UnitValues{CPUWork: 1}) {
+					t.Error("concurrent vector was rejected")
+				}
+			}()
+		}
+		wait.Wait()
+		finish, _ := statement.Finish(TerminalSuccess)
+		total, ok := finish.Result.TotalRU()
+		if !ok || total != float64(len(contributors)) {
+			t.Fatalf("unexpected concurrent total: %v, %v", total, ok)
+		}
+	})
+
+	t.Run("one incomplete owner makes the unit partial", func(t *testing.T) {
+		statement := newStatement()
+		registrar := statement.UnitContributorRegistrar()
+		complete := registrar.RegisterUnitContributor(CPUWork.Mask())
+		incomplete := registrar.RegisterUnitContributor(CPUWork.Mask())
+		if !complete.Complete(UnitValues{CPUWork: 2}) || !incomplete.Unavailable() {
+			t.Fatal("contributor terminal states were rejected")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StatePartial, ReasonIncompleteEvidence)
+		units, ok := finish.Result.Units()
+		if !ok || units[CPUWork] != 2 {
+			t.Fatalf("accepted contributor value was lost: %+v, %v", units, ok)
+		}
+	})
+
+	t.Run("streaming and fixed-vector domains combine without hiding incompleteness", func(t *testing.T) {
+		statement := newStatement()
+		if !statement.UnitRecorder().Add(CPUWork, 2) || !statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()) {
+			t.Fatal("streaming evidence was rejected")
+		}
+		complete := statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask())
+		if !complete.Complete(UnitValues{CPUWork: 3}) {
+			t.Fatal("fixed-vector evidence was rejected")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StateComplete, ReasonNone)
+		total, ok := finish.Result.TotalRU()
+		if !ok || total != 5 {
+			t.Fatalf("disjoint producer values were not combined: %v, %v", total, ok)
+		}
+
+		statement = newStatement()
+		if !statement.UnitRecorder().Add(CPUWork, 2) || !statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()) {
+			t.Fatal("streaming evidence was rejected")
+		}
+		incomplete := statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask())
+		if !incomplete.Unavailable() {
+			t.Fatal("incomplete fixed-vector evidence was rejected")
+		}
+		finish, _ = statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StatePartial, ReasonIncompleteEvidence)
+	})
+
+	t.Run("unterminated owner fails closed", func(t *testing.T) {
+		statement := newStatement()
+		if statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask()) == nil {
+			t.Fatal("contributor was not registered")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StateUnavailable, ReasonMissingEvidence)
+	})
+
+	t.Run("unsupported optional unit is isolated", func(t *testing.T) {
+		statement := newStatement()
+		registrar := statement.UnitContributorRegistrar()
+		cpu := registrar.RegisterUnitContributor(CPUWork.Mask())
+		hash := registrar.RegisterUnitContributor(HashStateRows.Mask())
+		if !cpu.Complete(UnitValues{CPUWork: 4}) || !hash.Unsupported() {
+			t.Fatal("contributor terminal state was rejected")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StateComplete, ReasonNone)
+		coverage, ok := finish.Result.Coverage()
+		if !ok || coverage.UnsupportedUnits != HashStateRows.Mask() {
+			t.Fatalf("optional unsupported evidence was lost: %+v, %v", coverage, ok)
+		}
+	})
+
+	t.Run("usable and unsupported owners retain partial evidence", func(t *testing.T) {
+		for _, test := range []struct {
+			name      string
+			terminate func(UnitContributor) bool
+			wantValue float64
+		}{
+			{
+				name: "complete and unsupported",
+				terminate: func(contributor UnitContributor) bool {
+					return contributor.Complete(UnitValues{CPUWork: 3})
+				},
+				wantValue: 3,
+			},
+			{
+				name: "partial and unsupported",
+				terminate: func(contributor UnitContributor) bool {
+					return contributor.Partial()
+				},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				statement := newStatement()
+				registrar := statement.UnitContributorRegistrar()
+				usable := registrar.RegisterUnitContributor(CPUWork.Mask())
+				unsupported := registrar.RegisterUnitContributor(CPUWork.Mask())
+				if !test.terminate(usable) || !unsupported.Unsupported() {
+					t.Fatal("contributor terminal state was rejected")
+				}
+				finish, _ := statement.Finish(TerminalSuccess)
+				assertOutcome(t, finish.Result, StatePartial, ReasonUnsupported)
+				units, ok := finish.Result.Units()
+				if !ok || units[CPUWork] != test.wantValue {
+					t.Fatalf("usable evidence was lost: %+v, %v", units, ok)
+				}
+				coverage, ok := finish.Result.Coverage()
+				if !ok || coverage.PartialUnits != CPUWork.Mask() || coverage.UnsupportedUnits != CPUWork.Mask() {
+					t.Fatalf("partial unsupported evidence was not retained: %+v, %v", coverage, ok)
+				}
+			})
+		}
+	})
+
+	t.Run("vector cannot escape its lease mask", func(t *testing.T) {
+		statement := newStatement()
+		contributor := statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask())
+		if contributor.Complete(UnitValues{CPUWork: 1, ScanBytes: 1}) {
+			t.Fatal("out-of-mask vector was accepted")
+		}
+		if contributor.Complete(UnitValues{CPUWork: 1}) {
+			t.Fatal("rejected terminal completion was retried")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StatePartial, ReasonIncompleteEvidence)
+	})
+}
+
 func TestCollectorCoverageOutcomes(t *testing.T) {
 	weights := Weights{CPUWork: 1, ScanBytes: 1}
 	required := CPUWork.Mask() | ScanBytes.Mask()

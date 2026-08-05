@@ -14,7 +14,10 @@
 
 package statementru
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // Mode controls how much statement RU state is collected and retained.
 type Mode uint8
@@ -84,11 +87,13 @@ type FinishResult struct {
 // Statement owns one logical statement's collector and exactly-once finish.
 // Transparent retries keep using the same Statement.
 type Statement struct {
-	mode      Mode
-	collector *Collector
-	reporter  Reporter
-	unit      statementUnitRecorder
-	evidence  statementEvidenceRecorder
+	mode         Mode
+	collector    *Collector
+	reporter     Reporter
+	unit         statementUnitRecorder
+	evidence     statementEvidenceRecorder
+	contributors atomic.Pointer[contributorCoordinator]
+	registrar    statementContributorRegistrar
 
 	finishOnce sync.Once
 	finish     FinishResult
@@ -145,6 +150,7 @@ func NewStatement(selection Selection) *Statement {
 	}
 	statement.unit.collector = collector
 	statement.evidence.collector = collector
+	statement.registrar.statement = statement
 	return statement
 }
 
@@ -172,6 +178,15 @@ func (s *Statement) EvidenceRecorder() EvidenceRecorder {
 	return &s.evidence
 }
 
+// UnitContributorRegistrar returns the statement-owned contributor lifecycle
+// capability. It does not expose finalization or direct evidence mutation.
+func (s *Statement) UnitContributorRegistrar() UnitContributorRegistrar {
+	if s == nil {
+		return nil
+	}
+	return &s.registrar
+}
+
 // Finish freezes the result and applies the production reporting gate exactly
 // once. The caller translates its final error into a bounded terminal status.
 // The bool is true only for the caller that performed finalization.
@@ -182,6 +197,7 @@ func (s *Statement) Finish(terminal TerminalStatus) (FinishResult, bool) {
 	finished := false
 	s.finishOnce.Do(func() {
 		finished = true
+		s.sealUnitContributors()
 		s.finish.Result = s.collector.Finalize()
 		s.finish.Terminal = terminal
 		if s.finish.Terminal != TerminalSuccess || s.mode != ModeResultOnly || s.reporter == nil {

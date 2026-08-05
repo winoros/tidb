@@ -360,6 +360,20 @@ type selectResult struct {
 	paging             bool
 
 	iter *selectResultIter
+
+	statementRUCloudSummary *cloudSummaryOwner
+}
+
+func (r *selectResult) abortStatementRUCloudSummary() {
+	if r != nil {
+		r.statementRUCloudSummary.abort()
+	}
+}
+
+func (r *selectResult) completeStatementRUCloudSummary() {
+	if r != nil {
+		r.statementRUCloudSummary.completeEOF()
+	}
 }
 
 func (r *selectResult) fetchResp(ctx context.Context) error {
@@ -403,6 +417,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		duration := time.Since(startTime)
 		r.fetchDuration += duration
 		if err != nil {
+			r.abortStatementRUCloudSummary()
 			// On error paths with a non-nil resultSubset (e.g. ErrMaxKeysReadExceeded),
 			// still merge CopExecDetails so ProcessedKeys reaches StmtCtx.ExecDetails
 			// (feeds tidb_keys_examined and the slow query log). Skip
@@ -422,6 +437,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 			r.memConsume(-atomic.LoadInt64(&r.selectRespSize))
 		}
 		if resultSubset == nil {
+			r.completeStatementRUCloudSummary()
 			r.selectResp = nil
 			atomic.StoreInt64(&r.selectRespSize, 0)
 			if !r.durationReported {
@@ -440,6 +456,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		r.selectResp = new(tipb.SelectResponse)
 		err = r.selectResp.Unmarshal(resultSubset.GetData())
 		if err != nil {
+			r.abortStatementRUCloudSummary()
 			return errors.Trace(err)
 		}
 
@@ -447,10 +464,12 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		atomic.StoreInt64(&r.selectRespSize, respSize)
 		r.memConsume(respSize)
 		if err := r.selectResp.Error; err != nil {
+			r.abortStatementRUCloudSummary()
 			return dbterror.ClassTiKV.Synthesize(terror.ErrCode(err.Code), err.Msg)
 		}
 
 		if len(r.selectResp.IntermediateOutputs) != len(intermediateOutputTypes) {
+			r.abortStatementRUCloudSummary()
 			return errors.Errorf(
 				"The length of intermediate output types %d mismatches the length of got intermediate outputs %d."+
 					" If a response contains intermediate outputs, you should use the SelectResultIter to read the data.",
@@ -460,6 +479,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		r.intermediateOutputTypes = intermediateOutputTypes
 
 		if err = r.ctx.SQLKiller.HandleSignal(); err != nil {
+			r.abortStatementRUCloudSummary()
 			return err
 		}
 		for _, warning := range r.selectResp.Warnings {
@@ -469,15 +489,21 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		r.partialCount++
 
 		hasStats, ok := resultSubset.(CopRuntimeStats)
+		var copStats *copr.CopRuntimeStats
 		if ok {
-			copStats := hasStats.GetCopRuntimeStats()
+			copStats = hasStats.GetCopRuntimeStats()
 			if copStats != nil {
+				r.statementRUCloudSummary.observeResponse(r.selectResp, copStats)
 				if err := r.updateCopRuntimeStats(ctx, copStats, resultSubset.RespTime(), false); err != nil {
+					r.abortStatementRUCloudSummary()
 					return err
 				}
 				r.ctx.ExecDetails.MergeCopExecDetails(&copStats.CopExecDetails, duration)
 				r.ctx.ExecDetails.MergeReadPoolTaskDetails(copStats.ReadPoolTaskDetails)
 			}
+		}
+		if copStats == nil {
+			r.statementRUCloudSummary.observeResponse(r.selectResp, nil)
 		}
 		if len(r.selectResp.Chunks) != 0 {
 			break
@@ -516,13 +542,19 @@ func (r *selectResult) Next(ctx context.Context, chk *chunk.Chunk) error {
 	}
 	// TODO(Shenghui Wu): add metrics
 	encodeType := r.selectResp.GetEncodeType()
+	var err error
 	switch encodeType {
 	case tipb.EncodeType_TypeDefault:
-		return r.readFromDefault(ctx, chk)
+		err = r.readFromDefault(ctx, chk)
 	case tipb.EncodeType_TypeChunk:
-		return r.readFromChunk(ctx, chk)
+		err = r.readFromChunk(ctx, chk)
+	default:
+		err = errors.Errorf("unsupported encode type:%v", encodeType)
 	}
-	return errors.Errorf("unsupported encode type:%v", encodeType)
+	if err != nil {
+		r.abortStatementRUCloudSummary()
+	}
+	return err
 }
 
 func (r *selectResult) IntoIter(intermediateFieldTypes [][]*types.FieldType) (SelectResultIter, error) {
@@ -534,6 +566,7 @@ func (r *selectResult) IntoIter(intermediateFieldTypes [][]*types.FieldType) (Se
 
 // NextRaw returns the next raw partial result.
 func (r *selectResult) NextRaw(ctx context.Context) (data []byte, err error) {
+	r.abortStatementRUCloudSummary()
 	failpoint.Inject("mockNextRawError", func(val failpoint.Value) {
 		if val.(bool) {
 			failpoint.Return(nil, errors.New("mockNextRawError"))
@@ -774,6 +807,7 @@ func (r *selectResult) Close() error {
 }
 
 func (r *selectResult) close() error {
+	r.abortStatementRUCloudSummary()
 	metrics.DistSQLPartialCountHistogram.Observe(float64(r.partialCount))
 	respSize := atomic.SwapInt64(&r.selectRespSize, 0)
 	if respSize > 0 {
@@ -955,10 +989,15 @@ func newSelectResultIter(result *selectResult, intermediateOutputTypes [][]*type
 }
 
 // Next implements the SelectResultIter interface.
-func (iter *selectResultIter) Next(ctx context.Context) (SelectResultRow, error) {
+func (iter *selectResultIter) Next(ctx context.Context) (row SelectResultRow, err error) {
+	defer func() {
+		if err != nil {
+			iter.result.abortStatementRUCloudSummary()
+		}
+	}()
 	for {
 		if r := iter.result; r.selectResp == nil {
-			if err := r.fetchRespWithIntermediateResults(ctx, iter.intermediateOutputTypes); err != nil {
+			if err = r.fetchRespWithIntermediateResults(ctx, iter.intermediateOutputTypes); err != nil {
 				return SelectResultRow{}, err
 			}
 
@@ -971,7 +1010,8 @@ func (iter *selectResultIter) Next(ctx context.Context) (SelectResultRow, error)
 			}
 
 			for i := 0; i <= len(iter.intermediateOutputTypes); i++ {
-				ch, err := newSelRespChannelIter(r, i)
+				var ch *selRespChannelIter
+				ch, err = newSelRespChannelIter(r, i)
 				if err != nil {
 					return SelectResultRow{}, err
 				}
@@ -985,7 +1025,7 @@ func (iter *selectResultIter) Next(ctx context.Context) (SelectResultRow, error)
 			// and then read the index rows (with smaller channel index) that have not been looked up.
 			lastPos := len(iter.channels) - 1
 			channel := iter.channels[lastPos]
-			row, err := channel.Next()
+			row, err = channel.Next()
 			if err != nil || !row.IsEmpty() {
 				return row, err
 			}

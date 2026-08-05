@@ -46,6 +46,60 @@ func BenchmarkCollectorAddUnitParallel(b *testing.B) {
 	})
 }
 
+func BenchmarkCollectorAcceptVector(b *testing.B) {
+	weights := Weights{CPUWork: 1, ScanBytes: 1, NetworkBytes: 1}
+	collector := NewCollector(Config{
+		RequiredUnits: CPUWork.Mask() | ScanBytes.Mask() | NetworkBytes.Mask(),
+		Weights:       &weights,
+	})
+	values := UnitValues{CPUWork: 1, ScanBytes: 2, NetworkBytes: 3}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		benchmarkAccepted = collector.AcceptVector(values)
+	}
+}
+
+func BenchmarkStatementUnitContributorLifecycle(b *testing.B) {
+	weights := Weights{CPUWork: 1}
+	values := UnitValues{CPUWork: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		statement := NewStatement(Selection{
+			Mode:          ModeResultOnly,
+			Applicable:    true,
+			RequiredUnits: CPUWork.Mask(),
+			Weights:       &weights,
+		})
+		contributor := statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask())
+		benchmarkAccepted = contributor.Complete(values)
+		benchmarkFinish, _ = statement.Finish(TerminalSuccess)
+	}
+}
+
+func BenchmarkStatementUnitContributorParallel(b *testing.B) {
+	weights := Weights{CPUWork: 1}
+	statement := NewStatement(Selection{
+		Mode:          ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: CPUWork.Mask(),
+		Weights:       &weights,
+	})
+	registrar := statement.UnitContributorRegistrar()
+	values := UnitValues{CPUWork: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			contributor := registrar.RegisterUnitContributor(CPUWork.Mask())
+			_ = contributor.Complete(values)
+		}
+	})
+	b.StopTimer()
+	benchmarkFinish, _ = statement.Finish(TerminalSuccess)
+}
+
 func BenchmarkCollectorLifecycleFinalize(b *testing.B) {
 	weights := Weights{CPUWork: 1}
 	b.ReportAllocs()

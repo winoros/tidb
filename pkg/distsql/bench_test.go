@@ -16,11 +16,147 @@ package distsql
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/util/benchdaily"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/execdetails"
 )
+
+var cloudSummaryBenchmarkSink uint64
+
+func BenchmarkCloudSummaryObserveResponseMicro(b *testing.B) {
+	for _, responseCount := range []int{1, 16, 128} {
+		for _, summaryCount := range []int{1, 5, 50, 500} {
+			name := fmt.Sprintf("Responses=%d/Summaries=%d", responseCount, summaryCount)
+			b.Run(name, func(b *testing.B) {
+				plan := cloudSummaryPlan{steps: make([]cloudSummaryStep, summaryCount)}
+				rows := make([]uint64, summaryCount)
+				for i := range summaryCount {
+					rows[i] = 1
+					if i > 0 {
+						plan.steps[i] = cloudSummaryStep{child: i - 1, multiplier: 1}
+					}
+				}
+				response := cloudSummaryTestResponse(rows...)
+				stats := completeCloudSummaryTestStats()
+
+				owner := &cloudSummaryOwner{plan: plan}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					owner.cpuWork = 0
+					owner.responses = 0
+					owner.failed = false
+					owner.done = false
+					for range responseCount {
+						owner.observeResponse(response, stats)
+					}
+					cloudSummaryBenchmarkSink = owner.cpuWork
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkCloudSummaryPrepareOwnerLifecycle(b *testing.B) {
+	dagData, err := cloudSummaryTestDAG().Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+	dctx := newCloudSummaryTestDistSQLContext()
+
+	b.Run("Off", func(b *testing.B) {
+		dctx.StatementRUUnitContributors = nil
+		b.ReportAllocs()
+		for range b.N {
+			request := &kv.Request{Tp: kv.ReqTypeDAG, Data: dagData, StoreType: kv.TiKV}
+			if owner := prepareCloudSummaryOwner(dctx, request); owner != nil {
+				b.Fatal("Off mode created a cloud-summary owner")
+			}
+		}
+	})
+
+	b.Run("Stage1", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			statement := newCloudSummaryTestStatement()
+			dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+			request := &kv.Request{Tp: kv.ReqTypeDAG, Data: dagData, StoreType: kv.TiKV}
+			owner := prepareCloudSummaryOwner(dctx, request)
+			if owner == nil {
+				b.Fatal("Stage1 did not create a cloud-summary owner")
+			}
+			owner.abort()
+			statement.Finish(statementru.TerminalSuccess)
+		}
+	})
+}
+
+func BenchmarkCloudSummarySelectToEOF(b *testing.B) {
+	dagData, err := cloudSummaryTestDAG().Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+	responseData, err := cloudSummaryTestResponse(10, 5, 4, 3).Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+	subset := &cloudSummaryTestSubset{data: responseData, stats: completeCloudSummaryTestStats()}
+	dctx := newCloudSummaryTestDistSQLContext()
+	client := &cloudSummaryTestClient{}
+	dctx.Client = client
+	chk := chunk.NewChunkWithCapacity(nil, 0)
+
+	for _, enabled := range []bool{false, true} {
+		name := "Off"
+		if enabled {
+			name = "Stage1"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				dctx.RuntimeStatsColl = execdetails.NewRuntimeStatsColl(dctx.RuntimeStatsColl)
+				var statement *statementru.Statement
+				if enabled {
+					statement = newCloudSummaryTestStatement()
+					dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+				} else {
+					dctx.StatementRUUnitContributors = nil
+				}
+				client.response = &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{subset}}
+				request := &kv.Request{Tp: kv.ReqTypeDAG, Data: dagData, StoreType: kv.TiKV}
+				result, err := SelectWithRuntimeStats(
+					context.Background(), dctx, request, nil, []int{1, 2, 3, 4}, 4,
+				)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := result.Next(context.Background(), chk); err != nil {
+					b.Fatal(err)
+				}
+				if err := result.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if enabled {
+					finish, _ := statement.Finish(statementru.TerminalSuccess)
+					total, ok := finish.Result.TotalRU()
+					if !ok || total != 39 {
+						b.Fatalf("unexpected Stage1 total: %v, %v", total, ok)
+					}
+					cloudSummaryBenchmarkSink = uint64(total)
+				}
+			}
+			b.StopTimer()
+			if !dctx.RuntimeStatsColl.ExistsCopStats(4) {
+				b.Fatal("matched benchmark bypassed normal cop runtime-stat recording")
+			}
+		})
+	}
+}
 
 func BenchmarkSelectResponseChunk_BigResponse(b *testing.B) {
 	for i := 0; i < b.N; i++ {

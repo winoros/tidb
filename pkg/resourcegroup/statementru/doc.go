@@ -18,10 +18,20 @@
 // A Collector accepts nonnegative finite unit deltas from concurrent
 // producers. Unit values and evidence coverage are separate: adding a zero or
 // nonzero delta does not prove that all required evidence for that unit is
-// present or partial. Hot-path contributors use UnitRecorder. Only the
-// statement-level, per-unit coordinator uses EvidenceRecorder, after all
-// contributors for an affected unit have terminated. This preserves the
-// distinction between an authoritative zero and missing evidence.
+// present or partial. Streaming hot-path producers use UnitRecorder and their
+// statement-level coordinator uses EvidenceRecorder. Fixed-vector producers
+// use UnitContributor leases instead. These mechanisms may share a unit only
+// for disjoint physical work; their sticky evidence is combined, so an
+// incomplete domain downgrades an otherwise present unit. Producers must
+// terminate every registered contributor before Statement.Finish; Finish does
+// not wait, and an unterminated contributor fails closed as missing evidence.
+// This preserves the distinction between an authoritative zero and missing
+// evidence.
+// UnitContributorRegistrar provides an exactly-once lease for producers whose
+// completeness is known only after several physical owners finish. Complete
+// leases submit one atomic fixed vector; Statement.Finish seals registration
+// and derives their evidence before freezing the collector. A rejected
+// terminal call still consumes its lease and cannot be retried.
 //
 // Finalize takes one consistent snapshot and is idempotent. Mutations after
 // finalization are rejected and cannot change the frozen Result. Result

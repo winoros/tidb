@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	contextutil "github.com/pingcap/tidb/pkg/util/context"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/memory"
@@ -82,6 +83,7 @@ type DistSQLContext struct {
 	LoadBasedReplicaReadThreshold time.Duration
 	RunawayChecker                resourcegroup.RunawayChecker
 	RUConsumptionReporter         resourcegroup.ConsumptionReporter
+	StatementRUUnitContributors   statementru.UnitContributorRegistrar
 	TiKVClientReadTimeout         uint64
 	MaxExecutionTime              uint64
 	MaxKeysRead                   uint64

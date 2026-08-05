@@ -4,6 +4,7 @@ go_library(
     name = "statementru",
     srcs = [
         "collector.go",
+        "contributor.go",
         "coverage.go",
         "doc.go",
         "result.go",
@@ -24,6 +25,6 @@ go_test(
     ],
     embed = [":statementru"],
     flaky = True,
-    shard_count = 9,
+    shard_count = 11,
     deps = ["@com_github_stretchr_testify//require"],
 )

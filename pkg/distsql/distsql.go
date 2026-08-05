@@ -59,6 +59,7 @@ func GenSelectResultFromMPPResponse(dctx *distsqlctx.DistSQLContext, fieldTypes 
 func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Request, fieldTypes []*types.FieldType) (SelectResult, error) {
 	r, ctx := tracing.StartRegionEx(ctx, "distsql.Select")
 	defer r.End()
+	statementRUCloudSummary := prepareCloudSummaryOwner(dctx, kvReq)
 
 	// For testing purpose.
 	if hook := ctx.Value("CheckSelectRequestHook"); hook != nil {
@@ -85,6 +86,9 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 		EnableCollectExecutionInfo: config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Load(),
 		TryCopLiteWorker:           &dctx.TryCopLiteWorker,
 	}
+	if statementRUCloudSummary != nil {
+		option.EnableCollectExecutionInfo = true
+	}
 
 	// Force the CopLiteWorker to be used or not used for testing purposes
 	failpoint.Inject("TryCopLiteWorker", func(val failpoint.Value) {
@@ -108,6 +112,7 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 
 	resp := dctx.Client.Send(ctx, kvReq, dctx.KVVars, option)
 	if resp == nil {
+		statementRUCloudSummary.abort()
 		return nil, errors.New("client returns nil response")
 	}
 
@@ -120,16 +125,17 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 	// for selectResult, we just use the kvReq.MemTracker prepared for co-processor
 	// instead of creating a new one for simplification.
 	return &selectResult{
-		label:              "dag",
-		resp:               resp,
-		rowLen:             len(fieldTypes),
-		fieldTypes:         fieldTypes,
-		ctx:                dctx,
-		sqlType:            label,
-		memTracker:         kvReq.MemTracker,
-		storeType:          kvReq.StoreType,
-		paging:             kvReq.Paging.Enable || kvReq.Paging.PagingSizeBytes > 0,
-		distSQLConcurrency: kvReq.Concurrency,
+		label:                   "dag",
+		resp:                    resp,
+		rowLen:                  len(fieldTypes),
+		fieldTypes:              fieldTypes,
+		ctx:                     dctx,
+		sqlType:                 label,
+		memTracker:              kvReq.MemTracker,
+		storeType:               kvReq.StoreType,
+		paging:                  kvReq.Paging.Enable || kvReq.Paging.PagingSizeBytes > 0,
+		distSQLConcurrency:      kvReq.Concurrency,
+		statementRUCloudSummary: statementRUCloudSummary,
 	}, nil
 }
 

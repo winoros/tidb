@@ -3578,6 +3578,7 @@ func (s *session) GetDistSQLCtx() *distsqlctx.DistSQLContext {
 			LoadBasedReplicaReadThreshold: vars.LoadBasedReplicaReadThreshold,
 			RunawayChecker:                sc.RunawayChecker,
 			RUConsumptionReporter:         ruConsumptionReporter,
+			StatementRUUnitContributors:   sc.StatementRUUnitContributorRegistrar(),
 			TiKVClientReadTimeout:         vars.GetTiKVClientReadTimeout(),
 			MaxExecutionTime:              vars.GetMaxExecutionTime(),
 			MaxKeysRead:                   vars.GetMaxKeysRead(),
@@ -3604,6 +3605,7 @@ func (s *session) GetDistSQLCtx() *distsqlctx.DistSQLContext {
 	if dctx.RUV2Metrics != vars.RUV2Metrics {
 		dctx.RUV2Metrics = vars.RUV2Metrics
 	}
+	dctx.StatementRUUnitContributors = sc.StatementRUUnitContributorRegistrar()
 
 	return dctx
 }

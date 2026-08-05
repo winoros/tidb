@@ -313,9 +313,10 @@ type StatementContext struct {
 	statementRUAttached bool
 	statementRUTaken    bool
 	statementRUOverride struct {
-		active   bool
-		unit     statementru.UnitRecorder
-		evidence statementru.EvidenceRecorder
+		active       bool
+		unit         statementru.UnitRecorder
+		evidence     statementru.EvidenceRecorder
+		contributors statementru.UnitContributorRegistrar
 	}
 	statementRUCommitPipelined bool
 	statementRUWholeTxnRetried bool
@@ -1299,6 +1300,18 @@ func (sc *StatementContext) StatementRUEvidenceRecorder() statementru.EvidenceRe
 	return sc.statementRU.EvidenceRecorder()
 }
 
+// StatementRUUnitContributorRegistrar returns the statement-owned contributor
+// lifecycle capability. It follows the same retry override as unit producers.
+func (sc *StatementContext) StatementRUUnitContributorRegistrar() statementru.UnitContributorRegistrar {
+	if sc.statementRUOverride.active {
+		return sc.statementRUOverride.contributors
+	}
+	if sc.statementRU == nil {
+		return nil
+	}
+	return sc.statementRU.UnitContributorRegistrar()
+}
+
 // WithStatementRUProducerOverride routes producers using this historical
 // StatementContext to target for the callback's dynamic scope. A nil target is
 // an explicit Off override and must not fall back to the historical statement's
@@ -1310,13 +1323,16 @@ func (sc *StatementContext) WithStatementRUProducerOverride(target *StatementCon
 	lifecycleID := sc.ctxID
 	var unit statementru.UnitRecorder
 	var evidence statementru.EvidenceRecorder
+	var contributors statementru.UnitContributorRegistrar
 	if target != nil {
 		unit = target.StatementRUUnitRecorder()
 		evidence = target.StatementRUEvidenceRecorder()
+		contributors = target.StatementRUUnitContributorRegistrar()
 	}
 	sc.statementRUOverride.active = true
 	sc.statementRUOverride.unit = unit
 	sc.statementRUOverride.evidence = evidence
+	sc.statementRUOverride.contributors = contributors
 	defer func() {
 		if sc.ctxID == lifecycleID {
 			sc.statementRUOverride = previous

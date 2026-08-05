@@ -16,14 +16,18 @@ package statementru
 
 import "sync"
 
-// UnitRecorder is the value-recording seam used by unit producers.
+// UnitRecorder is the value-recording seam used by streaming producers.
+// Fixed-vector contributors use UnitContributor instead. The two mechanisms
+// may contribute to the same unit only for disjoint physical work; callers are
+// responsible for preventing duplicate observations.
 type UnitRecorder interface {
 	Add(UnitKind, float64) bool
 }
 
-// EvidenceRecorder is the coverage seam used only by the statement-level,
-// per-unit coordinator after every contributor for the affected units has
-// terminated. Individual contributors receive only UnitRecorder.
+// EvidenceRecorder is the statement-level coverage seam for streaming
+// producer domains. Fixed-vector contributor coverage is derived separately
+// when Statement.Finish seals their registrations. Coverage is sticky across
+// both domains, so an incomplete domain downgrades an otherwise present unit.
 type EvidenceRecorder interface {
 	MarkPresent(UnitMask) bool
 	MarkPartial(UnitMask) bool
@@ -124,6 +128,38 @@ func (c *Collector) Add(kind UnitKind, delta float64) bool {
 		return false
 	}
 	c.values[kind] = next
+	return true
+}
+
+// AcceptVector atomically adds one fixed vector. Either every finite,
+// nonnegative slot is accepted under one lock or no value is changed. Invalid
+// or overflowing vectors invalidate the collector and return false. Evidence
+// remains the responsibility of the statement-level coordinator.
+func (c *Collector) AcceptVector(values UnitValues) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.finalized {
+		return false
+	}
+
+	next := c.values
+	for i, delta := range values {
+		kind := UnitKind(i)
+		if !validNumber(delta) {
+			c.markInvalidLocked(ReasonInvalidObservation, kind.Mask())
+			return false
+		}
+		value, ok := checkedAdd(next[i], delta)
+		if !ok {
+			c.markInvalidLocked(ReasonArithmeticOverflow, kind.Mask())
+			return false
+		}
+		next[i] = value
+	}
+	c.values = next
 	return true
 }
 

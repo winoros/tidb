@@ -194,8 +194,10 @@ func TestStatementRUReplayCoordinator(t *testing.T) {
 	target := stmtctx.NewStmtCtx()
 	require.True(t, history.ConfigureStatementRU(selection))
 	historyRecorder := history.StatementRUUnitRecorder()
+	historyRegistrar := history.StatementRUUnitContributorRegistrar()
 	require.True(t, target.ConfigureStatementRU(selection))
 	targetRecorder := target.StatementRUUnitRecorder()
+	targetRegistrar := target.StatementRUUnitContributorRegistrar()
 	vars := &variable.SessionVars{StmtCtx: target, FoundInPlanCache: true}
 	replayErr := errors.New("replay failed")
 
@@ -203,12 +205,15 @@ func TestStatementRUReplayCoordinator(t *testing.T) {
 		require.Same(t, history, vars.StmtCtx)
 		require.False(t, vars.FoundInPlanCache)
 		require.Equal(t, targetRecorder, history.StatementRUUnitRecorder())
+		require.Equal(t, targetRegistrar, history.StatementRUUnitContributorRegistrar())
 		history.ResetForRetry()
+		require.Equal(t, targetRegistrar, history.StatementRUUnitContributorRegistrar())
 		require.True(t, history.StatementRUUnitRecorder().Add(statementru.CPUWork, 2))
 		return replayErr
 	})
 	require.ErrorIs(t, err, replayErr)
 	require.Equal(t, historyRecorder, history.StatementRUUnitRecorder())
+	require.Equal(t, historyRegistrar, history.StatementRUUnitContributorRegistrar())
 
 	targetStatement := target.TakeStatementRUForExecution()
 	require.True(t, targetStatement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
@@ -222,9 +227,11 @@ func TestStatementRUReplayCoordinator(t *testing.T) {
 	require.NoError(t, withStatementRUProducerOverrideForRetry(vars, history, nil, func() error {
 		require.False(t, vars.FoundInPlanCache)
 		require.Nil(t, history.StatementRUUnitRecorder())
+		require.Nil(t, history.StatementRUUnitContributorRegistrar())
 		return nil
 	}))
 	require.Equal(t, historyRecorder, history.StatementRUUnitRecorder())
+	require.Equal(t, historyRegistrar, history.StatementRUUnitContributorRegistrar())
 }
 
 func TestStatementRUWholeTxnRetryLifecycle(t *testing.T) {
@@ -266,6 +273,9 @@ func TestStatementRUWholeTxnRetryLifecycle(t *testing.T) {
 		target := stmtctx.NewStmtCtx()
 		require.True(t, target.ConfigureStatementRU(selection))
 		se.sessionVars.StmtCtx = target
+		require.Equal(t, target.StatementRUUnitContributorRegistrar(), se.GetDistSQLCtx().StatementRUUnitContributors)
+		target.ResetForRetry()
+		require.Equal(t, target.StatementRUUnitContributorRegistrar(), se.GetDistSQLCtx().StatementRUUnitContributors)
 		return history, target, historyStatement
 	}
 
