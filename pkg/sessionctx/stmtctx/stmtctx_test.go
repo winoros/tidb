@@ -30,6 +30,7 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/testkit"
@@ -468,6 +469,26 @@ func TestSetStmtCtxTypeFlags(t *testing.T) {
 func TestResetStmtCtx(t *testing.T) {
 	sc := stmtctx.NewStmtCtx()
 	require.Equal(t, types.DefaultStmtFlags, sc.TypeFlags())
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	selection := statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}
+	offSC := stmtctx.NewStmtCtx()
+	require.True(t, offSC.ConfigureStatementRU(statementru.Selection{}))
+	require.False(t, offSC.ConfigureStatementRU(selection))
+	require.Nil(t, offSC.StatementRUUnitRecorder())
+	require.Nil(t, offSC.TakeStatementRUForExecution())
+	require.True(t, sc.ConfigureStatementRU(selection))
+	unitRecorder := sc.StatementRUUnitRecorder()
+	evidenceRecorder := sc.StatementRUEvidenceRecorder()
+	require.NotNil(t, unitRecorder)
+	require.NotNil(t, evidenceRecorder)
+	require.NotNil(t, sc.TakeStatementRUForExecution())
+	require.Nil(t, sc.TakeStatementRUForExecution())
+	require.False(t, sc.ConfigureStatementRU(selection))
 
 	tz := time.FixedZone("UTC+1", 2*60*60)
 	sc.SetTimeZone(tz)
@@ -485,6 +506,9 @@ func TestResetStmtCtx(t *testing.T) {
 	require.Equal(t, errctx.NewContextWithLevels(levels, sc), sc.ErrCtx())
 
 	sc.Reset()
+	require.Nil(t, sc.TakeStatementRUForExecution())
+	require.Nil(t, sc.StatementRUUnitRecorder())
+	require.Nil(t, sc.StatementRUEvidenceRecorder())
 	require.Same(t, time.UTC, sc.TimeZone())
 	require.Same(t, time.UTC, sc.TimeZone())
 	require.Equal(t, types.DefaultStmtFlags, sc.TypeFlags())
@@ -500,6 +524,18 @@ func TestResetStmtCtx(t *testing.T) {
 	levels = errctx.LevelMap{}
 	levels[errctx.ErrGroupDividedByZero] = errctx.LevelWarn
 	require.Equal(t, errctx.NewContextWithLevels(levels, sc), sc.ErrCtx())
+
+	require.True(t, sc.ConfigureStatementRU(selection))
+	unitRecorder = sc.StatementRUUnitRecorder()
+	evidenceRecorder = sc.StatementRUEvidenceRecorder()
+	sc.ResetForRetry()
+	require.Equal(t, unitRecorder, sc.StatementRUUnitRecorder())
+	require.Equal(t, evidenceRecorder, sc.StatementRUEvidenceRecorder())
+	require.NotNil(t, sc.TakeStatementRUForExecution())
+	sc.ResetForRetry()
+	require.Equal(t, unitRecorder, sc.StatementRUUnitRecorder())
+	require.Equal(t, evidenceRecorder, sc.StatementRUEvidenceRecorder())
+	require.Nil(t, sc.TakeStatementRUForExecution())
 }
 
 func TestStmtCtxID(t *testing.T) {

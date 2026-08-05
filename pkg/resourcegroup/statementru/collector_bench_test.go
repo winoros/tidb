@@ -17,9 +17,11 @@ package statementru
 import "testing"
 
 var (
-	benchmarkAccepted bool
-	benchmarkResult   Result
-	benchmarkUnits    UnitValues
+	benchmarkAccepted  bool
+	benchmarkResult    Result
+	benchmarkFinish    FinishResult
+	benchmarkStatement *Statement
+	benchmarkUnits     UnitValues
 )
 
 func BenchmarkCollectorAddUnit(b *testing.B) {
@@ -83,5 +85,30 @@ func BenchmarkCollectorCalibrationFinalize(b *testing.B) {
 		collector.MarkPresent(CPUWork.Mask())
 		benchmarkResult = collector.Finalize()
 		benchmarkUnits, _ = benchmarkResult.Units()
+	}
+}
+
+func BenchmarkStatementOffSelection(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		benchmarkStatement = NewStatement(Selection{Mode: ModeOff})
+	}
+}
+
+func BenchmarkStatementResultOnlyOwnerLifecycle(b *testing.B) {
+	weights := Weights{CPUWork: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		statement := NewStatement(Selection{
+			Mode:          ModeResultOnly,
+			Applicable:    true,
+			RequiredUnits: CPUWork.Mask(),
+			Weights:       &weights,
+		})
+		statement.UnitRecorder().Add(CPUWork, 1)
+		statement.EvidenceRecorder().MarkPresent(CPUWork.Mask())
+		benchmarkFinish, _ = statement.Finish(TerminalSuccess)
 	}
 }

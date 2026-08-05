@@ -7,6 +7,7 @@ go_library(
         "coverage.go",
         "doc.go",
         "result.go",
+        "statement.go",
         "units.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/resourcegroup/statementru",
@@ -19,8 +20,10 @@ go_test(
     srcs = [
         "collector_bench_test.go",
         "collector_test.go",
+        "statement_test.go",
     ],
     embed = [":statementru"],
     flaky = True,
-    shard_count = 6,
+    shard_count = 9,
+    deps = ["@com_github_stretchr_testify//require"],
 )

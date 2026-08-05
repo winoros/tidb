@@ -163,11 +163,8 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 	}
 
 	// Perform optimization and initialization related to the transaction level.
-	if err = sessiontxn.AdviseOptimizeWithPlanAndThenWarmUp(c.Ctx, stmt.Plan); err != nil {
-		return nil, err
-	}
-
-	return stmt, nil
+	err = sessiontxn.AdviseOptimizeWithPlanAndThenWarmUp(c.Ctx, stmt.Plan)
+	return finishCompileWithStatementRU(stmt, stmtCtx, err)
 }
 
 // needLowerPriority checks whether it's needed to lower the execution priority

@@ -37,6 +37,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/statistics/handle/usage/indexusage"
 	"github.com/pingcap/tidb/pkg/types"
 	contextutil "github.com/pingcap/tidb/pkg/util/context"
@@ -307,6 +308,10 @@ type StatementContext struct {
 	ExtraWarnHandler contextutil.WarnHandlerExt
 
 	execdetails.SyncExecDetails
+
+	statementRU         *statementru.Statement
+	statementRUAttached bool
+	statementRUTaken    bool
 
 	// PrevAffectedRows is the affected-rows value(DDL is 0, DML is the number of affected rows).
 	PrevAffectedRows int64
@@ -1237,6 +1242,48 @@ func (sc *StatementContext) ResetForRetry() {
 
 	// `TaskID` is reset, we'll need to reset distSQLCtx
 	sc.distSQLCtxCache.init = sync.Once{}
+}
+
+// ConfigureStatementRU freezes one selection and, when enabled, constructs its
+// owner without exposing finalization to the selecting caller. It returns false
+// only if this StatementContext was already configured. Off, inapplicable, and
+// invalid-mode selections are accepted as fail-closed Off without allocating an
+// owner. ResetForRetry deliberately preserves the frozen decision.
+func (sc *StatementContext) ConfigureStatementRU(selection statementru.Selection) bool {
+	if sc.statementRUAttached {
+		return false
+	}
+	sc.statementRUAttached = true
+	statement := statementru.NewStatement(selection)
+	sc.statementRU = statement
+	return true
+}
+
+// TakeStatementRUForExecution transfers finalization ownership to ExecStmt.
+// Producer recorder capabilities remain attached, and a replacement cannot be
+// installed. Lifecycle code should call this only after compile initialization.
+func (sc *StatementContext) TakeStatementRUForExecution() *statementru.Statement {
+	if !sc.statementRUAttached || sc.statementRUTaken {
+		return nil
+	}
+	sc.statementRUTaken = true
+	return sc.statementRU
+}
+
+// StatementRUUnitRecorder returns the narrow value-recording capability.
+func (sc *StatementContext) StatementRUUnitRecorder() statementru.UnitRecorder {
+	if sc.statementRU == nil {
+		return nil
+	}
+	return sc.statementRU.UnitRecorder()
+}
+
+// StatementRUEvidenceRecorder returns the statement-level evidence capability.
+func (sc *StatementContext) StatementRUEvidenceRecorder() statementru.EvidenceRecorder {
+	if sc.statementRU == nil {
+		return nil
+	}
+	return sc.statementRU.EvidenceRecorder()
 }
 
 // GetExecDetails gets the execution details for the statement.

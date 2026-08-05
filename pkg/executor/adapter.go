@@ -53,6 +53,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/plugin"
 	"github.com/pingcap/tidb/pkg/resourcegroup/runaway"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionstates"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
@@ -387,6 +388,10 @@ type ExecStmt struct {
 	OutputNames []*types.FieldName
 	PsStmt      *plannercore.PlanCacheStmt
 	Ti          *TelemetryInfo
+
+	// statementRU is the canonical owner for this logical execution. The
+	// StatementContext attachment is only a producer-access seam.
+	statementRU *statementru.Statement
 }
 
 // GetStmtNode returns the stmtNode inside Statement
@@ -1697,6 +1702,7 @@ func (a *ExecStmt) FinishExecuteStmt(txnTS uint64, err error, hasMoreResults boo
 	}
 
 	a.finalizeStatementRUV2Metrics()
+	a.finishStatementRU(err)
 	a.updateNetworkTrafficStatsAndMetrics()
 	// `LowSlowQuery` and `SummaryStmt` must be called before recording `PrevStmt`.
 	a.LogSlowQuery(txnTS, succ, hasMoreResults)
