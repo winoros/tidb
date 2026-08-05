@@ -1,0 +1,26 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "statementru",
+    srcs = [
+        "collector.go",
+        "coverage.go",
+        "doc.go",
+        "result.go",
+        "units.go",
+    ],
+    importpath = "github.com/pingcap/tidb/pkg/resourcegroup/statementru",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "statementru_test",
+    timeout = "short",
+    srcs = [
+        "collector_bench_test.go",
+        "collector_test.go",
+    ],
+    embed = [":statementru"],
+    flaky = True,
+    shard_count = 6,
+)
