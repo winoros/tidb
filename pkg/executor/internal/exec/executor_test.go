@@ -15,8 +15,13 @@
 package exec
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -114,5 +119,207 @@ func TestRUV2ExecutorMetricByTypeIncludesConcreteExecutorTypes(t *testing.T) {
 	} {
 		_, ok := ruv2ExecutorMetricByType(staleType)
 		require.False(t, ok, staleType)
+	}
+}
+
+type mockStatementRUExecutor struct {
+	BaseExecutorV2
+	rows       int
+	returnErr  error
+	panicValue any
+	childReq   *chunk.Chunk
+}
+
+type statementRUUnsupportedExecutor struct {
+	Executor
+}
+
+func newMockStatementRUExecutor(ctx sessionctx.Context, rows int, children ...Executor) *mockStatementRUExecutor {
+	executor := &mockStatementRUExecutor{
+		BaseExecutorV2: NewBaseExecutorV2(ctx.GetSessionVars(), nil, 0, children...),
+		rows:           rows,
+	}
+	if len(children) > 0 {
+		executor.childReq = children[0].NewChunk()
+	}
+	return executor
+}
+
+func (e *mockStatementRUExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
+	req.Reset()
+	if len(e.AllChildren()) > 0 {
+		child := e.Children(0)
+		if err := Next(ctx, child, e.childReq); err != nil {
+			return err
+		}
+		e.RecordStatementRUCPUWork(e.childReq.NumRows())
+	}
+	if e.panicValue != nil {
+		panic(e.panicValue)
+	}
+	if e.returnErr != nil {
+		return e.returnErr
+	}
+	req.SetNumVirtualRows(e.rows)
+	return nil
+}
+
+func configureStatementRUCPUWorkForTest(t testing.TB, ctx sessionctx.Context, executor Executor, multiplier int) *statementru.Statement {
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	sc := ctx.GetSessionVars().StmtCtx
+	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}))
+	require.True(t, ConfigureStatementRUCPUWork(executor, sc, multiplier))
+	return sc.TakeStatementRUForExecution()
+}
+
+func statementRUCPUWorkUnits(t testing.TB, statement *statementru.Statement, terminal statementru.TerminalStatus) float64 {
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	finish, first := statement.Finish(terminal)
+	require.True(t, first)
+	units, ok := finish.Result.Units()
+	require.True(t, ok)
+	return units[statementru.CPUWork]
+}
+
+func TestStatementRUCPUWorkHookAccounting(t *testing.T) {
+	t.Run("multiple chunks use frozen direct-child formula", func(t *testing.T) {
+		ctx := mock.NewContext()
+		child := newMockStatementRUExecutor(ctx, 4)
+		parent := newMockStatementRUExecutor(ctx, 2, child)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, parent, 3)
+
+		req := parent.NewChunk()
+		require.NoError(t, Next(context.Background(), parent, req))
+		require.NoError(t, Next(context.Background(), parent, req))
+
+		require.Equal(t, float64(24), statementRUCPUWorkUnits(t, statement, statementru.TerminalSuccess))
+	})
+
+	t.Run("nested descendant rows do not leak into parent input", func(t *testing.T) {
+		ctx := mock.NewContext()
+		grandchild := newMockStatementRUExecutor(ctx, 7)
+		child := newMockStatementRUExecutor(ctx, 3, grandchild)
+		parent := newMockStatementRUExecutor(ctx, 1, child)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, parent, 2)
+
+		require.NoError(t, Next(context.Background(), parent, parent.NewChunk()))
+
+		require.Equal(t, float64(6), statementRUCPUWorkUnits(t, statement, statementru.TerminalSuccess))
+	})
+
+	t.Run("successful child work survives parent error and panic", func(t *testing.T) {
+		for _, test := range []struct {
+			name       string
+			returnErr  error
+			panicValue any
+		}{
+			{name: "error", returnErr: errors.New("parent failed")},
+			{name: "panic", panicValue: "parent panicked"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				ctx := mock.NewContext()
+				child := newMockStatementRUExecutor(ctx, 5)
+				parent := newMockStatementRUExecutor(ctx, 0, child)
+				parent.returnErr = test.returnErr
+				parent.panicValue = test.panicValue
+				statement := configureStatementRUCPUWorkForTest(t, ctx, parent, 2)
+
+				require.Error(t, Next(context.Background(), parent, parent.NewChunk()))
+
+				require.Equal(t, float64(10), statementRUCPUWorkUnits(t, statement, statementru.TerminalError))
+			})
+		}
+	})
+
+	t.Run("errored child chunk does not become parent input", func(t *testing.T) {
+		ctx := mock.NewContext()
+		child := newMockStatementRUExecutor(ctx, 5)
+		child.returnErr = errors.New("child failed")
+		parent := newMockStatementRUExecutor(ctx, 0, child)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, parent, 2)
+
+		require.Error(t, Next(context.Background(), parent, parent.NewChunk()))
+
+		require.Equal(t, float64(0), statementRUCPUWorkUnits(t, statement, statementru.TerminalError))
+	})
+}
+
+func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
+	t.Run("off and zero formulas install no hook", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0, newMockStatementRUExecutor(ctx, 1))
+
+		require.True(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 1))
+		require.Nil(t, executor.statementRUCPU)
+		require.False(t, ConfigureStatementRUCPUWork(&statementRUUnsupportedExecutor{}, ctx.GetSessionVars().StmtCtx, 1))
+
+		weights := statementru.Weights{statementru.CPUWork: 1}
+		require.True(t, ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.CPUWork.Mask(),
+			Weights:       &weights,
+		}))
+		require.True(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 0))
+		require.Nil(t, executor.statementRUCPU)
+		require.False(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, -1))
+	})
+
+	t.Run("enabled formula is installed once", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0, newMockStatementRUExecutor(ctx, 1))
+		_ = configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+		installed := executor.statementRUCPU
+		require.NotNil(t, installed)
+
+		require.False(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 2))
+		require.Same(t, installed, executor.statementRUCPU)
+	})
+
+	t.Run("derived base does not inherit formula", func(t *testing.T) {
+		ctx := mock.NewContext()
+		child := newMockStatementRUExecutor(ctx, 1)
+		executor := newMockStatementRUExecutor(ctx, 0, child)
+		_ = configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+		require.NotNil(t, executor.statementRUCPU)
+
+		derived := executor.BuildNewBaseExecutorV2(nil, nil, 1, child)
+		require.Nil(t, derived.statementRUCPU)
+	})
+}
+
+func BenchmarkStatementRUCPUWorkHook(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := mock.NewContext()
+			child := newMockStatementRUExecutor(ctx, 1)
+			parent := newMockStatementRUExecutor(ctx, 1, child)
+			var statement *statementru.Statement
+			if enabled {
+				statement = configureStatementRUCPUWorkForTest(b, ctx, parent, 1)
+			}
+			req := parent.NewChunk()
+			goCtx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := Next(goCtx, parent, req); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			if enabled {
+				require.Equal(b, float64(b.N), statementRUCPUWorkUnits(b, statement, statementru.TerminalSuccess))
+			}
+		})
 	}
 }

@@ -21,11 +21,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/tidb/pkg/executor/internal/exec"
+	"github.com/pingcap/tidb/pkg/executor/internal/testutil"
+	windowexec "github.com/pingcap/tidb/pkg/executor/windows"
+	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/expression/aggregation"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/planner/property"
+	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/table/tables"
+	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
+	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/pingcap/tidb/pkg/util/mock"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
@@ -33,6 +50,24 @@ import (
 
 type statementRUReporterForTest struct {
 	reports []statementru.Report
+}
+
+type panickingStatementRUMemoryAction struct {
+	memory.BaseOOMAction
+}
+
+type statementRUEmptyGetter struct{}
+
+func (statementRUEmptyGetter) Get(context.Context, kv.Key, ...kv.GetOption) (kv.ValueEntry, error) {
+	return kv.ValueEntry{}, kv.ErrNotExist
+}
+
+func (*panickingStatementRUMemoryAction) Action(*memory.Tracker) {
+	panic(stderrors.New("selection memory accounting failed"))
+}
+
+func (*panickingStatementRUMemoryAction) GetPriority() int64 {
+	return memory.DefPanicPriority
 }
 
 func (r *statementRUReporterForTest) ReportStatementRU(report statementru.Report) {
@@ -190,4 +225,405 @@ func BenchmarkStatementRUOffHooks(b *testing.B) {
 		execStmt.statementRU = takeStatementRUForExecution(sc)
 		execStmt.finishStatementRU(nil)
 	}
+}
+
+func TestStatementRUSynchronousOperatorEligibilityAndWindowFormula(t *testing.T) {
+	t.Run("only root synchronous builder is eligible", func(t *testing.T) {
+		builder := &executorBuilder{}
+		require.True(t, builder.statementRUCPUWorkEligible())
+		builder.forDataReaderBuilder = true
+		require.False(t, builder.statementRUCPUWorkEligible())
+		builder.forDataReaderBuilder = false
+		builder.buildingShuffleWorker = true
+		require.False(t, builder.statementRUCPUWorkEligible())
+
+		for _, initial := range []bool{false, true} {
+			builder := &executorBuilder{buildingShuffleWorker: initial}
+			builder.buildShuffleAsyncExecutor(nil)
+			require.Equal(t, initial, builder.buildingShuffleWorker)
+		}
+	})
+
+	t.Run("parallel projection is deferred", func(t *testing.T) {
+		require.True(t, statementRUProjectionCPUWorkEligible(0, true))
+		require.True(t, statementRUProjectionCPUWorkEligible(-1, true))
+		require.True(t, statementRUProjectionCPUWorkEligible(4, false))
+		require.False(t, statementRUProjectionCPUWorkEligible(4, true))
+	})
+
+	t.Run("window formula includes frozen expression slots", func(t *testing.T) {
+		window := &physicalop.PhysicalWindow{}
+		require.Equal(t, 0, statementRUWindowCPUWorkMultiplier(window))
+
+		window.WindowFuncDescs = append(window.WindowFuncDescs, nil, nil)
+		window.PartitionBy = make([]property.SortItem, 1)
+		window.OrderBy = make([]property.SortItem, 2)
+		window.Frame = &logicalop.WindowFrame{
+			Start: &logicalop.FrameBound{CalcFuncs: make([]expression.Expression, 2)},
+			End:   &logicalop.FrameBound{CalcFuncs: make([]expression.Expression, 1)},
+		}
+		require.Equal(t, 8, statementRUWindowCPUWorkMultiplier(window))
+
+		window.Frame.Start = nil
+		require.Equal(t, 6, statementRUWindowCPUWorkMultiplier(window))
+	})
+}
+
+func TestStatementRUSelectedRecordSetDoesNotDetach(t *testing.T) {
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	recordSet := &recordSet{stmt: &ExecStmt{statementRU: statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	})}}
+
+	detached, ok, err := recordSet.TryDetach()
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, detached)
+}
+
+func TestStatementRUShuffleAsyncSubtreesExcluded(t *testing.T) {
+	ctx := mock.NewContext()
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	sc := ctx.GetSessionVars().StmtCtx
+	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}))
+
+	column := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+	schema := expression.NewSchema(column)
+	condition := &expression.Constant{Value: types.NewIntDatum(1), RetType: types.NewFieldType(mysql.TypeTiny)}
+	newDual := func() *physicalop.PhysicalTableDual {
+		dual := physicalop.PhysicalTableDual{RowCount: 1}.Init(ctx.GetPlanCtx(), nil, 0)
+		dual.SetSchema(schema)
+		return dual
+	}
+	newSelection := func(child base.PhysicalPlan) *physicalop.PhysicalSelection {
+		selection := physicalop.PhysicalSelection{Conditions: []expression.Expression{condition}}.Init(ctx.GetPlanCtx(), nil, 0)
+		selection.SetChildren(child)
+		return selection
+	}
+
+	dataSourceSelection := newSelection(newDual())
+	workerSelection := newSelection(newDual())
+	shufflePlan := physicalop.PhysicalShuffle{
+		Concurrency:  1,
+		Tails:        []base.PhysicalPlan{workerSelection},
+		DataSources:  []base.PhysicalPlan{dataSourceSelection},
+		SplitterType: physicalop.PartitionHashSplitterType,
+		ByItemArrays: [][]expression.Expression{{}},
+	}.Init(ctx.GetPlanCtx(), nil, 0)
+	shufflePlan.SetChildren(workerSelection)
+
+	builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+	built := builder.build(shufflePlan)
+	require.NoError(t, builder.err)
+	shuffle := built.(*ShuffleExec)
+	statement := sc.TakeStatementRUForExecution()
+	require.NotNil(t, statement)
+
+	shuffle.dataSources[0].(*SelectionExec).RecordStatementRUCPUWork(5)
+	shuffle.workers[0].childExec.(*SelectionExec).RecordStatementRUCPUWork(7)
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	units, ok := finish.Result.Units()
+	require.True(t, ok)
+	require.Equal(t, float64(0), units[statementru.CPUWork])
+}
+
+func TestStatementRUSelectionRecordsBeforeMemoryPanic(t *testing.T) {
+	ctx := mock.NewContext()
+	const (
+		initialRows = 32
+		rows        = 64
+	)
+	ctx.GetSessionVars().InitChunkSize = initialRows
+	ctx.GetSessionVars().MaxChunkSize = rows
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	sc := ctx.GetSessionVars().StmtCtx
+	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}))
+
+	column := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+	schema := expression.NewSchema(column)
+	dataSource := testutil.BuildMockDataSource(testutil.MockDataSourceParameters{
+		Ctx:        ctx,
+		DataSchema: schema,
+		Rows:       rows,
+		GenDataFunc: func(row int, _ *types.FieldType) any {
+			return int64(row)
+		},
+	})
+	dataSource.PrepareChunks()
+	condition := &expression.Constant{Value: types.NewIntDatum(1), RetType: types.NewFieldType(mysql.TypeTiny)}
+	selectionPlan := physicalop.PhysicalSelection{Conditions: []expression.Expression{condition}}.Init(ctx.GetPlanCtx(), nil, 0)
+	selectionPlan.SetChildren(testutil.BuildMockDataPhysicalPlan(ctx, dataSource))
+	builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+	built := builder.build(selectionPlan)
+	require.NoError(t, builder.err)
+	selection := built.(*SelectionExec)
+	statement := sc.TakeStatementRUForExecution()
+	require.NotNil(t, statement)
+
+	goCtx := context.Background()
+	require.NoError(t, exec.Open(goCtx, selection))
+	selection.memTracker.SetBytesLimit(selection.memTracker.BytesConsumed() + 1)
+	selection.memTracker.SetActionOnExceed(&panickingStatementRUMemoryAction{})
+	require.Error(t, exec.Next(goCtx, selection, exec.NewFirstChunk(selection)))
+	selection.memTracker.SetBytesLimit(-1)
+	selection.memTracker.SetActionOnExceed(nil)
+	require.NoError(t, exec.Close(selection))
+
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	finish, first := statement.Finish(statementru.TerminalError)
+	require.True(t, first)
+	units, ok := finish.Result.Units()
+	require.True(t, ok)
+	require.Equal(t, float64(rows), units[statementru.CPUWork])
+}
+
+func configureStatementRUCPUWorkTest(t testing.TB, ctx sessionctx.Context) {
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	require.True(t, ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}))
+}
+
+func newStatementRUCPUWorkDataSource(ctx sessionctx.Context, schema *expression.Schema, rows int) *testutil.MockDataSource {
+	dataSource := testutil.BuildMockDataSource(testutil.MockDataSourceParameters{
+		Ctx:        ctx,
+		DataSchema: schema,
+		Rows:       rows,
+		GenDataFunc: func(row int, _ *types.FieldType) any {
+			return int64(row + 1)
+		},
+	})
+	dataSource.PrepareChunks()
+	return dataSource
+}
+
+func drainStatementRUCPUWorkExecutor(t testing.TB, executor exec.Executor) int {
+	goCtx := context.Background()
+	require.NoError(t, exec.Open(goCtx, executor))
+	result := exec.NewFirstChunk(executor)
+	rows := 0
+	for {
+		require.NoError(t, exec.Next(goCtx, executor, result))
+		if result.NumRows() == 0 {
+			break
+		}
+		rows += result.NumRows()
+	}
+	require.NoError(t, exec.Close(executor))
+	return rows
+}
+
+func finishStatementRUCPUWorkTest(t testing.TB, statement *statementru.Statement, expected float64) {
+	require.NotNil(t, statement)
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	units, ok := finish.Result.Units()
+	require.True(t, ok)
+	require.Equal(t, expected, units[statementru.CPUWork])
+}
+
+func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
+	const (
+		chunkSize = 2
+		inputRows = 5
+	)
+
+	newContext := func(t testing.TB) *mock.Context {
+		ctx := mock.NewContext()
+		ctx.GetSessionVars().InitChunkSize = chunkSize
+		ctx.GetSessionVars().MaxChunkSize = chunkSize
+		configureStatementRUCPUWorkTest(t, ctx)
+		return ctx
+	}
+
+	t.Run("limit", func(t *testing.T) {
+		ctx := newContext(t)
+		column := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		schema := expression.NewSchema(column)
+		dataSource := newStatementRUCPUWorkDataSource(ctx, schema, inputRows)
+		plan := physicalop.PhysicalLimit{Offset: 1, Count: 10}.Init(ctx.GetPlanCtx(), nil, 0)
+		plan.SetSchema(schema)
+		plan.SetChildren(testutil.BuildMockDataPhysicalPlan(ctx, dataSource))
+
+		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+		built := builder.build(plan)
+		require.NoError(t, builder.err)
+		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+		require.Equal(t, inputRows-1, drainStatementRUCPUWorkExecutor(t, built))
+		finishStatementRUCPUWorkTest(t, statement, inputRows)
+	})
+
+	for _, test := range []struct {
+		name        string
+		concurrency int
+		expected    float64
+	}{
+		{name: "serial projection", concurrency: 0, expected: inputRows * 2},
+		{name: "parallel projection excluded", concurrency: 2, expected: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := newContext(t)
+			ctx.GetSessionVars().SetProjectionConcurrency(test.concurrency)
+			inputColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+			inputSchema := expression.NewSchema(inputColumn)
+			outputSchema := expression.NewSchema(
+				&expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)},
+				&expression.Column{Index: 1, RetType: types.NewFieldType(mysql.TypeLonglong)},
+			)
+			dataSource := newStatementRUCPUWorkDataSource(ctx, inputSchema, inputRows)
+			plan := physicalop.PhysicalProjection{
+				Exprs: []expression.Expression{inputColumn, inputColumn},
+			}.Init(ctx.GetPlanCtx(), &property.StatsInfo{RowCount: 100}, 0)
+			plan.SetSchema(outputSchema)
+			plan.SetChildren(testutil.BuildMockDataPhysicalPlan(ctx, dataSource))
+
+			builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+			built := builder.build(plan)
+			require.NoError(t, builder.err)
+			projection := built.(*ProjectionExec)
+			if test.concurrency > 0 {
+				require.Positive(t, projection.numWorkers)
+			} else {
+				require.Zero(t, projection.numWorkers)
+			}
+			statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+			require.Equal(t, inputRows, drainStatementRUCPUWorkExecutor(t, built))
+			finishStatementRUCPUWorkTest(t, statement, test.expected)
+		})
+	}
+
+	t.Run("stream aggregation", func(t *testing.T) {
+		ctx := newContext(t)
+		inputColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		inputSchema := expression.NewSchema(inputColumn)
+		dataSource := newStatementRUCPUWorkDataSource(ctx, inputSchema, inputRows)
+		aggDesc, err := aggregation.NewAggFuncDesc(
+			ctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{inputColumn}, false,
+		)
+		require.NoError(t, err)
+		plan := new(physicalop.PhysicalStreamAgg)
+		plan.AggFuncs = []*aggregation.AggFuncDesc{aggDesc}
+		plan.GroupByItems = []expression.Expression{inputColumn}
+		plan.SetSchema(expression.NewSchema(&expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}))
+		plan.Init(ctx.GetPlanCtx(), nil, 0)
+		plan.SetChildren(testutil.BuildMockDataPhysicalPlan(ctx, dataSource))
+
+		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+		built := builder.build(plan)
+		require.NoError(t, builder.err)
+		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+		require.Equal(t, inputRows, drainStatementRUCPUWorkExecutor(t, built))
+		finishStatementRUCPUWorkTest(t, statement, inputRows*2)
+	})
+
+	for _, pipelined := range []bool{false, true} {
+		name := "regular window"
+		if pipelined {
+			name = "pipelined window"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := newContext(t)
+			ctx.GetSessionVars().EnablePipelinedWindowExec = pipelined
+			inputColumn := &expression.Column{Index: 0, UniqueID: 1, RetType: types.NewFieldType(mysql.TypeLonglong)}
+			inputSchema := expression.NewSchema(inputColumn)
+			dataSource := newStatementRUCPUWorkDataSource(ctx, inputSchema, inputRows)
+			windowFunc, err := aggregation.NewWindowFuncDesc(ctx.GetExprCtx(), ast.WindowFuncRowNumber, nil, false)
+			require.NoError(t, err)
+			outputSchema := inputSchema.Clone()
+			outputSchema.Append(&expression.Column{Index: 1, UniqueID: 2, RetType: types.NewFieldType(mysql.TypeLonglong)})
+			plan := physicalop.PhysicalWindow{
+				WindowFuncDescs: []*aggregation.WindowFuncDesc{windowFunc},
+				PartitionBy:     []property.SortItem{{Col: inputColumn}},
+			}.Init(ctx.GetPlanCtx(), nil, 0)
+			plan.SetSchema(outputSchema)
+			plan.SetChildren(testutil.BuildMockDataPhysicalPlan(ctx, dataSource))
+
+			builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+			built := builder.build(plan)
+			require.NoError(t, builder.err)
+			if pipelined {
+				require.IsType(t, &windowexec.PipelinedWindowExec{}, built)
+			} else {
+				require.IsType(t, &windowexec.WindowExec{}, built)
+			}
+			statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+			require.Equal(t, inputRows, drainStatementRUCPUWorkExecutor(t, built))
+			finishStatementRUCPUWorkTest(t, statement, inputRows*2)
+		})
+	}
+
+	t.Run("union scan snapshot child", func(t *testing.T) {
+		ctx := mock.NewContext()
+		ctx.GetSessionVars().InitChunkSize = chunkSize
+		ctx.GetSessionVars().MaxChunkSize = chunkSize
+		configureStatementRUCPUWorkTest(t, ctx)
+
+		columnInfo := &model.ColumnInfo{
+			ID:        1,
+			Name:      ast.NewCIStr("id"),
+			Offset:    0,
+			State:     model.StatePublic,
+			FieldType: *types.NewFieldType(mysql.TypeLonglong),
+		}
+		tableInfo := &model.TableInfo{
+			ID:         1,
+			Name:       ast.NewCIStr("t"),
+			Columns:    []*model.ColumnInfo{columnInfo},
+			PKIsHandle: true,
+			State:      model.StatePublic,
+		}
+		tbl := tables.MockTableFromMeta(tableInfo)
+		column := &expression.Column{
+			Index: 0, ID: columnInfo.ID, UniqueID: 1, RetType: &columnInfo.FieldType,
+		}
+		schema := expression.NewSchema(column)
+		dataSource := newStatementRUCPUWorkDataSource(ctx, schema, inputRows)
+		unionScan := &UnionScanExec{
+			BaseExecutor:        exec.NewBaseExecutor(ctx, schema, 1, dataSource),
+			memBufSnap:          statementRUEmptyGetter{},
+			columns:             tableInfo.Columns,
+			table:               tbl,
+			snapshotChunkBuffer: exec.TryNewCacheChunk(dataSource),
+			physTblIDIdx:        -1,
+			compareExec: compareExec{
+				handleCols: plannerutil.NewIntHandleCols(column),
+			},
+		}
+		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+		builder.configureStatementRUCPUWork(unionScan, 1)
+		require.NoError(t, builder.err)
+		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+
+		rows := 0
+		for {
+			row, err := unionScan.getSnapshotRow(context.Background())
+			require.NoError(t, err)
+			if row == nil {
+				break
+			}
+			rows++
+			unionScan.cursor4SnapshotRows++
+		}
+		require.Equal(t, inputRows, rows)
+		finishStatementRUCPUWorkTest(t, statement, inputRows)
+	})
 }

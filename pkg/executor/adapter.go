@@ -299,6 +299,12 @@ func (a *recordSet) OnFetchReturned() {
 
 // TryDetach creates a new `RecordSet` which doesn't depend on the current session context.
 func (a *recordSet) TryDetach() (sqlexec.RecordSet, bool, error) {
+	// Lazy detached cursors do not currently transfer ExecStmt's statement-RU
+	// finalization ownership to cursor close. Keep selected statements on the
+	// ordinary record-set lifecycle until that ownership protocol exists.
+	if a.stmt != nil && a.stmt.statementRU != nil {
+		return nil, false, nil
+	}
 	e, ok := Detach(a.executor)
 	if !ok {
 		return nil, false, nil

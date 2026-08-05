@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -86,6 +87,48 @@ func getReusableNextIOAcc(e Executor) *nextIOAcc {
 
 func needNextIOAcc(trackRUV2 bool, parentAcc *nextIOAcc, childCount int) bool {
 	return childCount > 0 && (trackRUV2 || parentAcc != nil)
+}
+
+// statementRUCPUWorkHook is immutable after executor construction. Keeping the
+// hook behind a pointer makes the universally-off executor footprint one word
+// and keeps the hot path independent of session/context lookups.
+type statementRUCPUWorkHook struct {
+	recorder   statementru.UnitRecorder
+	multiplier float64
+}
+
+func (h *statementRUCPUWorkHook) recordInputRows(rows int64) {
+	if h == nil || rows <= 0 || h.multiplier == 0 {
+		return
+	}
+	h.recorder.Add(statementru.CPUWork, float64(rows)*h.multiplier)
+}
+
+type statementRUCPUWorkProvider interface {
+	installStatementRUCPUWork(*statementRUCPUWorkHook) bool
+}
+
+// ConfigureStatementRUCPUWork installs one frozen synchronous executor
+// formula and reports whether the request is supported and valid. The caller
+// is responsible for excluding asynchronous executor forms. A zero multiplier
+// is a valid zero formula and needs no hot-path hook. An enabled hook can be
+// installed only once during executor construction.
+func ConfigureStatementRUCPUWork(e Executor, sc *stmtctx.StatementContext, multiplier int) bool {
+	provider, ok := e.(statementRUCPUWorkProvider)
+	if !ok || multiplier < 0 {
+		return false
+	}
+	if sc == nil {
+		return true
+	}
+	recorder := sc.StatementRUUnitRecorder()
+	if recorder == nil || multiplier == 0 {
+		return true
+	}
+	return provider.installStatementRUCPUWork(&statementRUCPUWorkHook{
+		recorder:   recorder,
+		multiplier: float64(multiplier),
+	})
 }
 
 type ruv2ExecutorMetric struct {
@@ -452,6 +495,7 @@ func newExecutorKillerHandler(handler signalHandler) executorKillerHandler {
 type BaseExecutorV2 struct {
 	_              constructor.Constructor `ctor:"NewBaseExecutorV2,BuildNewBaseExecutorV2"`
 	ruv2CacheState ruv2NextCacheState
+	statementRUCPU *statementRUCPUWorkHook
 	executorKillerHandler
 	executorStats
 	executorMeta
@@ -512,6 +556,21 @@ func (e *BaseExecutorV2) ruv2NextCache() *ruv2NextCacheState {
 	return &e.ruv2CacheState
 }
 
+func (e *BaseExecutorV2) installStatementRUCPUWork(hook *statementRUCPUWorkHook) bool {
+	if e.statementRUCPU != nil {
+		return false
+	}
+	e.statementRUCPU = hook
+	return true
+}
+
+// RecordStatementRUCPUWork records rows successfully returned by this
+// synchronous executor's direct child. Asynchronous executor forms must not be
+// configured with a hook.
+func (e *BaseExecutorV2) RecordStatementRUCPUWork(inputRows int) {
+	e.statementRUCPU.recordInputRows(int64(inputRows))
+}
+
 // BuildNewBaseExecutorV2 builds a new `BaseExecutorV2` based on the configuration of the current base executor.
 // It's used to build a new sub-executor from an existing executor. For example, the `IndexLookUpExecutor` will use
 // this function to build `TableReaderExecutor`
@@ -527,6 +586,8 @@ func (e *BaseExecutorV2) BuildNewBaseExecutorV2(stmtRuntimeStatsColl *execdetail
 
 	newChunkAllocator := e.executorChunkAllocator
 	newChunkAllocator.retFieldTypes = newExecutorMeta.RetFieldTypes()
+	// Dynamic subexecutors must not inherit the parent's formula: their own
+	// execution/lifecycle class may be asynchronous or unsupported.
 	newE := BaseExecutorV2{
 		executorMeta:           newExecutorMeta,
 		executorStats:          newExecutorStats,
@@ -689,7 +750,6 @@ func Next(ctx context.Context, e Executor, req *chunk.Chunk) (err error) {
 		myAcc = getReusableNextIOAcc(e)
 		ctx = context.WithValue(ctx, nextIOAccKey, myAcc)
 	}
-
 	e.RegisterSQLAndPlanInExecForTopProfiling()
 	err = e.Next(ctx, req)
 

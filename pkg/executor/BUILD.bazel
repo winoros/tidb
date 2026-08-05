@@ -453,6 +453,7 @@ go_test(
         "//pkg/executor/sortexec",
         "//pkg/executor/staticrecordset",
         "//pkg/executor/unionexec",
+        "//pkg/executor/windows",
         "//pkg/expression",
         "//pkg/expression/aggregation",
         "//pkg/expression/exprstatic",

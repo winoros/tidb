@@ -43,6 +43,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
 	"github.com/pingcap/tidb/pkg/planner/property"
 	"github.com/pingcap/tidb/pkg/planner/util"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
@@ -1849,6 +1850,95 @@ func BenchmarkLimitExec(b *testing.B) {
 		cas.UsingInlineProjection = inlineProjection
 		b.Run(fmt.Sprintf("%v", cas), func(b *testing.B) {
 			benchmarkLimitExec(b, cas)
+		})
+	}
+}
+
+func BenchmarkStatementRULimitWrapper(b *testing.B) {
+	const rows = 8192
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := mock.NewContext()
+			ctx.GetSessionVars().InitChunkSize = vardef.DefInitChunkSize
+			ctx.GetSessionVars().MaxChunkSize = vardef.DefMaxChunkSize
+			var statement *statementru.Statement
+			if enabled {
+				weights := statementru.Weights{statementru.CPUWork: 1}
+				if !ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+					Mode:          statementru.ModeCalibration,
+					Applicable:    true,
+					RequiredUnits: statementru.CPUWork.Mask(),
+					Weights:       &weights,
+				}) {
+					b.Fatal("failed to configure statement RU")
+				}
+			}
+
+			column := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+			schema := expression.NewSchema(column)
+			dataSource := testutil.BuildMockDataSource(testutil.MockDataSourceParameters{
+				Ctx:        ctx,
+				DataSchema: schema,
+				Rows:       rows,
+				GenDataFunc: func(row int, _ *types.FieldType) any {
+					return int64(row)
+				},
+			})
+			dataSourcePlan := testutil.BuildMockDataPhysicalPlan(ctx, dataSource)
+			limitPlan := physicalop.PhysicalLimit{Count: rows}.Init(ctx.GetPlanCtx(), nil, 0)
+			limitPlan.SetSchema(schema)
+			limitPlan.SetChildren(dataSourcePlan)
+			builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+			limitExecutor := builder.build(limitPlan)
+			if builder.err != nil {
+				b.Fatal(builder.err)
+			}
+			if enabled {
+				statement = ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+			}
+			req := exec.NewFirstChunk(limitExecutor)
+			goCtx := context.Background()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				dataSource.PrepareChunks()
+				b.StartTimer()
+				if err := exec.Open(goCtx, limitExecutor); err != nil {
+					b.Fatal(err)
+				}
+				for {
+					if err := exec.Next(goCtx, limitExecutor, req); err != nil {
+						b.Fatal(err)
+					}
+					if req.NumRows() == 0 {
+						break
+					}
+				}
+				if err := exec.Close(limitExecutor); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(rows, "rows/op")
+			if enabled {
+				if !statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()) {
+					b.Fatal("failed to mark CPU work present")
+				}
+				finish, first := statement.Finish(statementru.TerminalSuccess)
+				if !first {
+					b.Fatal("statement RU finalized more than once")
+				}
+				units, ok := finish.Result.Units()
+				if !ok || units[statementru.CPUWork] != float64(rows)*float64(b.N) {
+					b.Fatalf("unexpected CPU work: %v, details available: %v", units[statementru.CPUWork], ok)
+				}
+			}
 		})
 	}
 }

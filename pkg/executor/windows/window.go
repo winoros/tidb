@@ -157,6 +157,7 @@ func (e *WindowExec) fetchChild(ctx context.Context) (eof bool, err error) {
 	if err != nil {
 		return false, errors.Trace(err)
 	}
+	e.RecordStatementRUCPUWork(childResult.NumRows())
 	// No more data.
 	numRows := childResult.NumRows()
 	if numRows == 0 {

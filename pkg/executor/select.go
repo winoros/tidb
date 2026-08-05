@@ -483,6 +483,7 @@ func (e *LimitExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		if err != nil {
 			return err
 		}
+		e.RecordStatementRUCPUWork(e.childResult.NumRows())
 		batchSize := uint64(e.childResult.NumRows())
 		// no more data.
 		if batchSize == 0 {
@@ -514,6 +515,7 @@ func (e *LimitExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	if err != nil {
 		return err
 	}
+	e.RecordStatementRUCPUWork(e.childResult.NumRows())
 	batchSize := uint64(e.childResult.NumRows())
 	// no more data.
 	if batchSize == 0 {
@@ -768,6 +770,9 @@ func (e *SelectionExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		}
 		mSize := e.childResult.MemoryUsage()
 		err := exec.Next(ctx, e.Children(0), e.childResult)
+		if err == nil {
+			e.RecordStatementRUCPUWork(e.childResult.NumRows())
+		}
 		e.memTracker.Consume(e.childResult.MemoryUsage() - mSize)
 		if err != nil {
 			return err
@@ -803,6 +808,9 @@ func (e *SelectionExec) unBatchedNext(ctx context.Context, chk *chunk.Chunk) err
 		}
 		mSize := e.childResult.MemoryUsage()
 		err := exec.Next(ctx, e.Children(0), e.childResult)
+		if err == nil {
+			e.RecordStatementRUCPUWork(e.childResult.NumRows())
+		}
 		e.memTracker.Consume(e.childResult.MemoryUsage() - mSize)
 		if err != nil {
 			return err

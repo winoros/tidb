@@ -216,6 +216,9 @@ func (e *ProjectionExec) unParallelExecute(ctx context.Context, chk *chunk.Chunk
 	e.childResult.SetRequiredRows(chk.RequiredRows(), e.MaxChunkSize())
 	mSize := e.childResult.MemoryUsage()
 	err := exec.Next(ctx, e.Children(0), e.childResult)
+	if err == nil {
+		e.RecordStatementRUCPUWork(e.childResult.NumRows())
+	}
 	failpoint.Inject("ConsumeRandomPanic", nil)
 	e.memTracker.Consume(e.childResult.MemoryUsage() - mSize)
 	if err != nil {

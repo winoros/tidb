@@ -127,6 +127,9 @@ type executorBuilder struct {
 	// can return a correct value even if the session context has already been destroyed
 	forDataReaderBuilder bool
 	dataReaderTS         uint64
+	// buildingShuffleWorker excludes executor copies that run asynchronously
+	// inside Shuffle. Their accounting needs a producer barrier in a later layer.
+	buildingShuffleWorker bool
 
 	// Used when building MPPGather.
 	encounterUnionScan bool
@@ -134,6 +137,32 @@ type executorBuilder struct {
 	// stmtCtxLock guards statement context and telemetry updates when executor building happens concurrently.
 	// It is only set for dataReaderBuilder instances used by index join inner workers.
 	stmtCtxLock *sync.Mutex
+}
+
+func (b *executorBuilder) configureStatementRUCPUWork(executor exec.Executor, multiplier int) {
+	if !b.statementRUCPUWorkEligible() {
+		return
+	}
+	if !exec.ConfigureStatementRUCPUWork(executor, b.sctx.GetSessionVars().StmtCtx, multiplier) {
+		b.err = errors.Errorf("cannot configure statement RU CPU work for executor %T with multiplier %d", executor, multiplier)
+	}
+}
+
+func (b *executorBuilder) statementRUCPUWorkEligible() bool {
+	return !b.forDataReaderBuilder && !b.buildingShuffleWorker
+}
+
+func statementRUProjectionCPUWorkEligible(numWorkers int64, vectorizable bool) bool {
+	return numWorkers <= 0 || !vectorizable
+}
+
+func (b *executorBuilder) buildShuffleAsyncExecutor(plan base.PhysicalPlan) exec.Executor {
+	previous := b.buildingShuffleWorker
+	b.buildingShuffleWorker = true
+	defer func() {
+		b.buildingShuffleWorker = previous
+	}()
+	return b.build(plan)
 }
 
 // CTEStorages stores resTbl and iterInTbl for CTEExec.
@@ -869,6 +898,7 @@ func (b *executorBuilder) buildLimit(v *physicalop.PhysicalLimit) exec.Executor 
 		// construct a project evaluator to do the inline projection
 		e.columnSwapHelper = chunk.NewColumnSwapHelper(e.columnIdxsUsedByChild)
 	}
+	b.configureStatementRUCPUWork(e, 1)
 	return e
 }
 
@@ -1646,6 +1676,7 @@ func (b *executorBuilder) buildUnionScanFromReader(reader exec.Executor, v *phys
 		b.err = errors.NewNoStackErrorf("unexpected operator %T under UnionScan", reader)
 		return nil
 	}
+	b.configureStatementRUCPUWork(us, 1)
 	return us
 }
 
@@ -2244,6 +2275,7 @@ func (b *executorBuilder) buildStreamAggFromChildExec(childExec exec.Executor, v
 		}
 	}
 
+	b.configureStatementRUCPUWork(e, len(v.GroupByItems)+len(v.AggFuncs))
 	executor_metrics.ExecutorStreamAggExec.Inc()
 	return e
 }
@@ -2258,6 +2290,7 @@ func (b *executorBuilder) buildSelection(v *physicalop.PhysicalSelection) exec.E
 		BaseExecutorV2:           exec.NewBaseExecutorV2(b.sctx.GetSessionVars(), v.Schema(), v.ID(), childExec),
 		filters:                  v.Conditions,
 	}
+	b.configureStatementRUCPUWork(e, len(v.Conditions))
 	return e
 }
 
@@ -2325,6 +2358,9 @@ func (b *executorBuilder) newProjectionExec(childExec exec.Executor, v *physical
 	// See also https://github.com/pingcap/tidb/issues/26832
 	if b.inUpdateStmt || b.inDeleteStmt || b.inInsertStmt || b.hasLock {
 		e.numWorkers = 0
+	}
+	if statementRUProjectionCPUWorkEligible(e.numWorkers, e.evaluatorSuit.Vectorizable()) {
+		b.configureStatementRUCPUWork(e, len(v.Exprs))
 	}
 	return e
 }
@@ -5571,12 +5607,27 @@ func (b *executorBuilder) buildWindow(v *physicalop.PhysicalWindow) exec.Executo
 	if b.err != nil {
 		return nil
 	}
-	exec, err := windowexec.Build(b.sctx, v, childExec, false)
+	windowExecutor, err := windowexec.Build(b.sctx, v, childExec, false)
 	if err != nil {
 		b.err = err
 		return nil
 	}
-	return exec
+	b.configureStatementRUCPUWork(windowExecutor, statementRUWindowCPUWorkMultiplier(v))
+	return windowExecutor
+}
+
+func statementRUWindowCPUWorkMultiplier(v *physicalop.PhysicalWindow) int {
+	multiplier := len(v.WindowFuncDescs) + len(v.PartitionBy) + len(v.OrderBy)
+	if v.Frame == nil {
+		return multiplier
+	}
+	if v.Frame.Start != nil {
+		multiplier += len(v.Frame.Start.CalcFuncs)
+	}
+	if v.Frame.End != nil {
+		multiplier += len(v.Frame.End.CalcFuncs)
+	}
+	return multiplier
 }
 
 func (b *executorBuilder) buildShuffle(v *physicalop.PhysicalShuffle) *ShuffleExec {
@@ -5605,7 +5656,7 @@ func (b *executorBuilder) buildShuffle(v *physicalop.PhysicalShuffle) *ShuffleEx
 	// 2. initialize the data sources (build the data sources from physical plan to executors)
 	shuffle.dataSources = make([]exec.Executor, len(v.DataSources))
 	for i, dataSource := range v.DataSources {
-		shuffle.dataSources[i] = b.build(dataSource)
+		shuffle.dataSources[i] = b.buildShuffleAsyncExecutor(dataSource)
 		if b.err != nil {
 			return nil
 		}
@@ -5642,7 +5693,7 @@ func (b *executorBuilder) buildShuffle(v *physicalop.PhysicalShuffle) *ShuffleEx
 			v.Tails[j].SetChildren(stub)
 		}
 
-		w.childExec = b.build(head)
+		w.childExec = b.buildShuffleAsyncExecutor(head)
 		if b.err != nil {
 			return nil
 		}
