@@ -72,8 +72,9 @@ type IndexLookUpMergeJoin struct {
 	// LastColHelper store the information for last col if there's complicated filter like col > x_col and col < x_col + 100.
 	LastColHelper *physicalop.ColWithCmpFuncManager
 
-	memTracker *memory.Tracker // track memory usage
-	prepared   bool
+	memTracker  *memory.Tracker // track memory usage
+	prepared    bool
+	statementRU *statementRUJoinRuntime
 }
 
 // OuterMergeCtx is the outer side ctx of merge join
@@ -134,6 +135,8 @@ type outerMergeWorker struct {
 	innerCh  chan<- *lookUpMergeJoinTask
 
 	parentMemTracker *memory.Tracker
+	statementRU      *statementRUJoinRuntime
+	statementRURows  int64
 }
 
 type innerMergeWorker struct {
@@ -151,6 +154,8 @@ type innerMergeWorker struct {
 	indexRanges           []*ranger.Range
 	nextColCompareFilters *physicalop.ColWithCmpFuncManager
 	keyOff2IdxOff         []int
+	statementRU           *statementRUJoinRuntime
+	statementRURows       int64
 }
 
 type indexMergeJoinResult struct {
@@ -166,6 +171,7 @@ func (e *IndexLookUpMergeJoin) Open(ctx context.Context) error {
 	}
 	e.memTracker = memory.NewTracker(e.ID(), -1)
 	e.memTracker.AttachTo(e.Ctx().GetSessionVars().StmtCtx.MemTracker)
+	e.statementRU = newStatementRUJoinRuntime(e.StatementRUEnabled())
 	return nil
 }
 
@@ -211,6 +217,7 @@ func (e *IndexLookUpMergeJoin) newOuterWorker(resultCh, innerCh chan *lookUpMerg
 		maxBatchSize:          e.Ctx().GetSessionVars().IndexJoinBatchSize,
 		parentMemTracker:      e.memTracker,
 		nextColCompareFilters: e.LastColHelper,
+		statementRU:           e.statementRU,
 	}
 	failpoint.Inject("testIssue18068", func() {
 		omw.batchSize = 1
@@ -235,6 +242,7 @@ func (e *IndexLookUpMergeJoin) newInnerMergeWorker(taskCh chan *lookUpMergeJoinT
 		joinChkResourceCh: e.joinChkResourceCh[workID],
 		retFieldTypes:     e.RetFieldTypes(),
 		maxChunkSize:      e.MaxChunkSize(),
+		statementRU:       e.statementRU,
 	}
 	if e.LastColHelper != nil {
 		// nextCwf.TmpConstant needs to be reset for every individual
@@ -251,7 +259,19 @@ func (e *IndexLookUpMergeJoin) newInnerMergeWorker(taskCh chan *lookUpMergeJoinT
 }
 
 // Next implements the Executor interface
-func (e *IndexLookUpMergeJoin) Next(ctx context.Context, req *chunk.Chunk) error {
+func (e *IndexLookUpMergeJoin) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	statementRU := e.statementRU
+	defer func() {
+		if r := recover(); r != nil {
+			statementRU.markFailed()
+			panic(r)
+		}
+		if err != nil {
+			statementRU.markFailed()
+			return
+		}
+		recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
+	}()
 	if !e.prepared {
 		e.startWorkers(ctx)
 		e.prepared = true
@@ -262,6 +282,9 @@ func (e *IndexLookUpMergeJoin) Next(ctx context.Context, req *chunk.Chunk) error
 	req.Reset()
 	if e.task == nil {
 		e.loadFinishedTask(ctx)
+		if ctx.Err() != nil {
+			statementRU.markFailed()
+		}
 	}
 	for e.task != nil {
 		select {
@@ -280,7 +303,12 @@ func (e *IndexLookUpMergeJoin) Next(ctx context.Context, req *chunk.Chunk) error
 			return ctx.Err()
 		}
 	}
+	if ctx.Err() != nil {
+		statementRU.markFailed()
+	}
 
+	e.WorkerWg.Wait()
+	statementRU.recordTerminal(&e.BaseExecutor, false)
 	return nil
 }
 
@@ -307,7 +335,7 @@ func (omw *outerMergeWorker) run(ctx context.Context, wg *sync.WaitGroup, cancel
 		}
 		close(omw.resultCh)
 		close(omw.innerCh)
-		wg.Done()
+		omw.statementRU.mergeBuildRowsAndDone(omw.statementRURows, wg)
 	}()
 	for {
 		task, err := omw.buildTask(ctx)
@@ -368,6 +396,7 @@ func (omw *outerMergeWorker) buildTask(ctx context.Context) (*lookUpMergeJoinTas
 		if execChk.NumRows() == 0 {
 			break
 		}
+		omw.statementRU.addLocalRows(&omw.statementRURows, execChk.NumRows())
 
 		task.outerResult.Add(execChk)
 		requiredRows -= execChk.NumRows()
@@ -394,7 +423,6 @@ func (imw *innerMergeWorker) run(ctx context.Context, wg *sync.WaitGroup, cancel
 	defer trace.StartRegion(ctx, "IndexLookupMergeJoinInnerWorker").End()
 	var task *lookUpMergeJoinTask
 	defer func() {
-		wg.Done()
 		if r := recover(); r != nil {
 			if task != nil {
 				task.doneErr = util.GetRecoverError(r)
@@ -403,6 +431,7 @@ func (imw *innerMergeWorker) run(ctx context.Context, wg *sync.WaitGroup, cancel
 			logutil.Logger(ctx).Error("innerMergeWorker panicked", zap.Any("recover", r), zap.Stack("stack"))
 			cancelFunc()
 		}
+		imw.statementRU.mergeProbeRowsAndDone(imw.statementRURows, wg)
 	}()
 
 	for ok := true; ok; {
@@ -719,6 +748,9 @@ func (imw *innerMergeWorker) dedupDatumLookUpKeys(lookUpContents []*IndexJoinLoo
 func (imw *innerMergeWorker) fetchNextInnerResult(ctx context.Context, task *lookUpMergeJoinTask) (beginRow chunk.Row, err error) {
 	task.innerResult = imw.innerExec.NewChunkWithCapacity(imw.innerExec.RetFieldTypes(), imw.innerExec.InitCap(), imw.innerExec.MaxChunkSize())
 	err = exec.Next(ctx, imw.innerExec, task.innerResult)
+	if err == nil {
+		imw.statementRU.addLocalRows(&imw.statementRURows, task.innerResult.NumRows())
+	}
 	task.innerIter = chunk.NewIterator4Chunk(task.innerResult)
 	beginRow = task.innerIter.Begin()
 	return
@@ -726,6 +758,7 @@ func (imw *innerMergeWorker) fetchNextInnerResult(ctx context.Context, task *loo
 
 // Close implements the Executor interface.
 func (e *IndexLookUpMergeJoin) Close() error {
+	e.statementRU.markFailed()
 	if e.RuntimeStats() != nil {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.RuntimeStats())
 	}

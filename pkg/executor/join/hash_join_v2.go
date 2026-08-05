@@ -645,6 +645,7 @@ func (e *HashJoinV2Exec) initMaxSpillRound() {
 
 // Close implements the Executor Close interface.
 func (e *HashJoinV2Exec) Close() error {
+	e.statementRU.markFailed()
 	if e.closeCh != nil {
 		close(e.closeCh)
 	}
@@ -700,6 +701,7 @@ func (e *HashJoinV2Exec) Open(ctx context.Context) error {
 func (e *HashJoinV2Exec) OpenSelf() error {
 	e.prepared = false
 	e.inRestore = false
+	e.statementRU = newStatementRUJoinRuntime(e.StatementRUEnabled())
 	needScanRowTableAfterProbeDone := e.ProbeWorkers[0].JoinProbe.NeedScanRowTable()
 	e.HashJoinCtxV2.needScanRowTableAfterProbeDone = needScanRowTableAfterProbeDone
 	if e.RightAsBuildSide {
@@ -1159,6 +1161,7 @@ func (e *HashJoinV2Exec) releaseDisk() {
 // step 1. fetch data from build side child and build a hash table;
 // step 2. fetch data from probe child in a background goroutine and probe the hash table in multiple join workers.
 func (e *HashJoinV2Exec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	statementRU := e.statementRU
 	if !e.prepared {
 		e.initHashTableContext()
 		e.initializeForProbe()
@@ -1175,14 +1178,20 @@ func (e *HashJoinV2Exec) Next(ctx context.Context, req *chunk.Chunk) (err error)
 
 	result, ok := <-e.joinResultCh
 	if !ok {
+		if ctx.Err() != nil {
+			statementRU.markFailed()
+		}
+		statementRU.recordTerminal(&e.BaseExecutor, true)
 		return nil
 	}
 	if result.err != nil {
 		e.finished.Store(true)
+		statementRU.markFailed()
 		return result.err
 	}
 	req.SwapColumns(result.chk)
 	result.src <- result.chk
+	recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
 	return nil
 }
 
@@ -1324,7 +1333,13 @@ func (e *HashJoinV2Exec) fetchAndBuildHashTableImpl(ctx context.Context) {
 
 	buildTaskCh := e.createBuildTasks(totalSegmentCnt, wg, errCh, doneCh)
 	e.buildHashTable(buildTaskCh, wg, errCh, doneCh)
-	waitJobDone(wg, errCh)
+	if waitJobDone(wg, errCh) && e.statementRU != nil {
+		if hashStateRows, ok := statementRUHashStateRowsV2(e.hashTableContext); ok {
+			e.statementRU.addHashStateRows(hashStateRows)
+		} else {
+			e.statementRU.markHashStateArithmeticInvalid()
+		}
+	}
 }
 
 func (e *HashJoinV2Exec) fetchBuildSideRows(ctx context.Context, fetcherAndWorkerSyncer *sync.WaitGroup, wg *sync.WaitGroup, errCh chan error, doneCh chan struct{}) chan *chunk.Chunk {

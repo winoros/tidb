@@ -48,6 +48,8 @@ type HashAggFinalWorker struct {
 	spillHelper *parallelHashAggSpillHelper
 
 	restoredAggResultMapperMem int64
+	statementRU                *hashAggStatementRURuntime
+	statementRUWorkerID        int
 }
 
 func (w *HashAggFinalWorker) getInputFromDisk(sctx sessionctx.Context) (ret aggfuncs.AggPartialResultMapper, restoredMem int64, err error) {
@@ -118,7 +120,7 @@ func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) error {
 	}
 }
 
-func (w *HashAggFinalWorker) generateResultAndSend(sctx sessionctx.Context, result *chunk.Chunk) {
+func (w *HashAggFinalWorker) generateResultAndSend(sctx sessionctx.Context, result *chunk.Chunk) bool {
 	var finished bool
 	exprCtx := sctx.GetExprCtx()
 	for _, results := range w.partialResultMap.M {
@@ -136,10 +138,11 @@ func (w *HashAggFinalWorker) generateResultAndSend(sctx sessionctx.Context, resu
 			w.outputCh <- &AfFinalResult{chk: result, giveBackCh: w.finalResultHolderCh}
 			result, finished = w.receiveFinalResultHolder()
 			if finished {
-				return
+				return false
 			}
 		}
 	}
+	return true
 }
 
 func (w *HashAggFinalWorker) sendFinalResult(sctx sessionctx.Context) {
@@ -154,8 +157,13 @@ func (w *HashAggFinalWorker) sendFinalResult(sctx sessionctx.Context) {
 
 	execStart := time.Now()
 	updateExecTime(w.stats, execStart)
+	var completedGroupRows int64
+	completedGroupRowsValid := true
 	if w.spillHelper.isSpilledChunksIOEmpty() {
-		w.generateResultAndSend(sctx, result)
+		if !w.generateResultAndSend(sctx, result) {
+			return
+		}
+		completedGroupRowsValid = addStatementRUCount(&completedGroupRows, int64(len(w.partialResultMap.M)))
 	} else {
 		for {
 			if w.checkFinishChClosed() {
@@ -169,11 +177,17 @@ func (w *HashAggFinalWorker) sendFinalResult(sctx sessionctx.Context) {
 			if eof {
 				break
 			}
-			w.generateResultAndSend(sctx, result)
+			if !w.generateResultAndSend(sctx, result) {
+				return
+			}
+			if completedGroupRowsValid {
+				completedGroupRowsValid = addStatementRUCount(&completedGroupRows, int64(len(w.partialResultMap.M)))
+			}
 		}
 	}
 
 	w.outputCh <- &AfFinalResult{chk: result, giveBackCh: w.finalResultHolderCh}
+	w.statementRU.completeFinalWorker(w.statementRUWorkerID, completedGroupRows, completedGroupRowsValid)
 }
 
 func (w *HashAggFinalWorker) restoreDataFromDisk(sctx sessionctx.Context) (eof bool, hasError bool) {

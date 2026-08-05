@@ -16,6 +16,7 @@ package sortexec
 
 import (
 	"context"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/expression"
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util"
@@ -97,6 +99,82 @@ type SortExec struct {
 	}
 
 	enableTmpStorageOnOOM bool
+
+	statementRU *statementRUNonlinearRuntime
+}
+
+const (
+	statementRUNonlinearTerminalOpen uint32 = iota
+	statementRUNonlinearTerminalCommitted
+	statementRUNonlinearTerminalAborted
+)
+
+type statementRUNonlinearRuntime struct {
+	terminal      atomic.Uint32
+	inputRows     uint64
+	inputValid    bool
+	inputInvalid  bool
+	inputComplete bool
+	totalLimit    uint64
+}
+
+func newStatementRUNonlinearRuntime(enabled bool) *statementRUNonlinearRuntime {
+	if !enabled {
+		return nil
+	}
+	return &statementRUNonlinearRuntime{inputValid: true}
+}
+
+func (r *statementRUNonlinearRuntime) abort() {
+	if r != nil {
+		r.terminal.CompareAndSwap(statementRUNonlinearTerminalOpen, statementRUNonlinearTerminalAborted)
+	}
+}
+
+func (r *statementRUNonlinearRuntime) addInputRows(rows int) {
+	if r == nil || !r.inputValid || rows <= 0 {
+		return
+	}
+	rowCount := uint64(rows)
+	if ^uint64(0)-r.inputRows < rowCount {
+		r.inputValid = false
+		r.inputInvalid = true
+		return
+	}
+	r.inputRows += rowCount
+}
+
+func statementRUSortCPUWork(rows uint64) float64 {
+	comparisonWidth := max(rows, uint64(2))
+	return float64(rows) * math.Log2(float64(comparisonWidth))
+}
+
+func statementRUTopNCPUWork(rows, totalLimit uint64) float64 {
+	comparisonWidth := max(min(rows, totalLimit), uint64(2))
+	return float64(rows) * math.Log2(float64(comparisonWidth))
+}
+
+func checkedStatementRUTopNTotalLimit(offset, count uint64) (uint64, bool) {
+	if count == 0 {
+		return 0, true
+	}
+	totalLimit := offset + count
+	return totalLimit, totalLimit >= offset
+}
+
+func (e *SortExec) recordStatementRUSortCPUWork(r *statementRUNonlinearRuntime) {
+	if r == nil || !r.inputComplete ||
+		!r.terminal.CompareAndSwap(statementRUNonlinearTerminalOpen, statementRUNonlinearTerminalCommitted) {
+		return
+	}
+	if r.inputInvalid {
+		e.InvalidateStatementRUUnit(statementru.CPUWork)
+		return
+	}
+	if !r.inputValid {
+		return
+	}
+	e.RecordStatementRUUnit(statementru.CPUWork, statementRUSortCPUWork(r.inputRows))
 }
 
 // When fetcher and workers are not created, we need to initiatively close these channels
@@ -107,6 +185,8 @@ func (e *SortExec) closeChannels() {
 
 // Close implements the Executor Close interface.
 func (e *SortExec) Close() error {
+	e.statementRU.abort()
+
 	// TopN not initializes `e.finishCh` but it will call the Close function
 	if e.finishCh != nil {
 		close(e.finishCh)
@@ -153,6 +233,7 @@ func (e *SortExec) Close() error {
 
 // Open implements the Executor Open interface.
 func (e *SortExec) Open(ctx context.Context) error {
+	e.statementRU = newStatementRUNonlinearRuntime(e.StatementRUEnabled())
 	e.fetched = &atomic.Bool{}
 	e.fetched.Store(false)
 	e.enableTmpStorageOnOOM = vardef.EnableTmpStorageOnOOM.Load()
@@ -263,6 +344,7 @@ func (e *SortExec) InitUnparallelModeForTest() {
                        resultChannel
 */
 func (e *SortExec) Next(ctx context.Context, req *chunk.Chunk) error {
+	statementRU := e.statementRU
 	if e.fetched.CompareAndSwap(false, true) {
 		err := e.initCompareFuncs(e.Ctx().GetExprCtx().GetEvalCtx())
 		if err != nil {
@@ -275,7 +357,7 @@ func (e *SortExec) Next(ctx context.Context, req *chunk.Chunk) error {
 			e.closeChannels()
 			return err
 		}
-		err = e.fetchChunks(ctx)
+		err = e.fetchChunks(ctx, statementRU)
 		if err != nil {
 			return err
 		}
@@ -283,18 +365,19 @@ func (e *SortExec) Next(ctx context.Context, req *chunk.Chunk) error {
 
 	req.Reset()
 	if e.IsUnparallel {
-		return e.appendResultToChunkInUnparallelMode(req)
+		return e.appendResultToChunkInUnparallelMode(req, statementRU)
 	}
-	return e.appendResultToChunkInParallelMode(req)
+	return e.appendResultToChunkInParallelMode(req, statementRU)
 }
 
-func (e *SortExec) appendResultToChunkInParallelMode(req *chunk.Chunk) error {
+func (e *SortExec) appendResultToChunkInParallelMode(req *chunk.Chunk, statementRU *statementRUNonlinearRuntime) error {
 	for !req.IsFull() {
 		row, ok := <-e.Parallel.resultChannel
 		if row.err != nil {
 			return row.err
 		}
 		if !ok {
+			e.recordStatementRUSortCPUWork(statementRU)
 			return nil
 		}
 		req.AppendRow(row.row)
@@ -302,18 +385,19 @@ func (e *SortExec) appendResultToChunkInParallelMode(req *chunk.Chunk) error {
 	return nil
 }
 
-func (e *SortExec) appendResultToChunkInUnparallelMode(req *chunk.Chunk) error {
+func (e *SortExec) appendResultToChunkInUnparallelMode(req *chunk.Chunk, statementRU *statementRUNonlinearRuntime) error {
 	sortPartitionListLen := len(e.Unparallel.sortPartitions)
 	if sortPartitionListLen == 0 {
+		e.recordStatementRUSortCPUWork(statementRU)
 		return nil
 	}
 
 	if sortPartitionListLen == 1 {
-		if err := e.onePartitionSorting(req); err != nil {
+		if err := e.onePartitionSorting(req, statementRU); err != nil {
 			return err
 		}
 	} else {
-		if err := e.externalSorting(req); err != nil {
+		if err := e.externalSorting(req, statementRU); err != nil {
 			return err
 		}
 	}
@@ -473,7 +557,7 @@ func (e *SortExec) spillSortedRowsInMemory() error {
 	return e.Parallel.spillHelper.spillImpl(e.Parallel.merger)
 }
 
-func (e *SortExec) onePartitionSorting(req *chunk.Chunk) (err error) {
+func (e *SortExec) onePartitionSorting(req *chunk.Chunk, statementRU *statementRUNonlinearRuntime) (err error) {
 	err = e.Unparallel.sortPartitions[0].checkError()
 	if err != nil {
 		return err
@@ -486,6 +570,7 @@ func (e *SortExec) onePartitionSorting(req *chunk.Chunk) (err error) {
 		}
 
 		if row.IsEmpty() {
+			e.recordStatementRUSortCPUWork(statementRU)
 			return nil
 		}
 
@@ -494,7 +579,7 @@ func (e *SortExec) onePartitionSorting(req *chunk.Chunk) (err error) {
 	return nil
 }
 
-func (e *SortExec) externalSorting(req *chunk.Chunk) (err error) {
+func (e *SortExec) externalSorting(req *chunk.Chunk, statementRU *statementRUNonlinearRuntime) (err error) {
 	// We only need to check error for the last partition as previous partitions
 	// have been checked when we call `switchToNewSortPartition` function.
 	err = e.Unparallel.sortPartitions[len(e.Unparallel.sortPartitions)-1].checkError()
@@ -516,6 +601,7 @@ func (e *SortExec) externalSorting(req *chunk.Chunk) (err error) {
 			return err
 		}
 		if row.IsEmpty() {
+			e.recordStatementRUSortCPUWork(statementRU)
 			return nil
 		}
 		req.AppendRow(row)
@@ -523,11 +609,11 @@ func (e *SortExec) externalSorting(req *chunk.Chunk) (err error) {
 	return nil
 }
 
-func (e *SortExec) fetchChunks(ctx context.Context) error {
+func (e *SortExec) fetchChunks(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	if e.IsUnparallel {
-		return e.fetchChunksUnparallel(ctx)
+		return e.fetchChunksUnparallel(ctx, statementRU)
 	}
-	return e.fetchChunksParallel(ctx)
+	return e.fetchChunksParallel(ctx, statementRU)
 }
 
 func (e *SortExec) switchToNewSortPartition(fields []*types.FieldType, byItemsDesc []bool, appendPartition bool) error {
@@ -598,7 +684,7 @@ func (e *SortExec) handleCurrentPartitionBeforeExit() error {
 	return nil
 }
 
-func (e *SortExec) fetchChunksUnparallel(ctx context.Context) error {
+func (e *SortExec) fetchChunksUnparallel(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	fields := exec.RetTypes(e)
 	byItemsDesc := make([]bool, len(e.ByItems))
 	for i, byItem := range e.ByItems {
@@ -617,8 +703,12 @@ func (e *SortExec) fetchChunksUnparallel(ctx context.Context) error {
 			return err
 		}
 		if chk.NumRows() == 0 {
+			if statementRU != nil {
+				statementRU.inputComplete = true
+			}
 			break
 		}
+		statementRU.addInputRows(chk.NumRows())
 
 		err = e.storeChunk(chk, fields, byItemsDesc)
 		if err != nil {
@@ -658,7 +748,7 @@ func (e *SortExec) fetchChunksUnparallel(ctx context.Context) error {
 	return nil
 }
 
-func (e *SortExec) fetchChunksParallel(ctx context.Context) error {
+func (e *SortExec) fetchChunksParallel(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	// Wait for the finish of all workers
 	workersWaiter := util.WaitGroupWrapper{}
 	// Wait for the finish of chunk fetcher
@@ -674,7 +764,7 @@ func (e *SortExec) fetchChunksParallel(ctx context.Context) error {
 
 	// Fetch chunks from child and put chunks into chunkChannel
 	fetcherWaiter.Run(func() {
-		e.fetchChunksFromChild(ctx)
+		e.fetchChunksFromChild(ctx, statementRU)
 	})
 
 	go e.generateResult(&workersWaiter, &fetcherWaiter)
@@ -698,16 +788,19 @@ func (e *SortExec) checkSpillAndExecute() error {
 }
 
 // Fetch chunks from child and put chunks into chunkChannel
-func (e *SortExec) fetchChunksFromChild(ctx context.Context) {
+func (e *SortExec) fetchChunksFromChild(ctx context.Context, statementRU *statementRUNonlinearRuntime) {
+	inputComplete := false
 	defer func() {
 		if r := recover(); r != nil {
 			processPanicAndLog(e.Parallel.resultChannel, r)
+			inputComplete = false
 		}
 
 		e.Parallel.fetcherAndWorkerSyncer.Wait()
 		err := e.spillRemainingRowsWhenNeeded()
 		if err != nil {
 			e.Parallel.resultChannel <- rowWithError{err: err}
+			inputComplete = false
 		}
 
 		failpoint.Inject("SignalCheckpointForSort", func(val failpoint.Value) {
@@ -720,6 +813,9 @@ func (e *SortExec) fetchChunksFromChild(ctx context.Context) {
 
 		// We must place it after the spill as workers will process its received
 		// chunks after channel is closed and this will cause data race.
+		if inputComplete && statementRU != nil {
+			statementRU.inputComplete = true
+		}
 		close(e.Parallel.chunkChannel)
 	}()
 
@@ -733,8 +829,10 @@ func (e *SortExec) fetchChunksFromChild(ctx context.Context) {
 
 		rowCount := chk.NumRows()
 		if rowCount == 0 {
+			inputComplete = true
 			break
 		}
+		statementRU.addInputRows(rowCount)
 
 		chkWithMemoryUsage := &chunkWithMemoryUsage{
 			Chk:         chk,

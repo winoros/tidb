@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util"
@@ -107,6 +108,17 @@ func (e *TopNExec) Open(ctx context.Context) error {
 
 // OpenSelf opens TopNExec itself without opening its children.
 func (e *TopNExec) OpenSelf() error {
+	e.statementRU = newStatementRUNonlinearRuntime(e.StatementRUEnabled())
+	if e.statementRU != nil {
+		totalLimit, ok := checkedStatementRUTopNTotalLimit(e.Limit.Offset, e.Limit.Count)
+		if !ok {
+			e.statementRU.inputValid = false
+			e.statementRU.inputInvalid = true
+		} else {
+			e.statementRU.totalLimit = totalLimit
+		}
+	}
+
 	e.memTracker = memory.NewTracker(e.ID(), -1)
 	e.memTracker.AttachTo(e.Ctx().GetSessionVars().StmtCtx.MemTracker)
 
@@ -161,8 +173,25 @@ func (e *TopNExec) OpenSelf() error {
 	return nil
 }
 
+func (e *TopNExec) recordStatementRUTopNCPUWork(r *statementRUNonlinearRuntime) {
+	if r == nil || !r.inputComplete ||
+		!r.terminal.CompareAndSwap(statementRUNonlinearTerminalOpen, statementRUNonlinearTerminalCommitted) {
+		return
+	}
+	if r.inputInvalid {
+		e.InvalidateStatementRUUnit(statementru.CPUWork)
+		return
+	}
+	if !r.inputValid {
+		return
+	}
+	e.RecordStatementRUUnit(statementru.CPUWork, statementRUTopNCPUWork(r.inputRows, r.totalLimit))
+}
+
 // Close implements the Executor Close interface.
 func (e *TopNExec) Close() error {
+	e.statementRU.abort()
+
 	// `e.finishCh == nil` means that `Open` is not called.
 	if e.finishCh == nil {
 		return exec.Close(e.Children(0))
@@ -266,9 +295,10 @@ Restore Stage:
 
 */
 func (e *TopNExec) Next(ctx context.Context, req *chunk.Chunk) error {
+	statementRU := e.statementRU
 	req.Reset()
 	if e.fetched.CompareAndSwap(false, true) {
-		err := e.fetchChunks(ctx)
+		err := e.fetchChunks(ctx, statementRU)
 		if err != nil {
 			return err
 		}
@@ -278,7 +308,11 @@ func (e *TopNExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		numToAppend := req.RequiredRows() - req.NumRows()
 		for range numToAppend {
 			row, ok := <-e.resultChannel
-			if !ok || row.err != nil {
+			if !ok {
+				e.recordStatementRUTopNCPUWork(statementRU)
+				return nil
+			}
+			if row.err != nil {
 				return row.err
 			}
 			// Be careful, if inline projection occurs.
@@ -292,7 +326,7 @@ func (e *TopNExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	return nil
 }
 
-func (e *TopNExec) fetchChunks(ctx context.Context) error {
+func (e *TopNExec) fetchChunks(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	defer func() {
 		if r := recover(); r != nil {
 			processPanicAndLog(e.resultChannel, r)
@@ -301,12 +335,15 @@ func (e *TopNExec) fetchChunks(ctx context.Context) error {
 	}()
 
 	if e.Limit.Count == 0 {
+		if statementRU != nil {
+			statementRU.inputComplete = true
+		}
 		close(e.resultChannel)
 		return nil
 	}
 
 	if len(e.RankInfo.TruncateKeyExprs) > 0 {
-		err := e.loadChunksUntilTotalLimitForRankTopN(ctx)
+		err := e.loadChunksUntilTotalLimitForRankTopN(ctx, statementRU)
 		if err != nil {
 			close(e.resultChannel)
 			return err
@@ -314,12 +351,12 @@ func (e *TopNExec) fetchChunks(ctx context.Context) error {
 
 		go e.executeRankTopN()
 	} else {
-		err := e.loadChunksUntilTotalLimit(ctx)
+		err := e.loadChunksUntilTotalLimit(ctx, statementRU)
 		if err != nil {
 			close(e.resultChannel)
 			return err
 		}
-		go e.executeTopN(ctx)
+		go e.executeTopN(ctx, statementRU)
 	}
 
 	return nil
@@ -365,7 +402,7 @@ func (e *TopNExec) initBeforeLoadingChunks() error {
 	return nil
 }
 
-func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context) error {
+func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	err := e.initBeforeLoadingChunks()
 	if err != nil {
 		return err
@@ -381,8 +418,12 @@ func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context) error {
 			return err
 		}
 		if srcChk.NumRows() == 0 {
+			if statementRU != nil {
+				statementRU.inputComplete = true
+			}
 			break
 		}
+		statementRU.addInputRows(srcChk.NumRows())
 		e.chkHeap.rowChunks.Add(srcChk)
 		if e.spillHelper.isSpillNeeded() {
 			e.isSpillTriggeredInStage1ForTest = true
@@ -396,7 +437,7 @@ func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context) error {
 	return nil
 }
 
-func (e *TopNExec) loadChunksUntilTotalLimitForRankTopN(ctx context.Context) error {
+func (e *TopNExec) loadChunksUntilTotalLimitForRankTopN(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	err := e.initBeforeLoadingChunks()
 	if err != nil {
 		return err
@@ -412,6 +453,7 @@ func (e *TopNExec) loadChunksUntilTotalLimitForRankTopN(ctx context.Context) err
 		if srcChk.NumRows() == 0 {
 			break
 		}
+		statementRU.addInputRows(srcChk.NumRows())
 
 		endIdx, err := e.findEndIdx(srcChk)
 		if err != nil {
@@ -434,6 +476,9 @@ func (e *TopNExec) loadChunksUntilTotalLimitForRankTopN(ctx context.Context) err
 	}
 
 	e.chkHeap.initPtrs()
+	if statementRU != nil {
+		statementRU.inputComplete = true
+	}
 	return nil
 }
 
@@ -522,7 +567,7 @@ func (e *TopNExec) findEndIdx(chk *chunk.Chunk) (int, error) {
 
 const topNCompactionFactor = 4
 
-func (e *TopNExec) executeTopNWhenNoSpillTriggered(ctx context.Context) error {
+func (e *TopNExec) executeTopNWhenNoSpillTriggered(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	if e.spillHelper.isSpillNeeded() {
 		e.isSpillTriggeredInStage2ForTest = true
 		return nil
@@ -541,8 +586,12 @@ func (e *TopNExec) executeTopNWhenNoSpillTriggered(ctx context.Context) error {
 		}
 
 		if childRowChk.NumRows() == 0 {
+			if statementRU != nil {
+				statementRU.inputComplete = true
+			}
 			break
 		}
+		statementRU.addInputRows(childRowChk.NumRows())
 
 		e.chkHeap.processChk(childRowChk)
 
@@ -575,18 +624,24 @@ func (e *TopNExec) checkSpillAndExecute() error {
 	return nil
 }
 
-func (e *TopNExec) fetchChunksFromChild(ctx context.Context) {
+func (e *TopNExec) fetchChunksFromChild(ctx context.Context, statementRU *statementRUNonlinearRuntime) {
+	inputComplete := false
 	defer func() {
 		if r := recover(); r != nil {
 			processPanicAndLog(e.resultChannel, r)
+			inputComplete = false
 		}
 
 		e.fetcherAndWorkerSyncer.Wait()
 		err := e.spillRemainingRowsWhenNeeded()
 		if err != nil {
 			e.resultChannel <- rowWithError{err: err}
+			inputComplete = false
 		}
 
+		if inputComplete && statementRU != nil {
+			statementRU.inputComplete = true
+		}
 		close(e.chunkChannel)
 	}()
 
@@ -600,8 +655,10 @@ func (e *TopNExec) fetchChunksFromChild(ctx context.Context) {
 
 		rowCount := chk.NumRows()
 		if rowCount == 0 {
+			inputComplete = true
 			break
 		}
+		statementRU.addInputRows(rowCount)
 
 		e.fetcherAndWorkerSyncer.Add(1)
 		select {
@@ -634,7 +691,7 @@ func (e *TopNExec) spillTopNExecHeap() error {
 	return nil
 }
 
-func (e *TopNExec) executeTopNWhenSpillTriggered(ctx context.Context) error {
+func (e *TopNExec) executeTopNWhenSpillTriggered(ctx context.Context, statementRU *statementRUNonlinearRuntime) error {
 	// idx need to be set to 0 as we need to spill all data
 	e.chkHeap.idx = 0
 	err := e.spillTopNExecHeap()
@@ -657,7 +714,7 @@ func (e *TopNExec) executeTopNWhenSpillTriggered(ctx context.Context) error {
 
 	// Fetch chunks from child and put chunks into chunkChannel
 	fetcherWaiter.Run(func() {
-		e.fetchChunksFromChild(ctx)
+		e.fetchChunksFromChild(ctx, statementRU)
 	})
 
 	fetcherWaiter.Wait()
@@ -665,7 +722,7 @@ func (e *TopNExec) executeTopNWhenSpillTriggered(ctx context.Context) error {
 	return nil
 }
 
-func (e *TopNExec) executeTopN(ctx context.Context) {
+func (e *TopNExec) executeTopN(ctx context.Context, statementRU *statementRUNonlinearRuntime) {
 	defer func() {
 		if r := recover(); r != nil {
 			processPanicAndLog(e.resultChannel, r)
@@ -680,13 +737,13 @@ func (e *TopNExec) executeTopN(ctx context.Context) {
 		heap.Pop(e.chkHeap)
 	}
 
-	if err := e.executeTopNWhenNoSpillTriggered(ctx); err != nil {
+	if err := e.executeTopNWhenNoSpillTriggered(ctx, statementRU); err != nil {
 		e.resultChannel <- rowWithError{err: err}
 		return
 	}
 
 	if e.spillHelper.isSpillNeeded() {
-		if err := e.executeTopNWhenSpillTriggered(ctx); err != nil {
+		if err := e.executeTopNWhenSpillTriggered(ctx, statementRU); err != nil {
 			e.resultChannel <- rowWithError{err: err}
 			return
 		}

@@ -56,6 +56,7 @@ type hashJoinCtxBase struct {
 	IsNullAware   bool
 	memTracker    *memory.Tracker // track memory usage.
 	diskTracker   *disk.Tracker   // track disk usage.
+	statementRU   *statementRUJoinRuntime
 }
 
 type probeSideTupleFetcherBase struct {
@@ -159,6 +160,11 @@ func (fetcher *probeSideTupleFetcherBase) getProbeSideResource(shouldLimitProbeF
 // fetchProbeSideChunks get chunks from fetches chunks from the big table in a background goroutine
 // and sends the chunks to multiple channels which will be read by multiple join workers.
 func (fetcher *probeSideTupleFetcherBase) fetchProbeSideChunks(ctx context.Context, maxChunkSize int, isBuildEmpty isBuildSideEmpty, checkSpill isSpillTriggered, canSkipIfBuildEmpty, needScanAfterProbeDone, shouldLimitProbeFetchSize bool, hashJoinCtx *hashJoinCtxBase) {
+	statementRU := hashJoinCtx.statementRU
+	var inputRows int64
+	defer func() {
+		statementRU.addProbeRows(inputRows)
+	}()
 	hasWaitedForBuild := false
 	for {
 		probeSideResource := fetcher.getProbeSideResource(shouldLimitProbeFetchSize, maxChunkSize, hashJoinCtx)
@@ -174,6 +180,7 @@ func (fetcher *probeSideTupleFetcherBase) fetchProbeSideChunks(ctx context.Conte
 			}
 			return
 		}
+		statementRU.addLocalRows(&inputRows, probeSideResult.NumRows())
 
 		err = triggerIntest(2)
 		if err != nil {
@@ -255,6 +262,11 @@ func checkAndSpillRowTableIfNeeded(fetcherAndWorkerSyncer *sync.WaitGroup, spill
 // fetchBuildSideRows fetches all rows from build side executor, and append them
 // to e.buildSideResult.
 func (w *buildWorkerBase) fetchBuildSideRows(ctx context.Context, hashJoinCtx *hashJoinCtxBase, fetcherAndWorkerSyncer *sync.WaitGroup, spillHelper *hashJoinSpillHelper, chkCh chan<- *chunk.Chunk, errCh chan<- error, doneCh <-chan struct{}) {
+	statementRU := hashJoinCtx.statementRU
+	var inputRows int64
+	defer func() {
+		statementRU.addBuildRows(inputRows)
+	}()
 	hasError := false
 
 	// We must put the close of chkCh after the place of spilling remaining rows or there will be data race
@@ -353,6 +365,7 @@ func (w *buildWorkerBase) fetchBuildSideRows(ctx context.Context, hashJoinCtx *h
 		failpoint.Inject("ConsumeRandomPanic", nil)
 
 		rows := chk.NumRows()
+		statementRU.addLocalRows(&inputRows, rows)
 		if rows == 0 {
 			return
 		}

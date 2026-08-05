@@ -16,6 +16,7 @@ package exec
 
 import (
 	"context"
+	"math"
 	"reflect"
 	stdatomic "sync/atomic"
 	"time"
@@ -89,23 +90,58 @@ func needNextIOAcc(trackRUV2 bool, parentAcc *nextIOAcc, childCount int) bool {
 	return childCount > 0 && (trackRUV2 || parentAcc != nil)
 }
 
-// statementRUCPUWorkHook is immutable after executor construction. Keeping the
+// statementRUHook is immutable after executor construction. Keeping the
 // hook behind a pointer makes the universally-off executor footprint one word
 // and keeps the hot path independent of session/context lookups.
-type statementRUCPUWorkHook struct {
+type statementRUHook struct {
 	recorder   statementru.UnitRecorder
 	multiplier float64
 }
 
-func (h *statementRUCPUWorkHook) recordInputRows(rows int64) {
+func (h *statementRUHook) recordInputRows(rows int64) {
 	if h == nil || rows <= 0 || h.multiplier == 0 {
 		return
 	}
 	h.recorder.Add(statementru.CPUWork, float64(rows)*h.multiplier)
 }
 
-type statementRUCPUWorkProvider interface {
-	installStatementRUCPUWork(*statementRUCPUWorkHook) bool
+func (h *statementRUHook) recordUnit(kind statementru.UnitKind, delta float64) {
+	if h == nil {
+		return
+	}
+	h.recorder.Add(kind, delta)
+}
+
+type statementRUProvider interface {
+	installStatementRUHook(*statementRUHook) bool
+}
+
+// StatementRUExecutorConfig freezes the common recorder configuration for one
+// executor. NeedsUnitRecorder keeps the hook for operators that emit nonlinear
+// or non-CPU terminal units even when their linear CPU multiplier is zero.
+type StatementRUExecutorConfig struct {
+	CPUWorkMultiplier int
+	NeedsUnitRecorder bool
+}
+
+// ConfigureStatementRUExecutor installs one frozen executor recorder. An
+// enabled hook can be installed only once during executor construction.
+func ConfigureStatementRUExecutor(e Executor, sc *stmtctx.StatementContext, config StatementRUExecutorConfig) bool {
+	provider, ok := e.(statementRUProvider)
+	if !ok || config.CPUWorkMultiplier < 0 {
+		return false
+	}
+	if sc == nil {
+		return true
+	}
+	recorder := sc.StatementRUUnitRecorder()
+	if recorder == nil || config.CPUWorkMultiplier == 0 && !config.NeedsUnitRecorder {
+		return true
+	}
+	return provider.installStatementRUHook(&statementRUHook{
+		recorder:   recorder,
+		multiplier: float64(config.CPUWorkMultiplier),
+	})
 }
 
 // ConfigureStatementRUCPUWork installs one frozen synchronous executor
@@ -114,21 +150,7 @@ type statementRUCPUWorkProvider interface {
 // is a valid zero formula and needs no hot-path hook. An enabled hook can be
 // installed only once during executor construction.
 func ConfigureStatementRUCPUWork(e Executor, sc *stmtctx.StatementContext, multiplier int) bool {
-	provider, ok := e.(statementRUCPUWorkProvider)
-	if !ok || multiplier < 0 {
-		return false
-	}
-	if sc == nil {
-		return true
-	}
-	recorder := sc.StatementRUUnitRecorder()
-	if recorder == nil || multiplier == 0 {
-		return true
-	}
-	return provider.installStatementRUCPUWork(&statementRUCPUWorkHook{
-		recorder:   recorder,
-		multiplier: float64(multiplier),
-	})
+	return ConfigureStatementRUExecutor(e, sc, StatementRUExecutorConfig{CPUWorkMultiplier: multiplier})
 }
 
 type ruv2ExecutorMetric struct {
@@ -493,9 +515,9 @@ func newExecutorKillerHandler(handler signalHandler) executorKillerHandler {
 
 // BaseExecutorV2 is a simplified version of `BaseExecutor`, which doesn't contain a full session context
 type BaseExecutorV2 struct {
-	_              constructor.Constructor `ctor:"NewBaseExecutorV2,BuildNewBaseExecutorV2"`
-	ruv2CacheState ruv2NextCacheState
-	statementRUCPU *statementRUCPUWorkHook
+	_               constructor.Constructor `ctor:"NewBaseExecutorV2,BuildNewBaseExecutorV2"`
+	ruv2CacheState  ruv2NextCacheState
+	statementRUHook *statementRUHook
 	executorKillerHandler
 	executorStats
 	executorMeta
@@ -556,11 +578,11 @@ func (e *BaseExecutorV2) ruv2NextCache() *ruv2NextCacheState {
 	return &e.ruv2CacheState
 }
 
-func (e *BaseExecutorV2) installStatementRUCPUWork(hook *statementRUCPUWorkHook) bool {
-	if e.statementRUCPU != nil {
+func (e *BaseExecutorV2) installStatementRUHook(hook *statementRUHook) bool {
+	if e.statementRUHook != nil {
 		return false
 	}
-	e.statementRUCPU = hook
+	e.statementRUHook = hook
 	return true
 }
 
@@ -568,7 +590,33 @@ func (e *BaseExecutorV2) installStatementRUCPUWork(hook *statementRUCPUWorkHook)
 // synchronous executor's direct child. Asynchronous executor forms must not be
 // configured with a hook.
 func (e *BaseExecutorV2) RecordStatementRUCPUWork(inputRows int) {
-	e.statementRUCPU.recordInputRows(int64(inputRows))
+	e.statementRUHook.recordInputRows(int64(inputRows))
+}
+
+// RecordStatementRUCPUWork64 records an already-aggregated direct-child row
+// count without narrowing it to the platform int width.
+func (e *BaseExecutorV2) RecordStatementRUCPUWork64(inputRows int64) {
+	e.statementRUHook.recordInputRows(inputRows)
+}
+
+// RecordStatementRUUnit records one already-finalized operator unit. Callers
+// must keep worker-local counters and invoke this only at their owning success
+// or completion boundary.
+func (e *BaseExecutorV2) RecordStatementRUUnit(kind statementru.UnitKind, delta float64) {
+	e.statementRUHook.recordUnit(kind, delta)
+}
+
+// InvalidateStatementRUUnit records that this executor observed an invalid
+// value for one unit without giving the executor statement-level coverage
+// authority. In ResultOnly mode this makes the final result HasTotal false.
+func (e *BaseExecutorV2) InvalidateStatementRUUnit(kind statementru.UnitKind) {
+	e.statementRUHook.recordUnit(kind, math.NaN())
+}
+
+// StatementRUEnabled reports whether this executor owns a statement RU
+// recorder. It is intended for construction/reset paths, not per-row checks.
+func (e *BaseExecutorV2) StatementRUEnabled() bool {
+	return e.statementRUHook != nil
 }
 
 // BuildNewBaseExecutorV2 builds a new `BaseExecutorV2` based on the configuration of the current base executor.

@@ -171,6 +171,7 @@ func (t *MergeJoinTable) fetchNextChunk(ctx context.Context, executor *MergeJoin
 	if err != nil {
 		return err
 	}
+	executor.RecordStatementRUCPUWork(t.childChunk.NumRows())
 	t.executed = t.childChunk.NumRows() == 0
 	return nil
 }
@@ -325,6 +326,14 @@ func (e *MergeJoinExec) Open(ctx context.Context) error {
 // Note the inner group collects all identical keys in a group across multiple chunks, but the outer group just covers
 // the identical keys within a chunk, so identical keys may cover more than one chunk.
 func (e *MergeJoinExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(r)
+		}
+		if err == nil {
+			recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
+		}
+	}()
 	req.Reset()
 
 	innerIter := e.InnerTable.groupRowsIter

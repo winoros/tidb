@@ -187,6 +187,17 @@ func statementRUCPUWorkUnits(t testing.TB, statement *statementru.Statement, ter
 }
 
 func TestStatementRUCPUWorkHookAccounting(t *testing.T) {
+	t.Run("aggregated rows retain int64 width", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, executor, 2)
+		rows := int64(1) << 40
+
+		executor.RecordStatementRUCPUWork64(rows)
+
+		require.Equal(t, float64(rows*2), statementRUCPUWorkUnits(t, statement, statementru.TerminalSuccess))
+	})
+
 	t.Run("multiple chunks use frozen direct-child formula", func(t *testing.T) {
 		ctx := mock.NewContext()
 		child := newMockStatementRUExecutor(ctx, 4)
@@ -255,7 +266,7 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 		executor := newMockStatementRUExecutor(ctx, 0, newMockStatementRUExecutor(ctx, 1))
 
 		require.True(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 1))
-		require.Nil(t, executor.statementRUCPU)
+		require.Nil(t, executor.statementRUHook)
 		require.False(t, ConfigureStatementRUCPUWork(&statementRUUnsupportedExecutor{}, ctx.GetSessionVars().StmtCtx, 1))
 
 		weights := statementru.Weights{statementru.CPUWork: 1}
@@ -266,7 +277,7 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 			Weights:       &weights,
 		}))
 		require.True(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 0))
-		require.Nil(t, executor.statementRUCPU)
+		require.Nil(t, executor.statementRUHook)
 		require.False(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, -1))
 	})
 
@@ -274,11 +285,37 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 		ctx := mock.NewContext()
 		executor := newMockStatementRUExecutor(ctx, 0, newMockStatementRUExecutor(ctx, 1))
 		_ = configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
-		installed := executor.statementRUCPU
+		installed := executor.statementRUHook
 		require.NotNil(t, installed)
 
 		require.False(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 2))
-		require.Same(t, installed, executor.statementRUCPU)
+		require.Same(t, installed, executor.statementRUHook)
+	})
+
+	t.Run("terminal-only executor keeps recorder with zero CPU multiplier", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		weights := statementru.Weights{statementru.HashStateRows: 1}
+		require.True(t, ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.HashStateRows.Mask(),
+			Weights:       &weights,
+		}))
+		require.True(t, ConfigureStatementRUExecutor(executor, ctx.GetSessionVars().StmtCtx, StatementRUExecutorConfig{
+			NeedsUnitRecorder: true,
+		}))
+		require.True(t, executor.StatementRUEnabled())
+		executor.RecordStatementRUUnit(statementru.HashStateRows, 7)
+
+		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+		require.NotNil(t, statement)
+		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.HashStateRows.Mask()))
+		result, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		units, ok := result.Result.Units()
+		require.True(t, ok)
+		require.Equal(t, float64(7), units[statementru.HashStateRows])
 	})
 
 	t.Run("derived base does not inherit formula", func(t *testing.T) {
@@ -286,11 +323,39 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 		child := newMockStatementRUExecutor(ctx, 1)
 		executor := newMockStatementRUExecutor(ctx, 0, child)
 		_ = configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
-		require.NotNil(t, executor.statementRUCPU)
+		require.NotNil(t, executor.statementRUHook)
 
 		derived := executor.BuildNewBaseExecutorV2(nil, nil, 1, child)
-		require.Nil(t, derived.statementRUCPU)
+		require.Nil(t, derived.statementRUHook)
 	})
+}
+
+func TestInvalidateStatementRUUnit(t *testing.T) {
+	ctx := mock.NewContext()
+	executor := newMockStatementRUExecutor(ctx, 0)
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	sc := ctx.GetSessionVars().StmtCtx
+	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}))
+	require.True(t, ConfigureStatementRUExecutor(executor, sc, StatementRUExecutorConfig{
+		NeedsUnitRecorder: true,
+	}))
+	statement := sc.TakeStatementRUForExecution()
+	require.NotNil(t, statement)
+
+	executor.InvalidateStatementRUUnit(statementru.CPUWork)
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	require.False(t, finish.Result.HasTotal())
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StateInvalid,
+		Reason: statementru.ReasonInvalidObservation,
+	}, finish.Result.Outcome())
 }
 
 func BenchmarkStatementRUCPUWorkHook(b *testing.B) {

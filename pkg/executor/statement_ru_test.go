@@ -21,8 +21,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/tidb/pkg/executor/aggregate"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/executor/internal/testutil"
+	"github.com/pingcap/tidb/pkg/executor/join"
+	"github.com/pingcap/tidb/pkg/executor/sortexec"
 	windowexec "github.com/pingcap/tidb/pkg/executor/windows"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
@@ -267,6 +270,143 @@ func TestStatementRUSynchronousOperatorEligibilityAndWindowFormula(t *testing.T)
 		window.Frame.Start = nil
 		require.Equal(t, 6, statementRUWindowCPUWorkMultiplier(window))
 	})
+}
+
+func TestStatementRUStatefulJoinExpressionCount(t *testing.T) {
+	col := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+	baseJoin := physicalop.BasePhysicalJoin{
+		LeftConditions:  expression.CNFExprs{col},
+		RightConditions: expression.CNFExprs{col},
+		OtherConditions: expression.CNFExprs{col},
+		LeftJoinKeys:    []*expression.Column{col, col},
+		RightJoinKeys:   []*expression.Column{col, col},
+		OuterJoinKeys:   []*expression.Column{col, col},
+		InnerJoinKeys:   []*expression.Column{col, col},
+	}
+	compareFilters := &physicalop.ColWithCmpFuncManager{OpType: []string{"gt", "lt"}}
+
+	hashJoin := &physicalop.PhysicalHashJoin{
+		BasePhysicalJoin:  baseJoin,
+		EqualConditions:   []*expression.ScalarFunction{{}, {}},
+		NAEqualConditions: []*expression.ScalarFunction{{}},
+	}
+	count, ok := statementRUHashJoinExpressionCount(hashJoin)
+	require.True(t, ok)
+	require.Equal(t, 6, count)
+
+	mergeJoin := &physicalop.PhysicalMergeJoin{BasePhysicalJoin: baseJoin, CompareFuncs: []expression.CompareFunc{nil, nil}}
+	count, ok = statementRUMergeJoinExpressionCount(mergeJoin)
+	require.True(t, ok)
+	require.Equal(t, 5, count)
+
+	indexJoin := &physicalop.PhysicalIndexJoin{BasePhysicalJoin: baseJoin, CompareFilters: compareFilters}
+	count, ok = statementRUIndexJoinExpressionCount(indexJoin)
+	require.True(t, ok)
+	require.Equal(t, 7, count)
+
+	indexHashJoin := &physicalop.PhysicalIndexHashJoin{PhysicalIndexJoin: physicalop.PhysicalIndexJoin{
+		BasePhysicalJoin: baseJoin,
+		OuterHashKeys:    []*expression.Column{col, col, col},
+		InnerHashKeys:    []*expression.Column{col, col, col},
+		CompareFilters:   compareFilters,
+	}}
+	count, ok = statementRUIndexHashJoinExpressionCount(indexHashJoin)
+	require.True(t, ok)
+	require.Equal(t, 8, count)
+
+	indexMergeJoin := &physicalop.PhysicalIndexMergeJoin{PhysicalIndexJoin: physicalop.PhysicalIndexJoin{
+		BasePhysicalJoin: baseJoin,
+		CompareFilters:   compareFilters,
+	}, CompareFuncs: []expression.CompareFunc{nil, nil}, OuterCompareFuncs: []expression.CompareFunc{nil}, NeedOuterSort: true}
+	count, ok = statementRUIndexMergeJoinExpressionCount(indexMergeJoin)
+	require.True(t, ok)
+	require.Equal(t, 8, count)
+
+	invalidHashJoin := *hashJoin
+	invalidHashJoin.RightJoinKeys = invalidHashJoin.RightJoinKeys[:1]
+	_, ok = statementRUHashJoinExpressionCount(&invalidHashJoin)
+	require.False(t, ok)
+
+	invalidIndexJoin := *indexJoin
+	invalidIndexJoin.InnerJoinKeys = invalidIndexJoin.InnerJoinKeys[:1]
+	_, ok = statementRUIndexJoinExpressionCount(&invalidIndexJoin)
+	require.False(t, ok)
+
+	invalidIndexHashJoin := *indexHashJoin
+	invalidIndexHashJoin.InnerHashKeys = invalidIndexHashJoin.InnerHashKeys[:1]
+	_, ok = statementRUIndexHashJoinExpressionCount(&invalidIndexHashJoin)
+	require.False(t, ok)
+
+	indexMergeJoinWithoutOuterSort := *indexMergeJoin
+	indexMergeJoinWithoutOuterSort.NeedOuterSort = false
+	count, ok = statementRUIndexMergeJoinExpressionCount(&indexMergeJoinWithoutOuterSort)
+	require.True(t, ok)
+	require.Equal(t, 7, count)
+}
+
+func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
+	tests := []struct {
+		name string
+		new  func(exec.BaseExecutor) exec.Executor
+	}{
+		{name: "Sort", new: func(base exec.BaseExecutor) exec.Executor {
+			return &sortexec.SortExec{BaseExecutor: base}
+		}},
+		{name: "TopN", new: func(base exec.BaseExecutor) exec.Executor {
+			return &sortexec.TopNExec{SortExec: sortexec.SortExec{BaseExecutor: base}}
+		}},
+		{name: "HashAgg", new: func(base exec.BaseExecutor) exec.Executor {
+			return &aggregate.HashAggExec{BaseExecutor: base}
+		}},
+		{name: "HashJoinV1", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.HashJoinV1Exec{BaseExecutor: base}
+		}},
+		{name: "HashJoinV2", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.HashJoinV2Exec{BaseExecutor: base}
+		}},
+		{name: "MergeJoin", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.MergeJoinExec{BaseExecutor: base}
+		}},
+		{name: "IndexJoin", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.IndexLookUpJoin{BaseExecutor: base}
+		}},
+		{name: "IndexHashJoin", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.IndexNestedLoopHashJoin{IndexLookUpJoin: join.IndexLookUpJoin{BaseExecutor: base}}
+		}},
+		{name: "IndexMergeJoin", new: func(base exec.BaseExecutor) exec.Executor {
+			return &join.IndexLookUpMergeJoin{BaseExecutor: base}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := mock.NewContext()
+			weights := statementru.Weights{
+				statementru.CPUWork:       1,
+				statementru.HashStateRows: 1,
+			}
+			sc := ctx.GetSessionVars().StmtCtx
+			require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				Weights:       &weights,
+			}))
+			executorUnderTest := tt.new(exec.NewBaseExecutor(ctx, expression.NewSchema(), 0))
+			builder := &executorBuilder{sctx: ctx}
+
+			builder.configureStatementRUStateful(executorUnderTest, 1)
+
+			require.NoError(t, builder.err)
+			provider, ok := executorUnderTest.(interface{ StatementRUEnabled() bool })
+			require.True(t, ok)
+			require.True(t, provider.StatementRUEnabled())
+			require.False(t, exec.ConfigureStatementRUExecutor(executorUnderTest, sc, exec.StatementRUExecutorConfig{
+				CPUWorkMultiplier: 1,
+				NeedsUnitRecorder: true,
+			}))
+		})
+	}
 }
 
 func TestStatementRUSelectedRecordSetDoesNotDetach(t *testing.T) {

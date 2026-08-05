@@ -120,6 +120,7 @@ type HashJoinV1Exec struct {
 
 // Close implements the Executor Close interface.
 func (e *HashJoinV1Exec) Close() error {
+	e.statementRU.markFailed()
 	if e.closeCh != nil {
 		close(e.closeCh)
 	}
@@ -189,6 +190,7 @@ func (e *HashJoinV1Exec) Open(ctx context.Context) error {
 // OpenSelf opens join itself and initializes the hash join context.
 func (e *HashJoinV1Exec) OpenSelf() error {
 	e.Prepared = false
+	e.statementRU = newStatementRUJoinRuntime(e.StatementRUEnabled())
 	if e.HashJoinCtxV1.memTracker != nil {
 		e.HashJoinCtxV1.memTracker.Reset()
 	} else {
@@ -1008,6 +1010,7 @@ func (w *ProbeWorkerV1) join2ChunkForOuterHashJoin(probeSideChk *chunk.Chunk, hC
 // step 1. fetch data from build side child and build a hash table;
 // step 2. fetch data from probe child in a background goroutine and probe the hash table in multiple join workers.
 func (e *HashJoinV1Exec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	statementRU := e.statementRU
 	if !e.Prepared {
 		e.buildFinished = make(chan error, 1)
 		hCtx := &HashContext{
@@ -1041,14 +1044,20 @@ func (e *HashJoinV1Exec) Next(ctx context.Context, req *chunk.Chunk) (err error)
 
 	result, ok := <-e.joinResultCh
 	if !ok {
+		if ctx.Err() != nil {
+			statementRU.markFailed()
+		}
+		statementRU.recordTerminal(&e.BaseExecutor, true)
 		return nil
 	}
 	if result.err != nil {
 		e.finished.Store(true)
+		statementRU.markFailed()
 		return result.err
 	}
 	req.SwapColumns(result.chk)
 	result.src <- result.chk
+	recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
 	return nil
 }
 
@@ -1097,6 +1106,12 @@ func (e *HashJoinV1Exec) fetchAndBuildHashTable(ctx context.Context) {
 	if err == nil {
 		if err = <-fetchBuildSideRowsOk; err != nil {
 			e.buildFinished <- err
+		} else if e.statementRU != nil {
+			if hashStateRows, ok := statementRUHashStateRowsV1(e.RowContainer); ok {
+				e.statementRU.setHashStateRows(hashStateRows)
+			} else {
+				e.statementRU.markHashStateArithmeticInvalid()
+			}
 		}
 	}
 }

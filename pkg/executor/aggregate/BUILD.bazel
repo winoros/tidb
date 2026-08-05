@@ -20,6 +20,7 @@ go_library(
         "//pkg/expression",
         "//pkg/parser/mysql",
         "//pkg/parser/terror",
+        "//pkg/resourcegroup/statementru",
         "//pkg/sessionctx",
         "//pkg/sessionctx/stmtctx",
         "//pkg/sessionctx/vardef",
@@ -44,11 +45,14 @@ go_library(
 go_test(
     name = "aggregate_test",
     timeout = "short",
-    srcs = ["agg_spill_test.go"],
+    srcs = [
+        "agg_spill_test.go",
+        "statement_ru_internal_test.go",
+    ],
+    embed = [":aggregate"],
     flaky = True,
-    shard_count = 3,
+    shard_count = 13,
     deps = [
-        ":aggregate",
         "//pkg/config",
         "//pkg/executor/aggfuncs",
         "//pkg/executor/internal/exec",
@@ -58,6 +62,7 @@ go_test(
         "//pkg/expression/aggregation",
         "//pkg/parser/ast",
         "//pkg/parser/mysql",
+        "//pkg/resourcegroup/statementru",
         "//pkg/sessionctx",
         "//pkg/sessionctx/vardef",
         "//pkg/types",

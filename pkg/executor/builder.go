@@ -148,6 +148,65 @@ func (b *executorBuilder) configureStatementRUCPUWork(executor exec.Executor, mu
 	}
 }
 
+func (b *executorBuilder) configureStatementRUStateful(executor exec.Executor, multiplier int) {
+	if !b.statementRUCPUWorkEligible() {
+		return
+	}
+	if !exec.ConfigureStatementRUExecutor(executor, b.sctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
+		CPUWorkMultiplier: multiplier,
+		NeedsUnitRecorder: true,
+	}) {
+		b.err = errors.Errorf("cannot configure stateful statement RU work for executor %T with multiplier %d", executor, multiplier)
+	}
+}
+
+func statementRUJoinConditionCount(join *physicalop.BasePhysicalJoin) int {
+	return len(join.LeftConditions) + len(join.RightConditions) + len(join.OtherConditions)
+}
+
+func statementRUCompareFilterCount(filters *physicalop.ColWithCmpFuncManager) int {
+	if filters == nil {
+		return 0
+	}
+	return len(filters.OpType)
+}
+
+func statementRUHashJoinExpressionCount(join *physicalop.PhysicalHashJoin) (int, bool) {
+	if len(join.LeftJoinKeys) != len(join.RightJoinKeys) || len(join.LeftNAJoinKeys) != len(join.RightNAJoinKeys) {
+		return 0, false
+	}
+	return len(join.EqualConditions) + len(join.NAEqualConditions) + statementRUJoinConditionCount(&join.BasePhysicalJoin), true
+}
+
+func statementRUMergeJoinExpressionCount(join *physicalop.PhysicalMergeJoin) (int, bool) {
+	if len(join.LeftJoinKeys) != len(join.RightJoinKeys) {
+		return 0, false
+	}
+	return len(join.CompareFuncs) + statementRUJoinConditionCount(&join.BasePhysicalJoin), true
+}
+
+func statementRUIndexJoinExpressionCount(join *physicalop.PhysicalIndexJoin) (int, bool) {
+	if len(join.OuterJoinKeys) != len(join.InnerJoinKeys) {
+		return 0, false
+	}
+	return len(join.OuterJoinKeys) + statementRUJoinConditionCount(&join.BasePhysicalJoin) + statementRUCompareFilterCount(join.CompareFilters), true
+}
+
+func statementRUIndexHashJoinExpressionCount(join *physicalop.PhysicalIndexHashJoin) (int, bool) {
+	if len(join.OuterHashKeys) != len(join.InnerHashKeys) {
+		return 0, false
+	}
+	return len(join.OuterHashKeys) + statementRUJoinConditionCount(&join.BasePhysicalJoin) + statementRUCompareFilterCount(join.CompareFilters), true
+}
+
+func statementRUIndexMergeJoinExpressionCount(join *physicalop.PhysicalIndexMergeJoin) (int, bool) {
+	count := len(join.CompareFuncs) + statementRUJoinConditionCount(&join.BasePhysicalJoin) + statementRUCompareFilterCount(join.CompareFilters)
+	if join.NeedOuterSort {
+		count += len(join.OuterCompareFuncs)
+	}
+	return count, true
+}
+
 func (b *executorBuilder) statementRUCPUWorkEligible() bool {
 	return !b.forDataReaderBuilder && !b.buildingShuffleWorker
 }
@@ -1778,6 +1837,9 @@ func (b *executorBuilder) buildMergeJoin(v *physicalop.PhysicalMergeJoin) exec.E
 	}
 
 	executor_metrics.ExecutorCounterMergeJoinExec.Inc()
+	if expressionCount, ok := statementRUMergeJoinExpressionCount(v); ok {
+		b.configureStatementRUStateful(e, expressionCount)
+	}
 	return e
 }
 
@@ -1989,19 +2051,27 @@ func (b *executorBuilder) buildHashJoinV2FromChildExecs(leftExec, rightExec exec
 }
 
 func (b *executorBuilder) buildHashJoin(v *physicalop.PhysicalHashJoin) exec.Executor {
+	var e exec.Executor
 	if b.sctx.GetSessionVars().UseHashJoinV2 && joinversion.IsHashJoinV2Supported() && v.CanUseHashJoinV2() {
-		return b.buildHashJoinV2(v)
-	}
-	leftExec := b.build(v.Children()[0])
-	if b.err != nil {
-		return nil
-	}
+		e = b.buildHashJoinV2(v)
+	} else {
+		leftExec := b.build(v.Children()[0])
+		if b.err != nil {
+			return nil
+		}
 
-	rightExec := b.build(v.Children()[1])
-	if b.err != nil {
-		return nil
+		rightExec := b.build(v.Children()[1])
+		if b.err != nil {
+			return nil
+		}
+		e = b.buildHashJoinFromChildExecs(leftExec, rightExec, v)
 	}
-	return b.buildHashJoinFromChildExecs(leftExec, rightExec, v)
+	if e != nil {
+		if expressionCount, ok := statementRUHashJoinExpressionCount(v); ok {
+			b.configureStatementRUStateful(e, expressionCount)
+		}
+	}
+	return e
 }
 
 func (b *executorBuilder) buildHashJoinFromChildExecs(leftExec, rightExec exec.Executor, v *physicalop.PhysicalHashJoin) *join.HashJoinV1Exec {
@@ -2158,7 +2228,9 @@ func (b *executorBuilder) buildHashAgg(v *physicalop.PhysicalHashAgg) exec.Execu
 	if b.err != nil {
 		return nil
 	}
-	return b.buildHashAggFromChildExec(src, v)
+	e := b.buildHashAggFromChildExec(src, v)
+	b.configureStatementRUStateful(e, len(v.GroupByItems)+len(v.AggFuncs))
+	return e
 }
 
 func (b *executorBuilder) buildHashAggFromChildExec(childExec exec.Executor, v *physicalop.PhysicalHashAgg) *aggregate.HashAggExec {
@@ -2744,6 +2816,7 @@ func (b *executorBuilder) buildSort(v *physicalop.PhysicalSort) exec.Executor {
 		ExecSchema:   v.Schema(),
 	}
 	executor_metrics.ExecutorCounterSortExec.Inc()
+	b.configureStatementRUStateful(&sortExec, 0)
 	return &sortExec
 }
 
@@ -2752,14 +2825,13 @@ func (b *executorBuilder) buildTopN(v *physicalop.PhysicalTopN) exec.Executor {
 	if b.err != nil {
 		return nil
 	}
-	sortExec := sortexec.SortExec{
-		BaseExecutor: exec.NewBaseExecutor(b.sctx, v.Schema(), v.ID(), childExec),
-		ByItems:      v.ByItems,
-		ExecSchema:   v.Schema(),
-	}
 	executor_metrics.ExecutorCounterTopNExec.Inc()
 	t := &sortexec.TopNExec{
-		SortExec:    sortExec,
+		SortExec: sortexec.SortExec{
+			BaseExecutor: exec.NewBaseExecutor(b.sctx, v.Schema(), v.ID(), childExec),
+			ByItems:      v.ByItems,
+			ExecSchema:   v.Schema(),
+		},
 		Limit:       &physicalop.PhysicalLimit{Count: v.Count, Offset: v.Offset},
 		Concurrency: b.sctx.GetSessionVars().Concurrency.ExecutorConcurrency,
 	}
@@ -2786,6 +2858,7 @@ func (b *executorBuilder) buildTopN(v *physicalop.PhysicalTopN) exec.Executor {
 		t.RankInfo.TruncateKeyPrefixCharCounts = make([]int, 0, 1)
 		t.RankInfo.TruncateKeyPrefixCharCounts = append(t.RankInfo.TruncateKeyPrefixCharCounts, v.PrefixLen)
 	}
+	b.configureStatementRUStateful(t, 0)
 	return t
 }
 
@@ -3541,6 +3614,17 @@ func (b *executorBuilder) newDataReaderBuilder(p base.PhysicalPlan) (*dataReader
 }
 
 func (b *executorBuilder) buildIndexLookUpJoin(v *physicalop.PhysicalIndexJoin) exec.Executor {
+	e := b.buildIndexLookUpJoinBase(v)
+	if e == nil {
+		return nil
+	}
+	if expressionCount, ok := statementRUIndexJoinExpressionCount(v); ok {
+		b.configureStatementRUStateful(e, expressionCount)
+	}
+	return e
+}
+
+func (b *executorBuilder) buildIndexLookUpJoinBase(v *physicalop.PhysicalIndexJoin) *join.IndexLookUpJoin {
 	outerExec := b.build(v.Children()[1-v.InnerChildIdx])
 	if b.err != nil {
 		return nil
@@ -3787,15 +3871,17 @@ func (b *executorBuilder) buildIndexLookUpMergeJoin(v *physicalop.PhysicalIndexM
 		joiners[i] = join.NewJoiner(b.sctx, v.JoinType, v.InnerChildIdx == 0, defaultValues, v.OtherConditions, leftTypes, rightTypes, childrenUsedSchema, false)
 	}
 	e.Joiners = joiners
+	if expressionCount, ok := statementRUIndexMergeJoinExpressionCount(v); ok {
+		b.configureStatementRUStateful(e, expressionCount)
+	}
 	return e
 }
 
 func (b *executorBuilder) buildIndexNestedLoopHashJoin(v *physicalop.PhysicalIndexHashJoin) exec.Executor {
-	joinExec := b.buildIndexLookUpJoin(&(v.PhysicalIndexJoin))
+	e := b.buildIndexLookUpJoinBase(&(v.PhysicalIndexJoin))
 	if b.err != nil {
 		return nil
 	}
-	e := joinExec.(*join.IndexLookUpJoin)
 	idxHash := &join.IndexNestedLoopHashJoin{
 		IndexLookUpJoin: *e,
 		KeepOuterOrder:  v.KeepOuterOrder,
@@ -3804,6 +3890,9 @@ func (b *executorBuilder) buildIndexNestedLoopHashJoin(v *physicalop.PhysicalInd
 	idxHash.Joiners = make([]join.Joiner, concurrency)
 	for i := range concurrency {
 		idxHash.Joiners[i] = e.Joiner.Clone()
+	}
+	if expressionCount, ok := statementRUIndexHashJoinExpressionCount(v); ok {
+		b.configureStatementRUStateful(idxHash, expressionCount)
 	}
 	return idxHash
 }

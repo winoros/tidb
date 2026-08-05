@@ -16,6 +16,7 @@ package aggregate_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
@@ -182,7 +184,7 @@ func getMockDataSourceParameters(ctx sessionctx.Context) testutil.MockDataSource
 	}
 }
 
-func buildHashAggExecutor(t *testing.T, ctx sessionctx.Context, child exec.Executor, fileNamePrefixForTest string) *aggregate.HashAggExec {
+func buildHashAggExecutor(t testing.TB, ctx sessionctx.Context, child exec.Executor, fileNamePrefixForTest string) *aggregate.HashAggExec {
 	if err := ctx.GetSessionVars().SetSystemVar(vardef.TiDBHashAggFinalConcurrency, fmt.Sprintf("%v", 5)); err != nil {
 		t.Fatal(err)
 	}
@@ -510,4 +512,237 @@ func TestRandomFail(t *testing.T) {
 	finishChan.Store(true)
 	wg.Wait()
 	util.CheckNoLeakFiles(t, testFuncName)
+}
+
+func configureStatementRUForHashAggTest(t testing.TB, ctx sessionctx.Context, aggExec *aggregate.HashAggExec, multiplier int) *statementru.Statement {
+	requiredUnits := statementru.CPUWork.Mask() | statementru.HashStateRows.Mask()
+	weights := statementru.Weights{
+		statementru.CPUWork:       1,
+		statementru.HashStateRows: 1,
+	}
+	require.True(t, ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: requiredUnits,
+		Weights:       &weights,
+	}))
+	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, ctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
+		CPUWorkMultiplier: multiplier,
+		NeedsUnitRecorder: true,
+	}))
+	statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+	require.NotNil(t, statement)
+	return statement
+}
+
+func finishStatementRUForHashAggTest(t testing.TB, statement *statementru.Statement, complete bool, terminal statementru.TerminalStatus) statementru.UnitValues {
+	requiredUnits := statementru.CPUWork.Mask() | statementru.HashStateRows.Mask()
+	if complete {
+		require.True(t, statement.EvidenceRecorder().MarkPresent(requiredUnits))
+	} else {
+		require.True(t, statement.EvidenceRecorder().MarkPartial(requiredUnits))
+	}
+	finish, first := statement.Finish(terminal)
+	require.True(t, first)
+	units, ok := finish.Result.Units()
+	require.True(t, ok)
+	return units
+}
+
+func executeHashAggForStatementRUTest(t testing.TB, aggExec *aggregate.HashAggExec, drain bool) {
+	ctx := context.Background()
+	require.NoError(t, aggExec.Open(ctx))
+	defer func() { require.NoError(t, aggExec.Close()) }()
+	for {
+		chk := exec.NewFirstChunk(aggExec)
+		require.NoError(t, aggExec.Next(ctx, chk))
+		if !drain || chk.NumRows() == 0 {
+			return
+		}
+	}
+}
+
+func executeSpilledHashAggForStatementRUTest(t *testing.T, aggExec *aggregate.HashAggExec) {
+	ctx := context.Background()
+	require.NoError(t, aggExec.Open(ctx))
+	defer func() { require.NoError(t, aggExec.Close()) }()
+	triggerTracker := memory.NewTracker(memory.LabelForSQLText, 1)
+	aggExec.ActionSpill().Action(triggerTracker)
+	for {
+		chk := exec.NewFirstChunk(aggExec)
+		require.NoError(t, aggExec.Next(ctx, chk))
+		if chk.NumRows() == 0 {
+			return
+		}
+	}
+}
+
+type statementRUErrorHashAggChild struct {
+	exec.BaseExecutor
+	returned atomic.Bool
+}
+
+var errStatementRUHashAggChild = errors.New("statement RU hash agg child error")
+
+func (c *statementRUErrorHashAggChild) Next(_ context.Context, req *chunk.Chunk) error {
+	req.Reset()
+	if c.returned.CompareAndSwap(false, true) {
+		req.AppendString(0, "a")
+		req.AppendFloat64(1, 1)
+		return nil
+	}
+	return errStatementRUHashAggChild
+}
+
+func TestStatementRUHashAggAccounting(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		mode := "serial"
+		if parallel {
+			mode = "parallel"
+		}
+
+		t.Run(mode+" grouped input", func(t *testing.T) {
+			ctx := mock.NewContext()
+			dataSource := buildMockDataSource(getMockDataSourceParameters(ctx), []string{"a", "b", "a"}, []float64{1, 2, 3})
+			dataSource.PrepareChunks()
+			aggExec := buildHashAggExecutor(t, ctx, dataSource, t.Name())
+			aggExec.IsUnparallelExec = !parallel
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+
+			executeHashAggForStatementRUTest(t, aggExec, true)
+			units := finishStatementRUForHashAggTest(t, statement, true, statementru.TerminalSuccess)
+			require.Equal(t, float64(6), units[statementru.CPUWork])
+			require.Equal(t, float64(2), units[statementru.HashStateRows])
+		})
+
+		t.Run(mode+" empty global aggregate", func(t *testing.T) {
+			ctx := mock.NewContext()
+			dataSource := buildMockDataSource(getMockDataSourceParameters(ctx), nil, nil)
+			dataSource.PrepareChunks()
+			aggExec := buildHashAggExecutor(t, ctx, dataSource, t.Name())
+			aggExec.IsUnparallelExec = !parallel
+			aggExec.GroupByItems = nil
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+
+			executeHashAggForStatementRUTest(t, aggExec, true)
+			units := finishStatementRUForHashAggTest(t, statement, true, statementru.TerminalSuccess)
+			require.Zero(t, units[statementru.CPUWork])
+			require.Equal(t, float64(1), units[statementru.HashStateRows])
+		})
+
+		t.Run(mode+" empty grouped aggregate", func(t *testing.T) {
+			ctx := mock.NewContext()
+			dataSource := buildMockDataSource(getMockDataSourceParameters(ctx), nil, nil)
+			dataSource.PrepareChunks()
+			aggExec := buildHashAggExecutor(t, ctx, dataSource, mode+"EmptyGrouped")
+			aggExec.IsUnparallelExec = !parallel
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+
+			executeHashAggForStatementRUTest(t, aggExec, true)
+			units := finishStatementRUForHashAggTest(t, statement, true, statementru.TerminalSuccess)
+			require.Zero(t, units[statementru.CPUWork])
+			require.Zero(t, units[statementru.HashStateRows])
+		})
+
+		t.Run(mode+" spill counts final logical groups once", func(t *testing.T) {
+			defer config.RestoreFunc()()
+			config.UpdateGlobal(func(conf *config.Config) {
+				conf.TempStoragePath = t.TempDir()
+			})
+			ctx := mock.NewContext()
+			dataSource := buildMockDataSource(testutil.MockDataSourceParameters{
+				DataSchema: expression.NewSchema(getColumns()[:2]...),
+				Ctx:        ctx,
+			}, []string{"a", "b", "a"}, []float64{1, 2, 3})
+			dataSource.PrepareChunks()
+			aggExec := buildHashAggExecutor(t, ctx, dataSource, mode+"StatementRUSpill")
+			aggExec.IsUnparallelExec = !parallel
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+
+			executeSpilledHashAggForStatementRUTest(t, aggExec)
+			units := finishStatementRUForHashAggTest(t, statement, true, statementru.TerminalSuccess)
+			require.Equal(t, float64(6), units[statementru.CPUWork])
+			require.Equal(t, float64(2), units[statementru.HashStateRows])
+			if parallel {
+				require.True(t, aggExec.IsSpillTriggeredForTest())
+			}
+		})
+
+		t.Run(mode+" early close has no terminal hash state", func(t *testing.T) {
+			ctx := mock.NewContext()
+			dataSource := buildMockDataSource(getMockDataSourceParameters(ctx), []string{"a", "b", "a"}, []float64{1, 2, 3})
+			dataSource.PrepareChunks()
+			aggExec := buildHashAggExecutor(t, ctx, dataSource, t.Name())
+			aggExec.IsUnparallelExec = !parallel
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+			require.True(t, ctx.GetSessionVars().StmtCtx.StatementRUUnitRecorder().Add(statementru.HashStateRows, 7))
+
+			executeHashAggForStatementRUTest(t, aggExec, false)
+			units := finishStatementRUForHashAggTest(t, statement, false, statementru.TerminalCanceled)
+			require.Equal(t, float64(7), units[statementru.HashStateRows])
+		})
+
+		t.Run(mode+" error has no terminal hash state", func(t *testing.T) {
+			ctx := mock.NewContext()
+			child := &statementRUErrorHashAggChild{
+				BaseExecutor: exec.NewBaseExecutor(ctx, getMockDataSourceParameters(ctx).DataSchema, 0),
+			}
+			aggExec := buildHashAggExecutor(t, ctx, child, t.Name())
+			aggExec.IsUnparallelExec = !parallel
+			statement := configureStatementRUForHashAggTest(t, ctx, aggExec, 2)
+			require.True(t, ctx.GetSessionVars().StmtCtx.StatementRUUnitRecorder().Add(statementru.HashStateRows, 7))
+
+			execCtx := context.Background()
+			require.NoError(t, aggExec.Open(execCtx))
+			chk := exec.NewFirstChunk(aggExec)
+			require.ErrorIs(t, aggExec.Next(execCtx, chk), errStatementRUHashAggChild)
+			require.False(t, aggregate.StatementRUHashStateCommittedForTest(aggExec))
+			require.NoError(t, aggExec.Close())
+			units := finishStatementRUForHashAggTest(t, statement, false, statementru.TerminalError)
+			require.Equal(t, float64(7), units[statementru.HashStateRows])
+		})
+	}
+}
+
+func BenchmarkStatementRUHashAggAccounting(b *testing.B) {
+	const rows = 8192
+	groupValues := make([]string, rows)
+	aggValues := make([]float64, rows)
+	for i := range rows {
+		groupValues[i] = fmt.Sprintf("group-%d", i%128)
+		aggValues[i] = float64(i)
+	}
+
+	for _, parallel := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			b.Run(fmt.Sprintf("parallel=%t/enabled=%t", parallel, enabled), func(b *testing.B) {
+				ctx := mock.NewContext()
+				ctx.GetSessionVars().InitChunkSize = 1024
+				ctx.GetSessionVars().MaxChunkSize = 1024
+				dataSource := buildMockDataSource(getMockDataSourceParameters(ctx), groupValues, aggValues)
+				aggExec := buildHashAggExecutor(b, ctx, dataSource, b.Name())
+				aggExec.IsUnparallelExec = !parallel
+				var statement *statementru.Statement
+				if enabled {
+					statement = configureStatementRUForHashAggTest(b, ctx, aggExec, len(aggExec.GroupByItems)+len(aggExec.PartialAggFuncs))
+				}
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					dataSource.PrepareChunks()
+					b.StartTimer()
+					executeHashAggForStatementRUTest(b, aggExec, true)
+				}
+				b.StopTimer()
+
+				if statement != nil {
+					units := finishStatementRUForHashAggTest(b, statement, true, statementru.TerminalSuccess)
+					require.Positive(b, units[statementru.CPUWork])
+					require.Positive(b, units[statementru.HashStateRows])
+				}
+			})
+		}
+	}
 }

@@ -88,6 +88,8 @@ type IndexLookUpJoin struct {
 	stats    *indexLookUpJoinRuntimeStats
 	Finished *atomic.Value
 	prepared bool
+
+	statementRU *statementRUJoinRuntime
 }
 
 // OuterCtx is the outer ctx used in index lookup join
@@ -156,6 +158,8 @@ type outerWorker struct {
 	innerCh  chan<- *lookUpJoinTask
 
 	parentMemTracker *memory.Tracker
+	statementRU      *statementRUJoinRuntime
+	statementRURows  int64
 }
 
 type innerWorker struct {
@@ -172,6 +176,8 @@ type innerWorker struct {
 	maxFetchSize          int
 	stats                 *innerWorkerRuntimeStats
 	memTracker            *memory.Tracker
+	statementRU           *statementRUJoinRuntime
+	statementRURows       int64
 }
 
 // Open implements the Executor interface.
@@ -191,6 +197,7 @@ func (e *IndexLookUpJoin) Open(ctx context.Context) error {
 		e.stats = &indexLookUpJoinRuntimeStats{}
 	}
 	e.cancelFunc = nil
+	e.statementRU = newStatementRUJoinRuntime(e.StatementRUEnabled())
 	return nil
 }
 
@@ -226,6 +233,7 @@ func (e *IndexLookUpJoin) newOuterWorker(resultCh, innerCh chan *lookUpJoinTask,
 		maxBatchSize:     maxBatchSize,
 		parentMemTracker: e.memTracker,
 		lookup:           e,
+		statementRU:      e.statementRU,
 	}
 	return ow
 }
@@ -251,6 +259,7 @@ func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWork
 		stats:         innerStats,
 		lookup:        e,
 		memTracker:    memory.NewTracker(memory.LabelForIndexJoinInnerWorker, -1),
+		statementRU:   e.statementRU,
 	}
 	failpoint.Inject("inlNewInnerPanic", func(val failpoint.Value) {
 		if val.(bool) {
@@ -280,7 +289,19 @@ func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWork
 }
 
 // Next implements the Executor interface.
-func (e *IndexLookUpJoin) Next(ctx context.Context, req *chunk.Chunk) error {
+func (e *IndexLookUpJoin) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	statementRU := e.statementRU
+	defer func() {
+		if r := recover(); r != nil {
+			statementRU.markFailed()
+			panic(r)
+		}
+		if err != nil {
+			statementRU.markFailed()
+			return
+		}
+		recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
+	}()
 	if !e.prepared {
 		e.startWorkers(ctx, req.RequiredRows())
 		e.prepared = true
@@ -296,6 +317,11 @@ func (e *IndexLookUpJoin) Next(ctx context.Context, req *chunk.Chunk) error {
 			return err
 		}
 		if task == nil {
+			e.WorkerWg.Wait()
+			if ctx.Err() != nil {
+				statementRU.markFailed()
+			}
+			statementRU.recordTerminal(&e.BaseExecutor, false)
 			return nil
 		}
 		startTime := time.Now()
@@ -395,7 +421,7 @@ func (ow *outerWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 		}
 		close(ow.resultCh)
 		close(ow.innerCh)
-		wg.Done()
+		ow.statementRU.mergeBuildRowsAndDone(ow.statementRURows, wg)
 	}()
 	for {
 		failpoint.Inject("TestIssue30211", nil)
@@ -472,6 +498,7 @@ func (ow *outerWorker) buildTask(ctx context.Context) (*lookUpJoinTask, error) {
 			return task, err
 		}
 		rows := chk.NumRows()
+		ow.statementRU.addLocalRows(&ow.statementRURows, rows)
 		if rows == 0 {
 			break
 		}
@@ -529,7 +556,7 @@ func (iw *innerWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 			// "task != nil" is guaranteed when panic happened.
 			task.doneCh <- err
 		}
-		wg.Done()
+		iw.statementRU.mergeProbeRowsAndDone(iw.statementRURows, wg)
 	}()
 
 	for ok := true; ok; {
@@ -788,6 +815,7 @@ func (iw *innerWorker) fetchInnerResults(ctx context.Context, task *lookUpJoinTa
 			needClose = true
 			break
 		}
+		iw.statementRU.addLocalRows(&iw.statementRURows, executorChk.NumRows())
 		task.innerResult.Add(executorChk)
 		// If maxFetchSize is set, we need to break the loop when the fetched rows reach the max.
 		if iw.maxFetchSize > 0 && task.innerResult.Len() >= iw.maxFetchSize {
@@ -843,6 +871,7 @@ func (iw *innerWorker) hasNullInJoinKey(row chunk.Row) bool {
 
 // Close implements the Executor interface.
 func (e *IndexLookUpJoin) Close() error {
+	e.statementRU.markFailed()
 	if e.stats != nil {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
 	}

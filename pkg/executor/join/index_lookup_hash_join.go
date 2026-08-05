@@ -151,6 +151,7 @@ func (e *IndexNestedLoopHashJoin) Open(ctx context.Context) error {
 	e.memTracker.AttachTo(e.Ctx().GetSessionVars().StmtCtx.MemTracker)
 	e.cancelFunc = nil
 	e.innerPtrBytes = make([][]byte, 0, 8)
+	e.statementRU = newStatementRUJoinRuntime(e.StatementRUEnabled())
 	if e.RuntimeStats() != nil {
 		e.stats = &indexLookUpJoinRuntimeStats{}
 	}
@@ -243,7 +244,25 @@ func (e *IndexNestedLoopHashJoin) wait4JoinWorkers() {
 }
 
 // Next implements the IndexNestedLoopHashJoin Executor interface.
-func (e *IndexNestedLoopHashJoin) Next(ctx context.Context, req *chunk.Chunk) error {
+func (e *IndexNestedLoopHashJoin) Next(ctx context.Context, req *chunk.Chunk) (err error) {
+	statementRU := e.statementRU
+	defer func() {
+		if r := recover(); r != nil {
+			statementRU.markFailed()
+			panic(r)
+		}
+		if err != nil {
+			statementRU.markFailed()
+			return
+		}
+		recordStatementRUJoinOutput(&e.BaseExecutor, req.NumRows())
+		if req.NumRows() == 0 {
+			if ctx.Err() != nil {
+				statementRU.markFailed()
+			}
+			statementRU.recordTerminal(&e.BaseExecutor, false)
+		}
+	}()
 	if !e.prepared {
 		e.startWorkers(ctx, req.RequiredRows())
 		e.prepared = true
@@ -260,6 +279,9 @@ func (e *IndexNestedLoopHashJoin) runInOrder(ctx context.Context, req *chunk.Chu
 		if e.isDryUpTasks(ctx) {
 			if e.panicErr.Load() {
 				return e.panicErr.error
+			}
+			if ctx.Err() != nil {
+				e.statementRU.markFailed()
 			}
 			return nil
 		}
@@ -347,6 +369,7 @@ func (*IndexNestedLoopHashJoin) handleResult(req *chunk.Chunk, result *indexHash
 
 // Close implements the IndexNestedLoopHashJoin Executor interface.
 func (e *IndexNestedLoopHashJoin) Close() error {
+	e.statementRU.markFailed()
 	if e.stats != nil {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
 	}
@@ -373,6 +396,7 @@ func (e *IndexNestedLoopHashJoin) Close() error {
 
 func (ow *indexHashJoinOuterWorker) run(ctx context.Context) {
 	defer trace.StartRegion(ctx, "IndexHashJoinOuterWorker").End()
+	defer func() { ow.statementRU.addBuildRows(ow.statementRURows) }()
 	defer close(ow.innerCh)
 	for {
 		failpoint.Inject("TestIssue30211", nil)
@@ -465,6 +489,7 @@ func (e *IndexNestedLoopHashJoin) newOuterWorker(innerCh chan *indexHashJoinTask
 			maxBatchSize:     maxBatchSize,
 			parentMemTracker: e.memTracker,
 			lookup:           &e.IndexLookUpJoin,
+			statementRU:      e.statementRU,
 		},
 		innerCh:        innerCh,
 		keepOuterOrder: e.KeepOuterOrder,
@@ -509,6 +534,7 @@ func (e *IndexNestedLoopHashJoin) newInnerWorker(taskCh chan *indexHashJoinTask,
 			stats:         innerStats,
 			lookup:        &e.IndexLookUpJoin,
 			memTracker:    memory.NewTracker(memory.LabelForIndexJoinInnerWorker, -1),
+			statementRU:   e.statementRU,
 		},
 		taskCh:            taskCh,
 		joiner:            e.Joiners[workerID],
@@ -542,6 +568,7 @@ func (e *IndexNestedLoopHashJoin) newInnerWorker(taskCh chan *indexHashJoinTask,
 
 func (iw *indexHashJoinInnerWorker) run(ctx context.Context, cancelFunc context.CancelFunc) {
 	defer trace.StartRegion(ctx, "IndexHashJoinInnerWorker").End()
+	defer func() { iw.statementRU.addProbeRows(iw.statementRURows) }()
 	var task *indexHashJoinTask
 	joinResult, ok := iw.getNewJoinResult(ctx)
 	if !ok {

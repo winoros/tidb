@@ -16,6 +16,7 @@ package aggregate
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
@@ -46,6 +48,163 @@ type HashAggInput struct {
 	// it's used to reuse the `chk`,
 	// and tell the data-fetcher which partial worker it should send data to.
 	giveBackCh chan<- *chunk.Chunk
+}
+
+const (
+	hashAggStatementRUOpen uint32 = iota
+	hashAggStatementRUCommitted
+	hashAggStatementRUAborted
+)
+
+type hashAggStatementRUDimension struct {
+	publication sync.Mutex
+	state       atomic.Uint32
+}
+
+func (d *hashAggStatementRUDimension) commit(publish func()) bool {
+	d.publication.Lock()
+	defer d.publication.Unlock()
+	if d.state.Load() != hashAggStatementRUOpen {
+		return false
+	}
+	publish()
+	d.state.Store(hashAggStatementRUCommitted)
+	return true
+}
+
+func (d *hashAggStatementRUDimension) abort() {
+	d.publication.Lock()
+	defer d.publication.Unlock()
+	if d.state.Load() == hashAggStatementRUOpen {
+		d.state.Store(hashAggStatementRUAborted)
+	}
+}
+
+type hashAggStatementRUFinalWorker struct {
+	completed atomic.Bool
+	rows      int64
+	valid     bool
+}
+
+// hashAggStatementRURuntime owns all mutable statement RU state for one Open.
+// Close aborts and detaches it before signaling executor goroutines, so an old
+// generation can finish without publishing into a later Open.
+type hashAggStatementRURuntime struct {
+	cpuWork   hashAggStatementRUDimension
+	hashState hashAggStatementRUDimension
+
+	inputRows  int64
+	inputValid bool
+
+	hashStateRows  int64
+	hashStateValid bool
+
+	finalWorkers []hashAggStatementRUFinalWorker
+	executed     atomic.Bool
+	childEmpty   atomic.Bool
+	serialActive sync.WaitGroup
+
+	parallelStartForTest func()
+}
+
+func newHashAggStatementRURuntime(finalConcurrency int) *hashAggStatementRURuntime {
+	runtime := &hashAggStatementRURuntime{
+		inputValid:     true,
+		hashStateValid: true,
+		finalWorkers:   make([]hashAggStatementRUFinalWorker, finalConcurrency),
+	}
+	runtime.childEmpty.Store(true)
+	return runtime
+}
+
+func (r *hashAggStatementRURuntime) abort() {
+	if r == nil {
+		return
+	}
+	r.cpuWork.abort()
+	r.hashState.abort()
+}
+
+func (r *hashAggStatementRURuntime) addInputRows(rows int) {
+	if r == nil || r.cpuWork.state.Load() != hashAggStatementRUOpen || !r.inputValid {
+		return
+	}
+	r.inputValid = addStatementRUInputRows(&r.inputRows, rows)
+}
+
+func (r *hashAggStatementRURuntime) commitCPUWork(e *HashAggExec) {
+	if r == nil {
+		return
+	}
+	r.cpuWork.commit(func() {
+		if r.inputValid {
+			e.RecordStatementRUCPUWork64(r.inputRows)
+		} else {
+			e.InvalidateStatementRUUnit(statementru.CPUWork)
+		}
+	})
+}
+
+func (r *hashAggStatementRURuntime) addHashStateRows(rows int64) {
+	if r == nil || r.hashState.state.Load() != hashAggStatementRUOpen || !r.hashStateValid {
+		return
+	}
+	r.hashStateValid = addStatementRUCount(&r.hashStateRows, rows)
+}
+
+func (r *hashAggStatementRURuntime) commitHashStateRows(e *HashAggExec, rows int64, valid bool) {
+	if r == nil {
+		return
+	}
+	r.hashState.commit(func() {
+		if valid {
+			e.RecordStatementRUUnit(statementru.HashStateRows, float64(rows))
+		} else {
+			e.InvalidateStatementRUUnit(statementru.HashStateRows)
+		}
+	})
+}
+
+func (r *hashAggStatementRURuntime) commitSerialHashStateRows(e *HashAggExec) {
+	if r == nil {
+		return
+	}
+	r.commitHashStateRows(e, r.hashStateRows, r.hashStateValid)
+}
+
+func (r *hashAggStatementRURuntime) completeFinalWorker(workerID int, rows int64, valid bool) {
+	if r == nil || r.hashState.state.Load() != hashAggStatementRUOpen || workerID < 0 || workerID >= len(r.finalWorkers) {
+		return
+	}
+	worker := &r.finalWorkers[workerID]
+	worker.rows = rows
+	worker.valid = valid
+	worker.completed.Store(true)
+}
+
+func (r *hashAggStatementRURuntime) commitParallelHashStateRows(e *HashAggExec, globalAggregate bool) {
+	if r == nil || r.hashState.state.Load() != hashAggStatementRUOpen || len(r.finalWorkers) == 0 {
+		return
+	}
+	var rows int64
+	valid := true
+	for i := range r.finalWorkers {
+		worker := &r.finalWorkers[i]
+		if !worker.completed.Load() {
+			return
+		}
+		if !worker.valid {
+			valid = false
+			continue
+		}
+		if valid {
+			valid = addStatementRUCount(&rows, worker.rows)
+		}
+	}
+	if valid && rows == 0 && globalAggregate {
+		rows = 1
+	}
+	r.commitHashStateRows(e, rows, valid)
 }
 
 // HashAggExec deals with all the aggregate functions.
@@ -155,6 +314,13 @@ type HashAggExec struct {
 	// isChildDrained indicates whether the all data from child has been taken out.
 	isChildDrained bool
 
+	// statementRU is nil on the dark path. An enabled Open installs a new
+	// generation that Next and all parallel workers capture before doing work.
+	statementRU atomic.Pointer[hashAggStatementRURuntime]
+	// statementRULifecycle serializes enabled Open/Close with parallel startup.
+	// The dark path never takes this lock.
+	statementRULifecycle sync.Mutex
+
 	HasDistinct bool
 
 	invalidMemoryUsageForTrackingTest bool
@@ -167,21 +333,27 @@ func (e *HashAggExec) Close() error {
 	if e.stats != nil {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
 	}
-
+	if !e.StatementRUEnabled() {
+		e.abortStatementRURuntime()
+		return e.close()
+	}
+	e.statementRULifecycle.Lock()
+	defer e.statementRULifecycle.Unlock()
+	statementRU := e.abortStatementRURuntime()
 	if e.IsUnparallelExec {
-		e.childResult = nil
-		e.groupSet, _ = set.NewStringSetWithMemoryUsage()
-		e.partialResultMap = nil
-		if e.memTracker != nil {
-			e.memTracker.ReplaceBytesUsed(0)
+		childErr := e.BaseExecutor.Close()
+		if statementRU != nil {
+			statementRU.serialActive.Wait()
 		}
-		if e.dataInDisk != nil {
-			e.dataInDisk.Close()
-		}
-		if e.spillAction != nil {
-			e.spillAction.SetFinished()
-		}
-		e.spillAction, e.tmpChkForSpill = nil, nil
+		e.cleanupUnparallel()
+		return childErr
+	}
+	return e.close()
+}
+
+func (e *HashAggExec) close() error {
+	if e.IsUnparallelExec {
+		e.cleanupUnparallel()
 		err := e.BaseExecutor.Close()
 		if err != nil {
 			return err
@@ -235,6 +407,22 @@ func (e *HashAggExec) Close() error {
 	return err
 }
 
+func (e *HashAggExec) cleanupUnparallel() {
+	e.childResult = nil
+	e.groupSet, _ = set.NewStringSetWithMemoryUsage()
+	e.partialResultMap = nil
+	if e.memTracker != nil {
+		e.memTracker.ReplaceBytesUsed(0)
+	}
+	if e.dataInDisk != nil {
+		e.dataInDisk.Close()
+	}
+	if e.spillAction != nil {
+		e.spillAction.SetFinished()
+	}
+	e.spillAction, e.tmpChkForSpill = nil, nil
+}
+
 // Open implements the Executor Open interface.
 func (e *HashAggExec) Open(ctx context.Context) error {
 	failpoint.Inject("mockHashAggExecBaseExecutorOpenReturnedError", func(val failpoint.Value) {
@@ -243,14 +431,34 @@ func (e *HashAggExec) Open(ctx context.Context) error {
 		}
 	})
 
+	if !e.StatementRUEnabled() {
+		if err := e.BaseExecutor.Open(ctx); err != nil {
+			return err
+		}
+		return e.openSelf(nil)
+	}
+	e.statementRULifecycle.Lock()
+	defer e.statementRULifecycle.Unlock()
+	e.abortStatementRURuntime()
 	if err := e.BaseExecutor.Open(ctx); err != nil {
 		return err
 	}
-	return e.OpenSelf()
+	return e.openSelf(e.newStatementRURuntime())
 }
 
 // OpenSelf just opens the hash aggregation executor.
 func (e *HashAggExec) OpenSelf() error {
+	if !e.StatementRUEnabled() {
+		e.abortStatementRURuntime()
+		return e.openSelf(nil)
+	}
+	e.statementRULifecycle.Lock()
+	defer e.statementRULifecycle.Unlock()
+	e.abortStatementRURuntime()
+	return e.openSelf(e.newStatementRURuntime())
+}
+
+func (e *HashAggExec) openSelf(statementRU *hashAggStatementRURuntime) error {
 	e.prepared.Store(false)
 
 	if e.memTracker != nil {
@@ -264,9 +472,29 @@ func (e *HashAggExec) OpenSelf() error {
 
 	if e.IsUnparallelExec {
 		e.initForUnparallelExec()
+		e.statementRU.Store(statementRU)
 		return nil
 	}
-	return e.initForParallelExec(e.Ctx())
+	if err := e.initForParallelExec(e.Ctx(), statementRU); err != nil {
+		statementRU.abort()
+		return err
+	}
+	e.statementRU.Store(statementRU)
+	return nil
+}
+
+func (e *HashAggExec) abortStatementRURuntime() *hashAggStatementRURuntime {
+	statementRU := e.statementRU.Swap(nil)
+	statementRU.abort()
+	return statementRU
+}
+
+func (e *HashAggExec) newStatementRURuntime() *hashAggStatementRURuntime {
+	finalConcurrency := 0
+	if !e.IsUnparallelExec {
+		finalConcurrency = e.Ctx().GetSessionVars().HashAggFinalConcurrency()
+	}
+	return newHashAggStatementRURuntime(finalConcurrency)
 }
 
 func (e *HashAggExec) initForUnparallelExec() {
@@ -350,7 +578,7 @@ func (e *HashAggExec) initPartialWorkers(partialConcurrency int, finalConcurrenc
 	e.memTracker.Consume(memUsage)
 }
 
-func (e *HashAggExec) initFinalWorkers(finalConcurrency int) {
+func (e *HashAggExec) initFinalWorkers(finalConcurrency int, statementRU *hashAggStatementRURuntime) {
 	for i := range finalConcurrency {
 		e.finalWorkers[i] = HashAggFinalWorker{
 			baseHashAggWorker:          newBaseHashAggWorker(e.finishCh, e.FinalAggFuncs, e.MaxChunkSize(), e.memTracker),
@@ -360,6 +588,8 @@ func (e *HashAggExec) initFinalWorkers(finalConcurrency int) {
 			finalResultHolderCh:        make(chan *chunk.Chunk, 1),
 			spillHelper:                e.spillHelper,
 			restoredAggResultMapperMem: 0,
+			statementRU:                statementRU,
+			statementRUWorkerID:        i,
 		}
 		// There is a bucket in the empty partialResultsMap.
 		e.memTracker.Consume(int64(e.finalWorkers[i].partialResultMap.Bytes))
@@ -371,7 +601,7 @@ func (e *HashAggExec) initFinalWorkers(finalConcurrency int) {
 	}
 }
 
-func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) error {
+func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context, statementRU *hashAggStatementRURuntime) error {
 	sessionVars := e.Ctx().GetSessionVars()
 	partialConcurrency := sessionVars.HashAggPartialConcurrency()
 	finalConcurrency := sessionVars.HashAggFinalConcurrency()
@@ -380,7 +610,9 @@ func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) error {
 		return errors.New("partialConcurrency or finalConcurrency is 0")
 	}
 
-	e.IsChildReturnEmpty = true
+	if statementRU == nil {
+		e.IsChildReturnEmpty = true
+	}
 	e.finalOutputCh = make(chan *AfFinalResult, finalConcurrency+partialConcurrency+1)
 	e.inputCh = make(chan *HashAggInput, partialConcurrency)
 	e.finishCh = make(chan struct{}, 1)
@@ -433,7 +665,7 @@ func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) error {
 	e.initRuntimeStats()
 
 	e.initPartialWorkers(partialConcurrency, finalConcurrency, ctx)
-	e.initFinalWorkers(finalConcurrency)
+	e.initFinalWorkers(finalConcurrency, statementRU)
 	e.parallelExecValid = true
 	e.executed.Store(false)
 	return nil
@@ -442,13 +674,28 @@ func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) error {
 // Next implements the Executor Next interface.
 func (e *HashAggExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
-	if e.IsUnparallelExec {
-		return e.unparallelExec(ctx, req)
+	statementRUEnabled := e.StatementRUEnabled()
+	statementRU := e.statementRU.Load()
+	if statementRUEnabled && statementRU == nil {
+		return nil
 	}
-	return e.parallelExec(ctx, req)
+	if e.IsUnparallelExec {
+		if statementRUEnabled {
+			e.statementRULifecycle.Lock()
+			if e.statementRU.Load() != statementRU {
+				e.statementRULifecycle.Unlock()
+				return nil
+			}
+			statementRU.serialActive.Add(1)
+			e.statementRULifecycle.Unlock()
+			defer statementRU.serialActive.Done()
+		}
+		return e.unparallelExec(ctx, req, statementRU)
+	}
+	return e.parallelExec(ctx, req, statementRU, statementRUEnabled)
 }
 
-func (e *HashAggExec) fetchChildData(ctx context.Context, waitGroup *sync.WaitGroup) {
+func (e *HashAggExec) fetchChildData(ctx context.Context, waitGroup *sync.WaitGroup, statementRU *hashAggStatementRURuntime) {
 	var (
 		input *HashAggInput
 		chk   *chunk.Chunk
@@ -510,9 +757,11 @@ func (e *HashAggExec) fetchChildData(ctx context.Context, waitGroup *sync.WaitGr
 		}
 
 		if chk.NumRows() == 0 {
+			statementRU.commitCPUWork(e)
 			e.memTracker.Consume(-mSize)
 			return
 		}
+		statementRU.addInputRows(chk.NumRows())
 
 		failpoint.Inject("ConsumeRandomPanic", nil)
 		e.memTracker.Consume(chk.MemoryUsage() - mSize)
@@ -572,17 +821,18 @@ func (e *HashAggExec) waitPartialWorkerAndCloseOutputChs(waitGroup *sync.WaitGro
 	}
 }
 
-func (e *HashAggExec) waitAllWorkersAndCloseFinalOutputCh(waitGroups ...*sync.WaitGroup) {
+func (*HashAggExec) waitAllWorkersAndCloseFinalOutputCh(finalOutputCh chan *AfFinalResult, waitGroups ...*sync.WaitGroup) {
 	for _, waitGroup := range waitGroups {
 		waitGroup.Wait()
 	}
-	close(e.finalOutputCh)
+	close(finalOutputCh)
 }
 
-func (e *HashAggExec) prepare4ParallelExec(ctx context.Context) {
+func (e *HashAggExec) prepare4ParallelExec(ctx context.Context, statementRU *hashAggStatementRURuntime) {
+	finalOutputCh := e.finalOutputCh
 	fetchChildWorkerWaitGroup := &sync.WaitGroup{}
 	fetchChildWorkerWaitGroup.Add(1)
-	go e.fetchChildData(ctx, fetchChildWorkerWaitGroup)
+	go e.fetchChildData(ctx, fetchChildWorkerWaitGroup, statementRU)
 
 	// We get the pointers here instead of when we are all finished and adding the time because:
 	// (1) If there is Apply in the plan tree, executors may be reused (Open()ed and Close()ed multiple times)
@@ -626,7 +876,7 @@ func (e *HashAggExec) prepare4ParallelExec(ctx context.Context) {
 
 	// All workers may send error message to e.finalOutputCh when they panic.
 	// And e.finalOutputCh should be closed after all goroutines gone.
-	go e.waitAllWorkersAndCloseFinalOutputCh(fetchChildWorkerWaitGroup, partialWorkerWaitGroup, finalWorkerWaitGroup)
+	go e.waitAllWorkersAndCloseFinalOutputCh(finalOutputCh, fetchChildWorkerWaitGroup, partialWorkerWaitGroup, finalWorkerWaitGroup)
 }
 
 // HashAggExec employs one input reader, M partial workers and N final workers to execute parallelly.
@@ -634,9 +884,27 @@ func (e *HashAggExec) prepare4ParallelExec(ctx context.Context) {
 // 1. input reader reads data from child executor and send them to partial workers.
 // 2. partial worker receives the input data, updates the partial results, and shuffle the partial results to the final workers.
 // 3. final worker receives partial results from all the partial workers, evaluates the final results and sends the final results to the main thread.
-func (e *HashAggExec) parallelExec(ctx context.Context, chk *chunk.Chunk) error {
-	if e.prepared.CompareAndSwap(false, true) {
-		e.prepare4ParallelExec(ctx)
+func (e *HashAggExec) parallelExec(ctx context.Context, chk *chunk.Chunk, statementRU *hashAggStatementRURuntime, statementRUEnabled bool) error {
+	var finalOutputCh chan *AfFinalResult
+	if !statementRUEnabled {
+		finalOutputCh = e.finalOutputCh
+		if e.prepared.CompareAndSwap(false, true) {
+			e.prepare4ParallelExec(ctx, nil)
+		}
+	} else {
+		if statementRU.parallelStartForTest != nil {
+			statementRU.parallelStartForTest()
+		}
+		e.statementRULifecycle.Lock()
+		if e.statementRU.Load() != statementRU {
+			e.statementRULifecycle.Unlock()
+			return nil
+		}
+		finalOutputCh = e.finalOutputCh
+		if e.prepared.CompareAndSwap(false, true) {
+			e.prepare4ParallelExec(ctx, statementRU)
+		}
+		e.statementRULifecycle.Unlock()
 	}
 
 	failpoint.Inject("parallelHashAggError", func(val failpoint.Value) {
@@ -645,17 +913,36 @@ func (e *HashAggExec) parallelExec(ctx context.Context, chk *chunk.Chunk) error 
 		}
 	})
 
-	if e.executed.Load() {
+	var executed bool
+	if statementRUEnabled {
+		executed = statementRU.executed.Load()
+	} else {
+		executed = e.executed.Load()
+	}
+	if executed {
+		statementRU.commitParallelHashStateRows(e, len(e.GroupByItems) == 0)
 		return nil
 	}
 
 	for {
-		result, ok := <-e.finalOutputCh
+		result, ok := <-finalOutputCh
 		if !ok {
-			e.executed.Store(true)
-			if e.IsChildReturnEmpty && e.DefaultVal != nil {
-				chk.Append(e.DefaultVal, 0, 1)
+			if statementRUEnabled {
+				statementRU.executed.Store(true)
+			} else {
+				e.executed.Store(true)
 			}
+			var childEmpty bool
+			if statementRUEnabled {
+				childEmpty = statementRU.childEmpty.Load()
+			} else {
+				childEmpty = e.IsChildReturnEmpty
+			}
+			if childEmpty && e.DefaultVal != nil {
+				chk.Append(e.DefaultVal, 0, 1)
+				return nil
+			}
+			statementRU.commitParallelHashStateRows(e, len(e.GroupByItems) == 0)
 			return nil
 		}
 		if result.err != nil {
@@ -667,14 +954,18 @@ func (e *HashAggExec) parallelExec(ctx context.Context, chk *chunk.Chunk) error 
 		// So that we can reuse the chunk
 		result.giveBackCh <- result.chk
 		if chk.NumRows() > 0 {
-			e.IsChildReturnEmpty = false
+			if statementRUEnabled {
+				statementRU.childEmpty.Store(false)
+			} else {
+				e.IsChildReturnEmpty = false
+			}
 			return nil
 		}
 	}
 }
 
 // unparallelExec executes hash aggregation algorithm in single thread.
-func (e *HashAggExec) unparallelExec(ctx context.Context, chk *chunk.Chunk) error {
+func (e *HashAggExec) unparallelExec(ctx context.Context, chk *chunk.Chunk, statementRU *hashAggStatementRURuntime) error {
 	chk.Reset()
 	for {
 		exprCtx := e.Ctx().GetExprCtx()
@@ -696,12 +987,16 @@ func (e *HashAggExec) unparallelExec(ctx context.Context, chk *chunk.Chunk) erro
 					return nil
 				}
 			}
+			statementRU.addHashStateRows(int64(len(e.groupKeys)))
 			e.resetSpillMode()
 		}
 		if e.executed.Load() {
+			if chk.NumRows() == 0 {
+				statementRU.commitSerialHashStateRows(e)
+			}
 			return nil
 		}
-		if err := e.execute(ctx); err != nil {
+		if err := e.execute(ctx, statementRU); err != nil {
 			return err
 		}
 		if len(e.groupSet.M) == 0 && len(e.GroupByItems) == 0 {
@@ -729,7 +1024,7 @@ func (e *HashAggExec) resetSpillMode() {
 }
 
 // execute fetches Chunks from src and update each aggregate function for each row in Chunk.
-func (e *HashAggExec) execute(ctx context.Context) (err error) {
+func (e *HashAggExec) execute(ctx context.Context, statementRU *hashAggStatementRURuntime) (err error) {
 	defer func() {
 		if e.tmpChkForSpill.NumRows() > 0 && err == nil {
 			err = e.dataInDisk.Add(e.tmpChkForSpill)
@@ -739,7 +1034,7 @@ func (e *HashAggExec) execute(ctx context.Context) (err error) {
 	exprCtx := e.Ctx().GetExprCtx()
 	for {
 		mSize := e.childResult.MemoryUsage()
-		if err := e.getNextChunk(ctx); err != nil {
+		if err := e.getNextChunk(ctx, statementRU); err != nil {
 			return err
 		}
 		failpoint.Inject("ConsumeRandomPanic", nil)
@@ -818,16 +1113,18 @@ func (e *HashAggExec) spillUnprocessedData(isFullChk bool) (err error) {
 	return nil
 }
 
-func (e *HashAggExec) getNextChunk(ctx context.Context) (err error) {
+func (e *HashAggExec) getNextChunk(ctx context.Context, statementRU *hashAggStatementRURuntime) (err error) {
 	e.childResult.Reset()
 	if !e.isChildDrained {
 		if err := exec.Next(ctx, e.Children(0), e.childResult); err != nil {
 			return err
 		}
 		if e.childResult.NumRows() != 0 {
+			statementRU.addInputRows(e.childResult.NumRows())
 			return nil
 		}
 		e.isChildDrained = true
+		statementRU.commitCPUWork(e)
 	}
 	if e.offsetOfSpilledChks < e.numOfSpilledChks {
 		e.childResult, err = e.dataInDisk.GetChunk(e.offsetOfSpilledChks)
@@ -837,6 +1134,21 @@ func (e *HashAggExec) getNextChunk(ctx context.Context) (err error) {
 		e.offsetOfSpilledChks++
 	}
 	return nil
+}
+
+func addStatementRUInputRows(total *int64, rows int) bool {
+	if rows <= 0 {
+		return true
+	}
+	return addStatementRUCount(total, int64(rows))
+}
+
+func addStatementRUCount(total *int64, delta int64) bool {
+	if delta < 0 || *total < 0 || math.MaxInt64-*total < delta {
+		return false
+	}
+	*total += delta
+	return true
 }
 
 func (e *HashAggExec) getPartialResults(groupKey string) []aggfuncs.PartialResult {
