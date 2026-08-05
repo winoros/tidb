@@ -35,6 +35,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/session"
 	"github.com/pingcap/tidb/pkg/sessionctx/slowlogrule"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
@@ -58,6 +59,14 @@ type mockRUV2ConsumptionReporter struct {
 	tiflashRU float64
 }
 
+type statementRUReportCollector struct {
+	reports []statementru.Report
+}
+
+func (r *statementRUReportCollector) ReportStatementRU(report statementru.Report) {
+	r.reports = append(r.reports, report)
+}
+
 func (*mockRUV2ConsumptionReporter) ReportConsumption(_ string, _ *rmpb.Consumption) {}
 
 func (m *mockRUV2ConsumptionReporter) ReportRUV2Consumption(resourceGroupName string, tikvRUV2, tidbRUV2, tiflashRUV2 float64) {
@@ -77,6 +86,34 @@ func (c *mockRUV2ReportingContext) GetDistSQLCtx() *distsqlctx.DistSQLContext {
 	dctx.RUConsumptionReporter = c.reporter
 	dctx.ResourceGroupName = c.GetSessionVars().StmtCtx.ResourceGroupName
 	return dctx
+}
+
+func TestCompilerTransfersStatementRUOwnerToExecStmt(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	se := tk.Session()
+	stmtCtx := se.GetSessionVars().StmtCtx
+	reporter := &statementRUReportCollector{}
+	weights := statementru.Weights{statementru.CPUWork: 2}
+	require.True(t, stmtCtx.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+		Reporter:      reporter,
+	}))
+	require.True(t, stmtCtx.StatementRUUnitRecorder().Add(statementru.CPUWork, 3))
+	require.True(t, stmtCtx.StatementRUEvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	stmtNode, err := parser.New().ParseOneStmt("select 1", "", "")
+	require.NoError(t, err)
+
+	execStmt, err := (&executor.Compiler{Ctx: se}).Compile(context.Background(), stmtNode)
+	require.NoError(t, err)
+	// Only Compiler can transfer this owner into ExecStmt. Reporting it from the
+	// terminal proves the production wiring, not merely the transfer helper.
+	require.Nil(t, stmtCtx.TakeStatementRUForExecution())
+	execStmt.FinishExecuteStmt(0, nil, false)
+	require.Equal(t, []statementru.Report{{TotalRU: 6}}, reporter.reports)
 }
 
 func TestFormatSQL(t *testing.T) {

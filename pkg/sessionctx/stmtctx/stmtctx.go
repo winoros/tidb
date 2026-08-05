@@ -312,6 +312,13 @@ type StatementContext struct {
 	statementRU         *statementru.Statement
 	statementRUAttached bool
 	statementRUTaken    bool
+	statementRUOverride struct {
+		active   bool
+		unit     statementru.UnitRecorder
+		evidence statementru.EvidenceRecorder
+	}
+	statementRUCommitPipelined bool
+	statementRUWholeTxnRetried bool
 
 	// PrevAffectedRows is the affected-rows value(DDL is 0, DML is the number of affected rows).
 	PrevAffectedRows int64
@@ -1272,6 +1279,9 @@ func (sc *StatementContext) TakeStatementRUForExecution() *statementru.Statement
 
 // StatementRUUnitRecorder returns the narrow value-recording capability.
 func (sc *StatementContext) StatementRUUnitRecorder() statementru.UnitRecorder {
+	if sc.statementRUOverride.active {
+		return sc.statementRUOverride.unit
+	}
 	if sc.statementRU == nil {
 		return nil
 	}
@@ -1280,10 +1290,66 @@ func (sc *StatementContext) StatementRUUnitRecorder() statementru.UnitRecorder {
 
 // StatementRUEvidenceRecorder returns the statement-level evidence capability.
 func (sc *StatementContext) StatementRUEvidenceRecorder() statementru.EvidenceRecorder {
+	if sc.statementRUOverride.active {
+		return sc.statementRUOverride.evidence
+	}
 	if sc.statementRU == nil {
 		return nil
 	}
 	return sc.statementRU.EvidenceRecorder()
+}
+
+// WithStatementRUProducerOverride routes producers using this historical
+// StatementContext to target for the callback's dynamic scope. A nil target is
+// an explicit Off override and must not fall back to the historical statement's
+// collector. ResetForRetry deliberately preserves the override. Nested calls
+// restore in LIFO order, panics still restore, and a full Reset starts a new
+// lifecycle that the old scope must not overwrite.
+func (sc *StatementContext) WithStatementRUProducerOverride(target *StatementContext, callback func() error) error {
+	previous := sc.statementRUOverride
+	lifecycleID := sc.ctxID
+	var unit statementru.UnitRecorder
+	var evidence statementru.EvidenceRecorder
+	if target != nil {
+		unit = target.StatementRUUnitRecorder()
+		evidence = target.StatementRUEvidenceRecorder()
+	}
+	sc.statementRUOverride.active = true
+	sc.statementRUOverride.unit = unit
+	sc.statementRUOverride.evidence = evidence
+	defer func() {
+		if sc.ctxID == lifecycleID {
+			sc.statementRUOverride = previous
+		}
+	}()
+	if callback != nil {
+		return callback()
+	}
+	return nil
+}
+
+// MarkStatementRUCommitPipelined preserves the commit mode after transaction
+// cleanup so final statement-RU write-detail collection can fail closed.
+func (sc *StatementContext) MarkStatementRUCommitPipelined() {
+	sc.statementRUCommitPipelined = true
+}
+
+// StatementRUCommitPipelined reports whether this statement owned a pipelined
+// commit whose current CommitDetails write pair is not authoritative.
+func (sc *StatementContext) StatementRUCommitPipelined() bool {
+	return sc.statementRUCommitPipelined
+}
+
+// MarkStatementRUWholeTxnRetried records that TiDB replayed the transaction,
+// including retries that failed before client-go could populate CommitDetails.
+func (sc *StatementContext) MarkStatementRUWholeTxnRetried() {
+	sc.statementRUWholeTxnRetried = true
+}
+
+// StatementRUWholeTxnRetried reports whether this finalizing statement owned a
+// TiDB whole-transaction replay.
+func (sc *StatementContext) StatementRUWholeTxnRetried() bool {
+	return sc.statementRUWholeTxnRetried
 }
 
 // GetExecDetails gets the execution details for the statement.

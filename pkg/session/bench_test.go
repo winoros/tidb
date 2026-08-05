@@ -32,7 +32,10 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/session/sessionapi"
+	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/util/benchdaily"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -45,6 +48,8 @@ import (
 
 var smallCount = 100
 var bigCount = 10000
+var statementRUMemBufferBenchSink kv.MemBuffer
+var statementRUTotalBenchSink float64
 
 func prepareBenchSession() (sessionapi.Session, *domain.Domain, kv.Storage) {
 	config.UpdateGlobal(func(cfg *config.Config) {
@@ -2140,4 +2145,232 @@ func BenchmarkPipelinedUpdate(b *testing.B) {
 		b.StopTimer()
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds()/int64(b.N*batchSize*batchNum)), "ns/row")
+}
+
+func BenchmarkStatementRUMutationPreparation(b *testing.B) {
+	store, err := mockstore.NewMockStore(mockstore.WithStoreType(mockstore.EmbedUnistore))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			b.Error(err)
+		}
+	})
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	newLazyTxn := func(b *testing.B, enabled bool) (*LazyTxn, kv.Transaction) {
+		inner, err := store.Begin()
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() {
+			_ = inner.Rollback()
+		})
+		sc := stmtctx.NewStmtCtx()
+		if enabled && !sc.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeResultOnly,
+			Applicable:    true,
+			RequiredUnits: statementru.CPUWork.Mask(),
+			Weights:       &weights,
+		}) {
+			b.Fatal("statement RU configuration rejected")
+		}
+		lazyTxn := &LazyTxn{Transaction: inner}
+		lazyTxn.bindStatementRU(&variable.SessionVars{StmtCtx: sc})
+		return lazyTxn, inner
+	}
+
+	b.Run("buffer_get/inner_direct", func(b *testing.B) {
+		_, inner := newLazyTxn(b, false)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			statementRUMemBufferBenchSink = inner.GetMemBuffer()
+		}
+	})
+	for _, enabled := range []bool{false, true} {
+		name := "off"
+		if enabled {
+			name = "result_only"
+		}
+		b.Run("buffer_get/"+name, func(b *testing.B) {
+			lazyTxn, _ := newLazyTxn(b, enabled)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				statementRUMemBufferBenchSink = lazyTxn.GetMemBuffer()
+			}
+		})
+	}
+
+	for _, mutationCount := range []int{1, 64, 1024} {
+		keys := make([]kv.Key, mutationCount)
+		for i := range keys {
+			keys[i] = kv.Key(fmt.Sprintf("statement-ru-mutation-%04d", i))
+		}
+		for _, getterPerMutation := range []bool{false, true} {
+			shape := "getter_once"
+			if getterPerMutation {
+				shape = "getter_per_mutation"
+			}
+			for _, enabled := range []bool{false, true} {
+				mode := "off"
+				if enabled {
+					mode = "result_only"
+				}
+				name := fmt.Sprintf("%s_%d/%s", shape, mutationCount, mode)
+				b.Run(name, func(b *testing.B) {
+					lazyTxn, inner := newLazyTxn(b, enabled)
+					value := []byte("value")
+					warmupBuffer := inner.GetMemBuffer()
+					for i, key := range keys {
+						if i%2 == 0 {
+							if err := warmupBuffer.Set(key, value); err != nil {
+								b.Fatal(err)
+							}
+						} else if err := warmupBuffer.Delete(key); err != nil {
+							b.Fatal(err)
+						}
+					}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						buffer := lazyTxn.GetMemBuffer()
+						for i, key := range keys {
+							if getterPerMutation {
+								buffer = lazyTxn.GetMemBuffer()
+							}
+							if i%2 == 0 {
+								if err := buffer.Set(key, value); err != nil {
+									b.Fatal(err)
+								}
+							} else if err := buffer.Delete(key); err != nil {
+								b.Fatal(err)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func BenchmarkStatementRUSQLMutationPreparation(b *testing.B) {
+	sessionAPI, domain, store := prepareBenchSession()
+	se := sessionAPI.(*session)
+	b.Cleanup(func() {
+		se.Close()
+		domain.Close()
+		if err := store.Close(); err != nil {
+			b.Error(err)
+		}
+	})
+	mustExecute(se, `set @@tidb_enable_mutation_checker = 0`)
+	ctx := context.Background()
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	selection := statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}
+
+	// This benchmark deliberately injects selection after Compile so it isolates
+	// mutation preparation and statement-owner overhead. It is not an end-to-end
+	// selector benchmark: Compile has already performed the production ownership
+	// transfer. Keep the remaining Prepare/Reset/Exec/finish/Finish sequence in
+	// sync with executeStmtImpl when that lifecycle changes.
+	executeMutationWithSyntheticPostCompileSelection := func(b *testing.B, sql string, enabled bool) {
+		stmtNode, err := se.ParseWithParams(ctx, sql)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = se.PrepareTxnCtx(ctx, stmtNode); err != nil {
+			b.Fatal(err)
+		}
+		txnStartTS := se.sessionVars.TxnCtx.StartTS
+		se.sessionVars.StartTime = time.Now()
+		if err = executor.ResetContextOfStmt(se, stmtNode); err != nil {
+			b.Fatal(err)
+		}
+		execStmt, err := (&executor.Compiler{Ctx: se}).Compile(ctx, stmtNode)
+		if err != nil {
+			b.Fatal(err)
+		}
+		sc := se.sessionVars.StmtCtx
+		var statement *statementru.Statement
+		if enabled {
+			if !sc.ConfigureStatementRU(selection) {
+				b.Fatal("statement RU configuration rejected")
+			}
+			statement = sc.TakeStatementRUForExecution()
+			if statement == nil {
+				b.Fatal("statement RU owner missing")
+			}
+		}
+
+		_, execErr := execStmt.Exec(ctx)
+		se.sessionVars.TxnCtx.StatementCount++
+		finalErr := finishStmt(ctx, se, execErr, execStmt)
+		execStmt.FinishExecuteStmt(txnStartTS, finalErr, false)
+		if finalErr != nil {
+			b.Fatal(finalErr)
+		}
+		if statement != nil {
+			if !statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()) {
+				b.Fatal("statement RU CPU evidence rejected")
+			}
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			if !first {
+				b.Fatal("statement RU finalized more than once")
+			}
+			total, ok := finish.Result.TotalRU()
+			if !ok || total <= 0 {
+				b.Fatalf("statement RU total unavailable: total=%v ok=%v", total, ok)
+			}
+			statementRUTotalBenchSink = total
+		}
+	}
+
+	indexCases := []struct {
+		count  int
+		suffix string
+	}{
+		{count: 0},
+		{count: 1, suffix: ", index i1(c1)"},
+		{count: 3, suffix: ", index i1(c1), index i2(c2), index i3(c3)"},
+	}
+	for _, operation := range []string{"insert", "update"} {
+		for _, indexCase := range indexCases {
+			for _, enabled := range []bool{false, true} {
+				mode := "off"
+				if enabled {
+					mode = "result_only"
+				}
+				name := fmt.Sprintf("%s/indexes_%d/%s", operation, indexCase.count, mode)
+				b.Run(name, func(b *testing.B) {
+					tableName := fmt.Sprintf("statement_ru_sql_%s_%d_%t", operation, indexCase.count, enabled)
+					mustExecute(se, "drop table if exists "+tableName)
+					mustExecute(se, fmt.Sprintf(
+						"create table %s (pk bigint primary key, c1 bigint, c2 bigint, c3 bigint%s)",
+						tableName,
+						indexCase.suffix,
+					))
+					if operation == "update" {
+						mustExecute(se, fmt.Sprintf("insert into %s values (1, 1, 1, 1)", tableName))
+					}
+					updateSQL := fmt.Sprintf("update %s set c1 = c1 + 1, c2 = c2 + 1, c3 = c3 + 1 where pk = 1", tableName)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := range b.N {
+						sql := fmt.Sprintf("insert into %s values (%d, %d, %d, %d)", tableName, i+1, i+1, i+1, i+1)
+						if operation == "update" {
+							sql = updateSQL
+						}
+						executeMutationWithSyntheticPostCompileSelection(b, sql, enabled)
+					}
+				})
+			}
+		}
+	}
 }

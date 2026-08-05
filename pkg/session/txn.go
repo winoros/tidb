@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"runtime/trace"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,8 +31,10 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/session/txninfo"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/util/logutil"
@@ -54,9 +57,11 @@ type LazyTxn struct {
 	kv.Transaction
 	txnFuture *txnFuture
 
-	initCnt       int
-	stagingHandle kv.StagingHandle
-	writeSLI      sli.TxnWriteThroughputSLI
+	initCnt                   int
+	stagingHandle             kv.StagingHandle
+	writeSLI                  sli.TxnWriteThroughputSLI
+	statementRUVars           *variable.SessionVars
+	statementRUMutationBuffer statementRUMutationMemBuffer
 
 	enterFairLockingOnValid bool
 
@@ -74,6 +79,139 @@ type LazyTxn struct {
 
 	// commit ts of the last successful transaction, to ensure ordering of TS
 	lastCommitTS uint64
+}
+
+// statementRUMutationMemBuffer charges only entry-creating/removing mutations.
+// Flag-only updates and staging lifecycle methods intentionally use the
+// embedded buffer unchanged because they do not add a prepared KV mutation.
+// Session execution serializes mutations with transaction replacement; only
+// retained readers may overlap replacement, and they must use RLock/RUnlock.
+type statementRUMutationMemBuffer struct {
+	targetMu sync.RWMutex
+	kv.MemBuffer
+	owner *LazyTxn
+}
+
+func (b *statementRUMutationMemBuffer) setTarget(target kv.MemBuffer) {
+	b.targetMu.Lock()
+	b.MemBuffer = target
+	b.targetMu.Unlock()
+}
+
+func (b *statementRUMutationMemBuffer) hasTarget(target kv.MemBuffer) bool {
+	b.targetMu.RLock()
+	matches := b.MemBuffer == target
+	b.targetMu.RUnlock()
+	return matches
+}
+
+// RLock pins one inner-transaction buffer for the complete caller read region.
+// Transaction replacement cannot make Len/Get/Iter and RUnlock observe a
+// different target after a retained proxy has locked the old one.
+func (b *statementRUMutationMemBuffer) RLock() {
+	b.targetMu.RLock()
+	b.MemBuffer.RLock()
+}
+
+// RUnlock releases the pinned inner buffer before allowing target replacement.
+func (b *statementRUMutationMemBuffer) RUnlock() {
+	b.MemBuffer.RUnlock()
+	b.targetMu.RUnlock()
+}
+
+func (b *statementRUMutationMemBuffer) recordMutation() {
+	if b == nil || b.owner == nil {
+		return
+	}
+	if recorder := b.owner.statementRUUnitRecorder(); recorder != nil {
+		recorder.Add(statementru.CPUWork, 1)
+	}
+}
+
+func (b *statementRUMutationMemBuffer) Set(key kv.Key, value []byte) error {
+	b.recordMutation()
+	return b.MemBuffer.Set(key, value)
+}
+
+func (b *statementRUMutationMemBuffer) SetWithFlags(key kv.Key, value []byte, flags ...kv.FlagsOp) error {
+	b.recordMutation()
+	return b.MemBuffer.SetWithFlags(key, value, flags...)
+}
+
+func (b *statementRUMutationMemBuffer) Delete(key kv.Key) error {
+	b.recordMutation()
+	return b.MemBuffer.Delete(key)
+}
+
+func (b *statementRUMutationMemBuffer) DeleteWithFlags(key kv.Key, flags ...kv.FlagsOp) error {
+	b.recordMutation()
+	return b.MemBuffer.DeleteWithFlags(key, flags...)
+}
+
+func (txn *LazyTxn) bindStatementRU(vars *variable.SessionVars) {
+	txn.statementRUVars = vars
+	txn.statementRUMutationBuffer.owner = txn
+	if txn.Transaction != nil {
+		txn.initStatementRUMutationBuffer()
+	}
+}
+
+func (txn *LazyTxn) initStatementRUMutationBuffer() {
+	// The proxy address and owner are stable for the LazyTxn lifetime. Its
+	// target changes only under targetMu, which retained read regions pin via
+	// the proxy's RLock/RUnlock methods.
+	txn.statementRUMutationBuffer.setTarget(txn.Transaction.GetMemBuffer())
+}
+
+func (txn *LazyTxn) setTransaction(inner kv.Transaction) {
+	txn.Transaction = inner
+	if inner != nil {
+		txn.initStatementRUMutationBuffer()
+	}
+	// Invalid/pending transitions deliberately retain the last target. It is
+	// unreachable through GetMemBuffer without an inner transaction and will be
+	// replaced under targetMu when the next transaction becomes valid.
+}
+
+func (txn *LazyTxn) statementRUUnitRecorder() statementru.UnitRecorder {
+	vars := txn.statementRUVars
+	if vars == nil || vars.StmtCtx == nil {
+		return nil
+	}
+	return vars.StmtCtx.StatementRUUnitRecorder()
+}
+
+// GetMemBuffer overrides the embedded transaction method so foreground encoded
+// mutation preparation shares the current logical statement recorder. Off
+// returns the original buffer without allocating a wrapper.
+func (txn *LazyTxn) GetMemBuffer() kv.MemBuffer {
+	buffer := txn.Transaction.GetMemBuffer()
+	if txn.statementRUUnitRecorder() == nil {
+		return buffer
+	}
+	if !txn.statementRUMutationBuffer.hasTarget(buffer) {
+		// Fail closed if a nonstandard LazyTxn constructor did not initialize
+		// the proxy for this inner transaction; SQL mutation behavior must remain
+		// unchanged.
+		return buffer
+	}
+	return &txn.statementRUMutationBuffer
+}
+
+// Set records foreground paths that mutate through Transaction directly.
+func (txn *LazyTxn) Set(key kv.Key, value []byte) error {
+	if recorder := txn.statementRUUnitRecorder(); recorder != nil {
+		recorder.Add(statementru.CPUWork, 1)
+	}
+	return txn.Transaction.Set(key, value)
+}
+
+// Delete records foreground paths that mutate through Transaction directly.
+func (txn *LazyTxn) Delete(key kv.Key) error {
+	if recorder := txn.statementRUUnitRecorder(); recorder != nil {
+		recorder.Add(statementru.CPUWork, 1)
+	}
+	return txn.Transaction.Delete(key)
 }
 
 // GetTableInfo returns the cached index name.
@@ -278,7 +416,7 @@ func (txn *LazyTxn) GetOption(opt int) any {
 }
 
 func (txn *LazyTxn) changeToPending(future *txnFuture) {
-	txn.Transaction = nil
+	txn.setTransaction(nil)
 	txn.txnFuture = future
 }
 
@@ -293,10 +431,10 @@ func (txn *LazyTxn) changePendingToValid(ctx context.Context, sctx sessionctx.Co
 	defer trace.StartRegion(ctx, "WaitTsoFuture").End()
 	t, err := future.wait()
 	if err != nil {
-		txn.Transaction = nil
+		txn.setTransaction(nil)
 		return err
 	}
-	txn.Transaction = t
+	txn.setTransaction(t)
 	txn.initStmtBuf()
 
 	if txn.enterFairLockingOnValid {
@@ -335,7 +473,7 @@ func (txn *LazyTxn) changeToInvalid() {
 		txn.Transaction.GetMemBuffer().Cleanup(txn.stagingHandle)
 	}
 	txn.stagingHandle = kv.InvalidStagingHandle
-	txn.Transaction = nil
+	txn.setTransaction(nil)
 	txn.txnFuture = nil
 
 	txn.enterFairLockingOnValid = false

@@ -164,6 +164,9 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 
 	// Perform optimization and initialization related to the transaction level.
 	err = sessiontxn.AdviseOptimizeWithPlanAndThenWarmUp(c.Ctx, stmt.Plan)
+	if err == nil {
+		recordStatementRUFrontendCompile(stmtCtx, sessVars.FoundInPlanCache, stmtNode, preparedObj)
+	}
 	return finishCompileWithStatementRU(stmt, stmtCtx, err)
 }
 

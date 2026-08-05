@@ -396,8 +396,11 @@ type ExecStmt struct {
 	Ti          *TelemetryInfo
 
 	// statementRU is the canonical owner for this logical execution. The
-	// StatementContext attachment is only a producer-access seam.
-	statementRU *statementru.Statement
+	// StatementContext attachment is a producer-access seam. The original
+	// context pointer is retained only for commit-mode evidence because the
+	// session's current context can temporarily rotate during transaction replay.
+	statementRU        *statementru.Statement
+	statementRUContext *stmtctx.StatementContext
 }
 
 // GetStmtNode returns the stmtNode inside Statement
@@ -552,7 +555,9 @@ func (a *ExecStmt) RebuildPlan(ctx context.Context) (int64, error) {
 	}
 	a.OutputNames = names
 	a.Plan = p
-	a.Ctx.GetSessionVars().StmtCtx.SetPlan(p)
+	stmtCtx := a.Ctx.GetSessionVars().StmtCtx
+	stmtCtx.SetPlan(p)
+	recordStatementRUFrontendCompile(stmtCtx, a.Ctx.GetSessionVars().FoundInPlanCache, a.StmtNode, nil)
 	return a.InfoSchema.SchemaMetaVersion(), nil
 }
 
@@ -1708,6 +1713,7 @@ func (a *ExecStmt) FinishExecuteStmt(txnTS uint64, err error, hasMoreResults boo
 	}
 
 	a.finalizeStatementRUV2Metrics()
+	a.recordStatementRUWriteDetails(execDetail.CommitDetail, err, a.readStatementRUCommitEvidence())
 	a.finishStatementRU(err)
 	a.updateNetworkTrafficStatsAndMetrics()
 	// `LowSlowQuery` and `SummaryStmt` must be called before recording `PrevStmt`.

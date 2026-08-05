@@ -538,6 +538,107 @@ func TestResetStmtCtx(t *testing.T) {
 	require.Nil(t, sc.TakeStatementRUForExecution())
 }
 
+func TestStatementRUProducerOverride(t *testing.T) {
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	selection := statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &weights,
+	}
+
+	t.Run("routes frozen history to live target and restores", func(t *testing.T) {
+		history := stmtctx.NewStmtCtx()
+		target := stmtctx.NewStmtCtx()
+		require.True(t, history.ConfigureStatementRU(selection))
+		historyRecorder := history.StatementRUUnitRecorder()
+		historyStatement := history.TakeStatementRUForExecution()
+		_, first := historyStatement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.True(t, target.ConfigureStatementRU(selection))
+		targetRecorder := target.StatementRUUnitRecorder()
+
+		require.NoError(t, history.WithStatementRUProducerOverride(target, func() error {
+			require.Equal(t, targetRecorder, history.StatementRUUnitRecorder())
+			history.ResetForRetry()
+			require.Equal(t, targetRecorder, history.StatementRUUnitRecorder())
+			require.True(t, history.StatementRUUnitRecorder().Add(statementru.CPUWork, 3))
+			return nil
+		}))
+		require.Equal(t, historyRecorder, history.StatementRUUnitRecorder())
+		require.False(t, historyRecorder.Add(statementru.CPUWork, 1))
+
+		targetStatement := target.TakeStatementRUForExecution()
+		require.True(t, targetStatement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+		finish, first := targetStatement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		units, ok := finish.Result.Units()
+		require.True(t, ok)
+		require.Equal(t, float64(3), units[statementru.CPUWork])
+	})
+
+	t.Run("explicit Off does not fall back", func(t *testing.T) {
+		history := stmtctx.NewStmtCtx()
+		require.True(t, history.ConfigureStatementRU(selection))
+		require.NoError(t, history.WithStatementRUProducerOverride(nil, func() error {
+			require.Nil(t, history.StatementRUUnitRecorder())
+			require.Nil(t, history.StatementRUEvidenceRecorder())
+			history.ResetForRetry()
+			require.Nil(t, history.StatementRUUnitRecorder())
+			return nil
+		}))
+		require.NotNil(t, history.StatementRUUnitRecorder())
+	})
+
+	t.Run("panic restores previous routing", func(t *testing.T) {
+		history := stmtctx.NewStmtCtx()
+		target := stmtctx.NewStmtCtx()
+		require.True(t, history.ConfigureStatementRU(selection))
+		require.True(t, target.ConfigureStatementRU(selection))
+		historyRecorder := history.StatementRUUnitRecorder()
+		targetRecorder := target.StatementRUUnitRecorder()
+
+		require.Panics(t, func() {
+			_ = history.WithStatementRUProducerOverride(target, func() error {
+				require.Equal(t, targetRecorder, history.StatementRUUnitRecorder())
+				panic("statement RU producer panic")
+			})
+		})
+		require.Equal(t, historyRecorder, history.StatementRUUnitRecorder())
+	})
+
+	t.Run("self target nested scope and full reset", func(t *testing.T) {
+		sc := stmtctx.NewStmtCtx()
+		require.True(t, sc.ConfigureStatementRU(selection))
+		recorder := sc.StatementRUUnitRecorder()
+		offTarget := stmtctx.NewStmtCtx()
+		require.NoError(t, sc.WithStatementRUProducerOverride(sc, func() error {
+			require.Equal(t, recorder, sc.StatementRUUnitRecorder())
+			require.NoError(t, sc.WithStatementRUProducerOverride(offTarget, func() error {
+				require.Nil(t, sc.StatementRUUnitRecorder())
+				return nil
+			}))
+			require.Equal(t, recorder, sc.StatementRUUnitRecorder())
+			require.True(t, sc.StatementRUUnitRecorder().Add(statementru.CPUWork, 1))
+			return nil
+		}))
+
+		require.NoError(t, sc.WithStatementRUProducerOverride(sc, func() error {
+			sc.MarkStatementRUCommitPipelined()
+			sc.MarkStatementRUWholeTxnRetried()
+			sc.ResetForRetry()
+			require.True(t, sc.StatementRUCommitPipelined())
+			require.True(t, sc.StatementRUWholeTxnRetried())
+			require.Equal(t, recorder, sc.StatementRUUnitRecorder())
+			require.True(t, sc.Reset())
+			return nil
+		}))
+		require.False(t, sc.StatementRUCommitPipelined())
+		require.False(t, sc.StatementRUWholeTxnRetried())
+		require.Nil(t, sc.StatementRUUnitRecorder())
+	})
+}
+
 func TestStmtCtxID(t *testing.T) {
 	sc := stmtctx.NewStmtCtx()
 	currentID := sc.CtxID()

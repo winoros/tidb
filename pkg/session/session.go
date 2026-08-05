@@ -986,6 +986,9 @@ func (s *session) CommitTxn(ctx context.Context) error {
 	defer r.End()
 
 	s.setLastTxnInfoBeforeTxnEnd()
+	if s.txn.Valid() && s.txn.IsPipelined() {
+		s.sessionVars.StmtCtx.MarkStatementRUCommitPipelined()
+	}
 	var commitDetail *tikvutil.CommitDetails
 	ctx = context.WithValue(ctx, tikvutil.CommitDetailCtxKey, &commitDetail)
 	err := s.doCommitWithRetry(ctx)
@@ -1164,6 +1167,7 @@ func (s *session) checkTxnAborted(stmt sqlexec.Statement) error {
 func (s *session) retry(ctx context.Context, maxCnt uint) (err error) {
 	var retryCnt uint
 	originalStmtCtx := s.sessionVars.StmtCtx
+	originalStmtCtx.MarkStatementRUWholeTxnRetried()
 	defer func() {
 		s.sessionVars.StmtCtx = originalStmtCtx
 		s.sessionVars.RetryInfo.Retrying = false
@@ -1199,54 +1203,65 @@ func (s *session) retry(ctx context.Context, maxCnt uint) (err error) {
 		s.sessionVars.RetryInfo.ResetOffset()
 		for i, sr := range nh.history {
 			st := sr.st
-			s.sessionVars.StmtCtx = sr.stmtCtx
-			s.sessionVars.StmtCtx.CTEStorageMap = map[int]*executor.CTEStorages{}
-			s.sessionVars.StmtCtx.ResetForRetry()
-			s.sessionVars.PlanCacheParams.Reset()
-			schemaVersion, err = st.RebuildPlan(ctx)
-			if err != nil {
+			rebuildFailed := false
+			err = withStatementRUProducerOverrideForRetry(sessVars, sr.stmtCtx, originalStmtCtx, func() error {
+				s.sessionVars.StmtCtx.CTEStorageMap = map[int]*executor.CTEStorages{}
+				s.sessionVars.StmtCtx.ResetForRetry()
+				s.sessionVars.PlanCacheParams.Reset()
+				var replayErr error
+				schemaVersion, replayErr = st.RebuildPlan(ctx)
+				if replayErr != nil {
+					rebuildFailed = true
+					return replayErr
+				}
+
+				if retryCnt == 0 {
+					// We do not have to log the query every time.
+					// We print the queries at the first try only.
+					sql := sqlForLog(st.GetTextToLog(false))
+					if sessVars.EnableRedactLog != errors.RedactLogEnable {
+						sql += redact.String(sessVars.EnableRedactLog, sessVars.PlanCacheParams.String())
+					}
+					logutil.Logger(ctx).Warn("retrying",
+						zap.Int64("schemaVersion", schemaVersion),
+						zap.Uint("retryCnt", retryCnt),
+						zap.Int("queryNum", i),
+						zap.String("sql", sql))
+				} else {
+					logutil.Logger(ctx).Warn("retrying",
+						zap.Int64("schemaVersion", schemaVersion),
+						zap.Uint("retryCnt", retryCnt),
+						zap.Int("queryNum", i))
+				}
+				_, digest := s.sessionVars.StmtCtx.SQLDigest()
+				s.txn.onStmtStart(digest.String())
+				if replayErr = sessiontxn.GetTxnManager(s).OnStmtStart(ctx, st.GetStmtNode()); replayErr == nil {
+					failpoint.Inject("txnRetryPreExecError", func(val failpoint.Value) {
+						if val.(bool) {
+							replayErr = errors.New("mock txn retry pre-exec error")
+						}
+					})
+				}
+				if replayErr == nil {
+					// Only surface the optimistic retry count after replay actually reaches statement execution.
+					s.sessionVars.StmtCtx.ExecRetryCount = uint64(retryCnt + 1)
+					originalStmtCtx.ExecRetryCount = uint64(retryCnt + 1)
+					_, replayErr = st.Exec(ctx)
+				}
+				s.txn.onStmtEnd()
+				if replayErr != nil {
+					s.StmtRollback(ctx, false)
+					return replayErr
+				}
+				s.StmtCommit(ctx)
+				return nil
+			})
+			if rebuildFailed {
 				return err
 			}
-
-			if retryCnt == 0 {
-				// We do not have to log the query every time.
-				// We print the queries at the first try only.
-				sql := sqlForLog(st.GetTextToLog(false))
-				if sessVars.EnableRedactLog != errors.RedactLogEnable {
-					sql += redact.String(sessVars.EnableRedactLog, sessVars.PlanCacheParams.String())
-				}
-				logutil.Logger(ctx).Warn("retrying",
-					zap.Int64("schemaVersion", schemaVersion),
-					zap.Uint("retryCnt", retryCnt),
-					zap.Int("queryNum", i),
-					zap.String("sql", sql))
-			} else {
-				logutil.Logger(ctx).Warn("retrying",
-					zap.Int64("schemaVersion", schemaVersion),
-					zap.Uint("retryCnt", retryCnt),
-					zap.Int("queryNum", i))
-			}
-			_, digest := s.sessionVars.StmtCtx.SQLDigest()
-			s.txn.onStmtStart(digest.String())
-			if err = sessiontxn.GetTxnManager(s).OnStmtStart(ctx, st.GetStmtNode()); err == nil {
-				failpoint.Inject("txnRetryPreExecError", func(val failpoint.Value) {
-					if val.(bool) {
-						err = errors.New("mock txn retry pre-exec error")
-					}
-				})
-			}
-			if err == nil {
-				// Only surface the optimistic retry count after replay actually reaches statement execution.
-				s.sessionVars.StmtCtx.ExecRetryCount = uint64(retryCnt + 1)
-				originalStmtCtx.ExecRetryCount = uint64(retryCnt + 1)
-				_, err = st.Exec(ctx)
-			}
-			s.txn.onStmtEnd()
 			if err != nil {
-				s.StmtRollback(ctx, false)
 				break
 			}
-			s.StmtCommit(ctx)
 		}
 		logutil.Logger(ctx).Warn("transaction association",
 			zap.Uint64("retrying txnStartTS", s.GetSessionVars().TxnCtx.StartTS),
@@ -1288,6 +1303,25 @@ func (s *session) retry(ctx context.Context, maxCnt uint) (err error) {
 		s.sessionVars.SetInTxn(false)
 	}
 	return err
+}
+
+func withStatementRUProducerOverrideForRetry(
+	sessVars *variable.SessionVars,
+	historyStmtCtx *stmtctx.StatementContext,
+	targetStmtCtx *stmtctx.StatementContext,
+	replay func() error,
+) error {
+	return historyStmtCtx.WithStatementRUProducerOverride(targetStmtCtx, func() error {
+		sessVars.StmtCtx = historyStmtCtx
+		// FoundInPlanCache is session-global while replay iterates per-statement
+		// contexts. Each Optimize must prove its own hit before frontend zero is
+		// authoritative.
+		sessVars.FoundInPlanCache = false
+		if replay != nil {
+			return replay()
+		}
+		return nil
+	})
 }
 
 func sqlForLog(sql string) string {
@@ -4868,6 +4902,7 @@ func createSessionWithOpt(
 		sessionStatesHandlers: make(map[sessionstates.SessionStateType]sessionctx.SessionStatesHandler),
 	}
 	s.sessionVars = variable.NewSessionVars(s)
+	s.txn.bindStatementRU(s.sessionVars)
 	s.exprctx = sessionexpr.NewExprContext(s)
 	s.pctx = newPlanContextImpl(s)
 	s.tblctx = tblsession.NewMutateContext(s)

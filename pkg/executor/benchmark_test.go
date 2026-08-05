@@ -45,12 +45,14 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/disk"
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	tikvutil "github.com/tikv/client-go/v2/util"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -2180,5 +2182,68 @@ func BenchmarkCompleteLoadErr(b *testing.B) {
 	err := types.ErrDataTooLong
 	for n := 0; n < b.N; n++ {
 		completeLoadErr(col, 0, err)
+	}
+}
+
+func BenchmarkStatementRUFrontendCompileCollection(b *testing.B) {
+	stmt := &ast.SelectStmt{}
+	stmt.SetText(nil, "select * from t where a = ?")
+	weights := statementru.Weights{statementru.FrontendCompileBytes: 1}
+	for _, enabled := range []bool{false, true} {
+		name := "off"
+		if enabled {
+			name = "result_only"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				sc := stmtctx.NewStmtCtx()
+				if enabled {
+					if !sc.ConfigureStatementRU(statementru.Selection{
+						Mode:          statementru.ModeResultOnly,
+						Applicable:    true,
+						RequiredUnits: statementru.FrontendCompileBytes.Mask(),
+						Weights:       &weights,
+					}) {
+						b.Fatal("statement RU configuration rejected")
+					}
+				}
+				recordStatementRUFrontendCompile(sc, false, stmt, nil)
+				if statement := sc.TakeStatementRUForExecution(); statement != nil {
+					statement.Finish(statementru.TerminalSuccess)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStatementRUWriteDetailCollection(b *testing.B) {
+	writeUnits := statementru.WriteKeys.Mask() | statementru.WriteBytes.Mask()
+	weights := statementru.Weights{statementru.WriteKeys: 1, statementru.WriteBytes: 1}
+	detail := &tikvutil.CommitDetails{WriteKeys: 64, WriteSize: 4096}
+	for _, enabled := range []bool{false, true} {
+		name := "off"
+		if enabled {
+			name = "result_only"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				var statement *statementru.Statement
+				if enabled {
+					statement = statementru.NewStatement(statementru.Selection{
+						Mode:          statementru.ModeResultOnly,
+						Applicable:    true,
+						RequiredUnits: writeUnits,
+						Weights:       &weights,
+					})
+				}
+				execStmt := ExecStmt{StmtNode: &ast.CommitStmt{}, statementRU: statement}
+				execStmt.recordStatementRUWriteDetails(detail, nil, statementRUCommitEvidence{})
+				if statement != nil {
+					statement.Finish(statementru.TerminalSuccess)
+				}
+			}
+		})
 	}
 }

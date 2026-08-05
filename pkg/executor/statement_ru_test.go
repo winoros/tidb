@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
@@ -41,6 +42,7 @@ import (
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
@@ -49,6 +51,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/mock"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
 type statementRUReporterForTest struct {
@@ -157,6 +160,228 @@ func TestFinishCompileWithStatementRUTransfersAfterInitialization(t *testing.T) 
 		require.NotNil(t, execStmt.statementRU)
 		require.Nil(t, takeStatementRUForExecution(sc))
 		require.Equal(t, unitRecorder, sc.StatementRUUnitRecorder())
+	})
+
+}
+
+func TestStatementRUFrontendCompileCollection(t *testing.T) {
+	weights := statementru.Weights{statementru.FrontendCompileBytes: 1}
+	newStatement := func(t testing.TB) (*stmtctx.StatementContext, *statementru.Statement) {
+		t.Helper()
+		sc := stmtctx.NewStmtCtx()
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.FrontendCompileBytes.Mask(),
+			Weights:       &weights,
+		}))
+		return sc, sc.TakeStatementRUForExecution()
+	}
+	finish := func(t testing.TB, statement *statementru.Statement) (statementru.UnitValues, statementru.Coverage) {
+		t.Helper()
+		result, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		units, ok := result.Result.Units()
+		require.True(t, ok)
+		coverage, ok := result.Result.Coverage()
+		require.True(t, ok)
+		return units, coverage
+	}
+
+	t.Run("ordinary miss records original bytes", func(t *testing.T) {
+		sc, statement := newStatement(t)
+		stmt := &ast.SelectStmt{}
+		stmt.SetText(nil, "select 你好")
+		recordStatementRUFrontendCompile(sc, false, stmt, nil)
+		units, coverage := finish(t, statement)
+		require.Equal(t, float64(len("select 你好")), units[statementru.FrontendCompileBytes])
+		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.PresentUnits)
+	})
+
+	t.Run("prepared miss records template instead of execute", func(t *testing.T) {
+		sc, statement := newStatement(t)
+		template := &ast.SelectStmt{}
+		template.SetText(nil, "select ?")
+		execute := &ast.ExecuteStmt{Name: "s"}
+		execute.SetText(nil, "execute s using @a")
+		recordStatementRUFrontendCompile(sc, false, execute, &plannercore.PlanCacheStmt{
+			PreparedAst: &ast.Prepared{Stmt: template},
+		})
+		units, coverage := finish(t, statement)
+		require.Equal(t, float64(len("select ?")), units[statementru.FrontendCompileBytes])
+		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.PresentUnits)
+	})
+
+	t.Run("cache hit is authoritative zero", func(t *testing.T) {
+		sc, statement := newStatement(t)
+		recordStatementRUFrontendCompile(sc, true, &ast.ExecuteStmt{}, nil)
+		units, coverage := finish(t, statement)
+		require.Zero(t, units[statementru.FrontendCompileBytes])
+		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.PresentUnits)
+		require.Zero(t, coverage.UnavailableUnits)
+	})
+
+	t.Run("missing template is unavailable", func(t *testing.T) {
+		sc, statement := newStatement(t)
+		recordStatementRUFrontendCompile(sc, false, &ast.ExecuteStmt{}, nil)
+		units, coverage := finish(t, statement)
+		require.Zero(t, units[statementru.FrontendCompileBytes])
+		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.UnavailableUnits)
+		require.Zero(t, coverage.PresentUnits)
+	})
+
+	t.Run("replay routes compile work to trigger statement", func(t *testing.T) {
+		history, historyStatement := newStatement(t)
+		history.OriginalSQL = "select ?"
+		_, first := historyStatement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		target, targetStatement := newStatement(t)
+
+		require.NoError(t, history.WithStatementRUProducerOverride(target, func() error {
+			recordStatementRUFrontendCompile(history, false, &ast.ExecuteStmt{}, nil)
+			recordStatementRUFrontendCompile(history, true, &ast.ExecuteStmt{}, nil)
+			return nil
+		}))
+
+		units, coverage := finish(t, targetStatement)
+		require.Equal(t, float64(len("select ?")), units[statementru.FrontendCompileBytes])
+		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.PresentUnits)
+	})
+}
+
+func TestStatementRUWriteDetailCollection(t *testing.T) {
+	writeUnits := statementru.WriteKeys.Mask() | statementru.WriteBytes.Mask()
+	weights := statementru.Weights{
+		statementru.WriteKeys:  1,
+		statementru.WriteBytes: 1,
+	}
+	tests := []struct {
+		name                string
+		stmtNode            ast.StmtNode
+		detail              *tikvutil.CommitDetails
+		finalErr            error
+		pipelined           bool
+		wholeTxnRetried     bool
+		preparedDDL         bool
+		expectedKeys        float64
+		expectedBytes       float64
+		expectedPresent     statementru.UnitMask
+		expectedMissing     statementru.UnitMask
+		expectedUnsupported statementru.UnitMask
+	}{
+		{
+			name:            "accepted positive final attempt",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			expectedKeys:    3,
+			expectedBytes:   21,
+			expectedPresent: writeUnits,
+		},
+		{name: "ambiguous zero", stmtNode: &ast.CommitStmt{}, detail: &tikvutil.CommitDetails{}, expectedMissing: writeUnits},
+		{name: "missing detail", stmtNode: &ast.CommitStmt{}, expectedMissing: writeUnits},
+		{
+			name:            "whole transaction retry",
+			stmtNode:        &ast.CommitStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21, TxnRetry: 1},
+			expectedMissing: writeUnits,
+		},
+		{
+			name:            "TiDB retry before client detail",
+			stmtNode:        &ast.CommitStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			wholeTxnRetried: true,
+			expectedMissing: writeUnits,
+		},
+		{
+			name:                "pipelined false zero",
+			stmtNode:            &ast.InsertStmt{},
+			detail:              &tikvutil.CommitDetails{},
+			pipelined:           true,
+			expectedMissing:     writeUnits,
+			expectedUnsupported: writeUnits,
+		},
+		{
+			name:                "DDL does not consume implicit commit detail",
+			stmtNode:            &ast.CreateTableStmt{},
+			detail:              &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			expectedMissing:     writeUnits,
+			expectedUnsupported: writeUnits,
+		},
+		{
+			name:                "prepared DDL does not consume implicit commit detail",
+			stmtNode:            &ast.ExecuteStmt{},
+			detail:              &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			preparedDDL:         true,
+			expectedMissing:     writeUnits,
+			expectedUnsupported: writeUnits,
+		},
+		{
+			name:            "failed statement records no writes",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			finalErr:        stderrors.New("commit failed"),
+			expectedMissing: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statement := statementru.NewStatement(statementru.Selection{
+				Mode:          statementru.ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: writeUnits,
+				Weights:       &weights,
+			})
+			execStmt := &ExecStmt{StmtNode: tt.stmtNode, statementRU: statement}
+			if tt.preparedDDL {
+				execStmt.Plan = &plannercore.Execute{Plan: &plannercore.DDL{}}
+			}
+			execStmt.recordStatementRUWriteDetails(tt.detail, tt.finalErr, statementRUCommitEvidence{
+				pipelined:       tt.pipelined,
+				wholeTxnRetried: tt.wholeTxnRetried,
+			})
+			finish, first := statement.Finish(statementRUTerminalStatus(tt.finalErr))
+			require.True(t, first)
+			units, ok := finish.Result.Units()
+			require.True(t, ok)
+			coverage, ok := finish.Result.Coverage()
+			require.True(t, ok)
+			require.Equal(t, tt.expectedKeys, units[statementru.WriteKeys])
+			require.Equal(t, tt.expectedBytes, units[statementru.WriteBytes])
+			require.Equal(t, tt.expectedPresent, coverage.PresentUnits&writeUnits)
+			require.Equal(t, tt.expectedMissing, coverage.UnavailableUnits&writeUnits)
+			require.Equal(t, tt.expectedUnsupported, coverage.UnsupportedUnits&writeUnits)
+		})
+	}
+
+	t.Run("ExecStmt retains original context commit evidence", func(t *testing.T) {
+		original := stmtctx.NewStmtCtx()
+		require.True(t, original.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: writeUnits,
+			Weights:       &weights,
+		}))
+		original.MarkStatementRUWholeTxnRetried()
+
+		execStmt, err := finishCompileWithStatementRU(&ExecStmt{StmtNode: &ast.CommitStmt{}}, original, nil)
+		require.NoError(t, err)
+		statement := execStmt.statementRU
+		require.NotNil(t, statement)
+		execStmt.recordStatementRUWriteDetails(
+			&tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			nil,
+			execStmt.readStatementRUCommitEvidence(),
+		)
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		units, ok := finish.Result.Units()
+		require.True(t, ok)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Zero(t, units[statementru.WriteKeys])
+		require.Zero(t, units[statementru.WriteBytes])
+		require.Equal(t, writeUnits, coverage.UnavailableUnits&writeUnits)
 	})
 }
 

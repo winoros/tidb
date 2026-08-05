@@ -19,9 +19,12 @@ import (
 	stderrors "errors"
 
 	"github.com/pingcap/tidb/pkg/metrics"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
 func takeStatementRUForExecution(sc *stmtctx.StatementContext) *statementru.Statement {
@@ -37,8 +40,139 @@ func finishCompileWithStatementRU(stmt *ExecStmt, sc *stmtctx.StatementContext, 
 	if initializationErr != nil {
 		return nil, initializationErr
 	}
+	stmt.statementRUContext = sc
 	stmt.statementRU = takeStatementRUForExecution(sc)
 	return stmt, nil
+}
+
+func recordStatementRUFrontendCompile(
+	sc *stmtctx.StatementContext,
+	cacheHit bool,
+	stmtNode ast.StmtNode,
+	preparedObj *plannercore.PlanCacheStmt,
+) {
+	if sc == nil {
+		return
+	}
+	unitRecorder := sc.StatementRUUnitRecorder()
+	if unitRecorder == nil {
+		return
+	}
+	evidenceRecorder := sc.StatementRUEvidenceRecorder()
+	if evidenceRecorder == nil {
+		return
+	}
+	unitMask := statementru.FrontendCompileBytes.Mask()
+	if cacheHit {
+		evidenceRecorder.MarkPresent(unitMask)
+		return
+	}
+
+	source := statementRUCompileSource(sc, stmtNode, preparedObj)
+	if source == "" {
+		evidenceRecorder.MarkUnavailable(unitMask)
+		return
+	}
+	if unitRecorder.Add(statementru.FrontendCompileBytes, float64(len(source))) {
+		evidenceRecorder.MarkPresent(unitMask)
+	}
+}
+
+func statementRUCompileSource(
+	sc *stmtctx.StatementContext,
+	stmtNode ast.StmtNode,
+	preparedObj *plannercore.PlanCacheStmt,
+) string {
+	if preparedObj != nil && preparedObj.PreparedAst != nil && preparedObj.PreparedAst.Stmt != nil {
+		if source := preparedObj.PreparedAst.Stmt.OriginalText(); source != "" {
+			return source
+		}
+		if sc.OriginalSQL != "" {
+			return sc.OriginalSQL
+		}
+		return preparedObj.PreparedAst.Stmt.Text()
+	}
+	if stmtNode == nil {
+		return sc.OriginalSQL
+	}
+	if _, preparedExecution := stmtNode.(*ast.ExecuteStmt); preparedExecution {
+		// ResetContextOfStmt stores the resolved template in OriginalSQL. Never
+		// substitute the outer EXECUTE text for missing template evidence.
+		return sc.OriginalSQL
+	}
+	if source := stmtNode.OriginalText(); source != "" {
+		return source
+	}
+	if sc.OriginalSQL != "" {
+		return sc.OriginalSQL
+	}
+	return stmtNode.Text()
+}
+
+func (a *ExecStmt) readStatementRUCommitEvidence() statementRUCommitEvidence {
+	if a == nil || a.statementRUContext == nil {
+		return statementRUCommitEvidence{}
+	}
+	return statementRUCommitEvidence{
+		pipelined:       a.statementRUContext.StatementRUCommitPipelined(),
+		wholeTxnRetried: a.statementRUContext.StatementRUWholeTxnRetried(),
+	}
+}
+
+func (a *ExecStmt) recordStatementRUWriteDetails(
+	commitDetail *tikvutil.CommitDetails,
+	finalErr error,
+	commitEvidence statementRUCommitEvidence,
+) {
+	if a == nil || a.statementRU == nil || finalErr != nil {
+		return
+	}
+	unitRecorder := a.statementRU.UnitRecorder()
+	evidenceRecorder := a.statementRU.EvidenceRecorder()
+	writeUnits := statementru.WriteKeys.Mask() | statementru.WriteBytes.Mask()
+	if unitRecorder == nil || evidenceRecorder == nil {
+		return
+	}
+	if a.statementRUOwnsDDL() {
+		evidenceRecorder.MarkUnsupported(writeUnits)
+		return
+	}
+	if commitEvidence.pipelined {
+		evidenceRecorder.MarkUnsupported(writeUnits)
+		return
+	}
+	// Current client-go does not expose authoritative zero, complete pipelined
+	// flush totals, or a final-successful-attempt presence bit. TiDB can also
+	// replay before client-go creates CommitDetails. Keep every such path
+	// unavailable until that dependency contract lands; only a positive,
+	// non-retried ordinary pair is complete in this layer.
+	if commitEvidence.wholeTxnRetried || commitDetail == nil || commitDetail.TxnRetry > 0 ||
+		commitDetail.WriteKeys <= 0 || commitDetail.WriteSize <= 0 {
+		evidenceRecorder.MarkUnavailable(writeUnits)
+		return
+	}
+	keysAccepted := unitRecorder.Add(statementru.WriteKeys, float64(commitDetail.WriteKeys))
+	bytesAccepted := unitRecorder.Add(statementru.WriteBytes, float64(commitDetail.WriteSize))
+	if keysAccepted && bytesAccepted {
+		evidenceRecorder.MarkPresent(writeUnits)
+	}
+}
+
+type statementRUCommitEvidence struct {
+	pipelined       bool
+	wholeTxnRetried bool
+}
+
+func (a *ExecStmt) statementRUOwnsDDL() bool {
+	if _, ddl := a.StmtNode.(ast.DDLNode); ddl {
+		return true
+	}
+	plan := a.Plan
+	if execute, ok := plan.(*plannercore.Execute); ok {
+		plan = execute.Plan
+	}
+	_, ddl := plan.(*plannercore.DDL)
+	return ddl
 }
 
 func (a *ExecStmt) finishStatementRU(finalErr error) {
