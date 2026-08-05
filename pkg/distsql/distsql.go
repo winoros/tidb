@@ -41,6 +41,7 @@ import (
 
 // GenSelectResultFromMPPResponse generates an iterator from response.
 func GenSelectResultFromMPPResponse(dctx *distsqlctx.DistSQLContext, fieldTypes []*types.FieldType, planIDs []int, rootID int, resp kv.Response) SelectResult {
+	markMPPStatementRUUnsupported(dctx)
 	// TODO: Add metric label and set open tracing.
 	return &selectResult{
 		label:      "mpp",
@@ -60,6 +61,7 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 	r, ctx := tracing.StartRegionEx(ctx, "distsql.Select")
 	defer r.End()
 	statementRUCloudSummary := prepareCloudSummaryOwner(dctx, kvReq)
+	statementRUScanBytes := prepareRangeScanByteEstimateOwner(dctx, kvReq)
 
 	// For testing purpose.
 	if hook := ctx.Value("CheckSelectRequestHook"); hook != nil {
@@ -86,7 +88,7 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 		EnableCollectExecutionInfo: config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Load(),
 		TryCopLiteWorker:           &dctx.TryCopLiteWorker,
 	}
-	if statementRUCloudSummary != nil {
+	if statementRUCloudSummary != nil || statementRUScanBytes != nil {
 		option.EnableCollectExecutionInfo = true
 	}
 
@@ -113,6 +115,7 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 	resp := dctx.Client.Send(ctx, kvReq, dctx.KVVars, option)
 	if resp == nil {
 		statementRUCloudSummary.abort()
+		statementRUScanBytes.abort()
 		return nil, errors.New("client returns nil response")
 	}
 
@@ -136,6 +139,7 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 		paging:                  kvReq.Paging.Enable || kvReq.Paging.PagingSizeBytes > 0,
 		distSQLConcurrency:      kvReq.Concurrency,
 		statementRUCloudSummary: statementRUCloudSummary,
+		statementRUScanBytes:    statementRUScanBytes,
 	}, nil
 }
 

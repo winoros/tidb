@@ -15,6 +15,8 @@
 package distsql
 
 import (
+	"math/bits"
+
 	distsqlctx "github.com/pingcap/tidb/pkg/distsql/context"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
@@ -52,24 +54,86 @@ type cloudSummaryOwner struct {
 	done        bool
 }
 
+type rangeScanByteEstimateOwner struct {
+	contributor       statementru.UnitContributor
+	totalKeys         uint64
+	processedKeys     uint64
+	processedKeysSize uint64
+	responses         uint64
+	sawUsableDetail   bool
+	incomplete        bool
+	done              bool
+}
+
+func markMPPStatementRUUnsupported(dctx *distsqlctx.DistSQLContext) {
+	if dctx == nil || dctx.StatementRUUnitContributors == nil {
+		return
+	}
+	units := dctx.StatementRUUnitContributors.RequiredUnits() &
+		(statementru.CPUWork.Mask() | statementru.ScanBytes.Mask())
+	if units == 0 {
+		return
+	}
+	contributor := dctx.StatementRUUnitContributors.RegisterUnitContributor(units)
+	if contributor != nil {
+		contributor.Unsupported()
+	}
+}
+
+func prepareRangeScanByteEstimateOwner(dctx *distsqlctx.DistSQLContext, request *kv.Request) *rangeScanByteEstimateOwner {
+	if dctx == nil || request == nil || dctx.StatementRUUnitContributors == nil || request.Tp != kv.ReqTypeDAG {
+		return nil
+	}
+	if dctx.StatementRUUnitContributors.RequiredUnits()&statementru.ScanBytes.Mask() == 0 {
+		return nil
+	}
+	contributor := dctx.StatementRUUnitContributors.RegisterUnitContributor(statementru.ScanBytes.Mask())
+	if contributor == nil {
+		return nil
+	}
+	if request.StoreType != kv.TiKV || request.BatchCop {
+		contributor.Unsupported()
+		return nil
+	}
+	// Cached and store-batched responses do not provide a one-to-one detail
+	// record for every physical scan response. Disable both until the response
+	// contract carries explicit per-response coverage.
+	request.Cacheable = false
+	request.StoreBatchSize = 0
+	return &rangeScanByteEstimateOwner{contributor: contributor}
+}
+
 func prepareCloudSummaryOwner(dctx *distsqlctx.DistSQLContext, request *kv.Request) *cloudSummaryOwner {
 	if dctx == nil || request == nil || dctx.StatementRUUnitContributors == nil || request.Tp != kv.ReqTypeDAG {
 		return nil
 	}
+	requiredUnits := dctx.StatementRUUnitContributors.RequiredUnits()
+	cpuRequired := requiredUnits&statementru.CPUWork.Mask() != 0
+	hashStateRequired := requiredUnits&statementru.HashStateRows.Mask() != 0
+	if !cpuRequired && !hashStateRequired {
+		return nil
+	}
 	if request.StoreType != kv.TiKV || request.BatchCop {
-		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnsupported)
+		if cpuRequired {
+			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnsupported)
+		}
 		return nil
 	}
 
 	var dag tipb.DAGRequest
 	if err := dag.Unmarshal(request.Data); err != nil {
-		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnavailable)
+		if cpuRequired {
+			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnavailable)
+		}
+		return nil
+	}
+	if hashStateRequired && dagHasHashAggregation(&dag) {
+		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.HashStateRows.Mask(), cloudSummaryPlanUnsupported)
+	}
+	if !cpuRequired {
 		return nil
 	}
 	plan, status := freezeCloudSummaryPlan(&dag)
-	if plan.hasHashAgg {
-		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.HashStateRows.Mask(), cloudSummaryPlanUnsupported)
-	}
 	if status != cloudSummaryPlanSupported {
 		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), status)
 		return nil
@@ -90,6 +154,18 @@ func prepareCloudSummaryOwner(dctx *distsqlctx.DistSQLContext, request *kv.Reque
 	request.Cacheable = false
 	request.StoreBatchSize = 0
 	return &cloudSummaryOwner{plan: plan, contributor: contributor}
+}
+
+func dagHasHashAggregation(dag *tipb.DAGRequest) bool {
+	if dag == nil {
+		return false
+	}
+	for _, executor := range dag.Executors {
+		if executor != nil && executor.GetTp() == tipb.ExecType_TypeAggregation {
+			return true
+		}
+	}
+	return false
 }
 
 func finishImmediateCloudSummaryContributor(
@@ -244,7 +320,7 @@ func (o *cloudSummaryOwner) observeResponse(response *tipb.SelectResponse, stats
 	if o == nil || o.done {
 		return
 	}
-	if response == nil || !completeCloudSummaryRPCStats(stats) {
+	if response == nil || !completeSingleCopResponseStats(stats) {
 		o.failed = true
 		return
 	}
@@ -290,11 +366,12 @@ func (o *cloudSummaryOwner) observeResponse(response *tipb.SelectResponse, stats
 	o.responses++
 }
 
-// completeCloudSummaryRPCStats is deliberately stricter than the execution
-// path. Execution summaries contain no stable attempt identity, so Stage 1 can
-// accept a response only when client statistics prove exactly one CmdCop RPC,
-// no cache reuse, no request error, and no backoff/retry evidence.
-func completeCloudSummaryRPCStats(stats *copr.CopRuntimeStats) bool {
+// completeSingleCopResponseStats is deliberately stricter than the execution
+// path. The current execution summaries and scan details contain no stable
+// attempt identity, so they are accepted only when client statistics prove
+// exactly one CmdCop RPC, no cache reuse, no request error, and no retry or
+// backoff evidence.
+func completeSingleCopResponseStats(stats *copr.CopRuntimeStats) bool {
 	if stats == nil || stats.CoprCacheHit || stats.ReqStats == nil ||
 		stats.ReqStats.GetRPCStatsCount() != 1 || stats.ReqStats.GetCmdRPCCount(tikvrpc.CmdCop) != 1 ||
 		len(stats.ReqStats.ErrStats) != 0 || stats.ReqStats.OtherErrCnt != 0 ||
@@ -312,6 +389,112 @@ func checkedCloudSummaryProduct(rows, multiplier uint64) (uint64, bool) {
 		return 0, false
 	}
 	return rows * multiplier, true
+}
+
+func (o *rangeScanByteEstimateOwner) observeResponse(stats *copr.CopRuntimeStats) {
+	if o == nil || o.done {
+		return
+	}
+	if stats == nil || !stats.ScanDetailV2Present || stats.ScanDetail == nil {
+		o.incomplete = true
+		return
+	}
+	detail := stats.ScanDetail
+	if detail.TotalKeys < 0 || detail.ProcessedKeys < 0 || detail.ProcessedKeysSize < 0 {
+		o.incomplete = true
+		return
+	}
+	o.sawUsableDetail = true
+	// ScanDetailV2 defines processed versions as user key-value pairs and total
+	// versions as the superset encountered by MVCC. A nonempty processed set
+	// therefore needs both a nonzero byte size and no more entries than total.
+	// Treat old or inconsistent zero-filled details as incomplete evidence.
+	if (detail.TotalKeys == 0 && (detail.ProcessedKeys != 0 || detail.ProcessedKeysSize != 0)) ||
+		(detail.ProcessedKeys == 0 && detail.ProcessedKeysSize != 0) ||
+		detail.ProcessedKeys > detail.TotalKeys ||
+		(detail.ProcessedKeys > 0 && detail.ProcessedKeysSize == 0) {
+		o.incomplete = true
+		return
+	}
+	if !completeSingleCopResponseStats(stats) {
+		o.incomplete = true
+		return
+	}
+	totalKeys := uint64(detail.TotalKeys)
+	processedKeys := uint64(detail.ProcessedKeys)
+	processedKeysSize := uint64(detail.ProcessedKeysSize)
+	if totalKeys > maxExactStatementRUInteger || processedKeys > maxExactStatementRUInteger ||
+		processedKeysSize > maxExactStatementRUInteger ||
+		o.totalKeys > maxExactStatementRUInteger-totalKeys ||
+		o.processedKeys > maxExactStatementRUInteger-processedKeys ||
+		o.processedKeysSize > maxExactStatementRUInteger-processedKeysSize {
+		o.incomplete = true
+		return
+	}
+	if o.responses == ^uint64(0) {
+		o.incomplete = true
+		return
+	}
+	if !o.incomplete {
+		o.totalKeys += totalKeys
+		o.processedKeys += processedKeys
+		o.processedKeysSize += processedKeysSize
+	}
+	o.responses++
+}
+
+func (o *rangeScanByteEstimateOwner) completeEOF() {
+	if o == nil || o.done {
+		return
+	}
+	o.done = true
+	if o.incomplete || o.responses == 0 {
+		if o.sawUsableDetail {
+			o.contributor.Partial()
+		} else {
+			o.contributor.Unavailable()
+		}
+		return
+	}
+	// Merge the raw tuple across every physical response before division. The
+	// estimate is intentionally owner-wide: summing per-response ratios would
+	// make the result depend on region partitioning. When a direct total-size
+	// field is propagated, response observation must explicitly select one
+	// homogeneous source and this final estimate can then become an exact sum.
+	var scanBytes float64
+	if o.totalKeys != 0 && o.processedKeys != 0 {
+		if !rangeScanEstimateWithinExactBoundary(o.processedKeysSize, o.totalKeys, o.processedKeys) {
+			o.contributor.Partial()
+			return
+		}
+		scanBytes = float64(o.processedKeysSize) / float64(o.processedKeys) * float64(o.totalKeys)
+		if scanBytes > float64(maxExactStatementRUInteger) {
+			o.contributor.Partial()
+			return
+		}
+	}
+	var values statementru.UnitValues
+	values[statementru.ScanBytes] = scanBytes
+	o.contributor.Complete(values)
+}
+
+func rangeScanEstimateWithinExactBoundary(processedKeysSize, totalKeys, processedKeys uint64) bool {
+	estimateHigh, estimateLow := bits.Mul64(processedKeysSize, totalKeys)
+	boundaryHigh, boundaryLow := bits.Mul64(maxExactStatementRUInteger, processedKeys)
+	return estimateHigh < boundaryHigh ||
+		(estimateHigh == boundaryHigh && estimateLow <= boundaryLow)
+}
+
+func (o *rangeScanByteEstimateOwner) abort() {
+	if o == nil || o.done {
+		return
+	}
+	o.done = true
+	if o.sawUsableDetail {
+		o.contributor.Partial()
+	} else {
+		o.contributor.Unavailable()
+	}
 }
 
 func (o *cloudSummaryOwner) completeEOF() {

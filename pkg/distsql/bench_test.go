@@ -26,7 +26,8 @@ import (
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 )
 
-var cloudSummaryBenchmarkSink uint64
+var statementRUBenchmarkSink uint64
+var rangeScanBenchmarkSink uint64
 
 func BenchmarkCloudSummaryObserveResponseMicro(b *testing.B) {
 	for _, responseCount := range []int{1, 16, 128} {
@@ -42,7 +43,7 @@ func BenchmarkCloudSummaryObserveResponseMicro(b *testing.B) {
 					}
 				}
 				response := cloudSummaryTestResponse(rows...)
-				stats := completeCloudSummaryTestStats()
+				stats := completeSingleCopResponseTestStats()
 
 				owner := &cloudSummaryOwner{plan: plan}
 				b.ReportAllocs()
@@ -55,7 +56,7 @@ func BenchmarkCloudSummaryObserveResponseMicro(b *testing.B) {
 					for range responseCount {
 						owner.observeResponse(response, stats)
 					}
-					cloudSummaryBenchmarkSink = owner.cpuWork
+					statementRUBenchmarkSink = owner.cpuWork
 				}
 			})
 		}
@@ -96,6 +97,61 @@ func BenchmarkCloudSummaryPrepareOwnerLifecycle(b *testing.B) {
 	})
 }
 
+func BenchmarkRangeScanByteEstimateOwnerLifecycle(b *testing.B) {
+	weights := statementru.Weights{statementru.ScanBytes: 1}
+	for _, responseCount := range []int{1, 16, 128} {
+		b.Run(fmt.Sprintf("Responses=%d", responseCount), func(b *testing.B) {
+			stats := completeScanDetailV2TestStats(10, 2, 8)
+			want := float64(40 * responseCount)
+			b.ReportAllocs()
+			for range b.N {
+				statement := statementru.NewStatement(statementru.Selection{
+					Mode:          statementru.ModeResultOnly,
+					Applicable:    true,
+					RequiredUnits: statementru.ScanBytes.Mask(),
+					Weights:       &weights,
+				})
+				owner := &rangeScanByteEstimateOwner{
+					contributor: statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.ScanBytes.Mask()),
+				}
+				for range responseCount {
+					owner.observeResponse(stats)
+				}
+				owner.completeEOF()
+				finish, _ := statement.Finish(statementru.TerminalSuccess)
+				total, ok := finish.Result.TotalRU()
+				if !ok || total != want {
+					b.Fatalf("unexpected scan total: %v, %v", total, ok)
+				}
+				rangeScanBenchmarkSink = uint64(total)
+			}
+		})
+	}
+}
+
+func BenchmarkRangeScanByteEstimateObserveResponseMicro(b *testing.B) {
+	stats := completeScanDetailV2TestStats(10, 2, 8)
+	for _, responseCount := range []int{1, 16, 128} {
+		b.Run(fmt.Sprintf("Responses=%d", responseCount), func(b *testing.B) {
+			owner := &rangeScanByteEstimateOwner{}
+			b.ReportAllocs()
+			for range b.N {
+				owner.totalKeys = 0
+				owner.processedKeys = 0
+				owner.processedKeysSize = 0
+				owner.responses = 0
+				owner.sawUsableDetail = false
+				owner.incomplete = false
+				owner.done = false
+				for range responseCount {
+					owner.observeResponse(stats)
+				}
+				rangeScanBenchmarkSink = owner.processedKeysSize
+			}
+		})
+	}
+}
+
 func BenchmarkCloudSummarySelectToEOF(b *testing.B) {
 	dagData, err := cloudSummaryTestDAG().Marshal()
 	if err != nil {
@@ -105,24 +161,39 @@ func BenchmarkCloudSummarySelectToEOF(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	subset := &cloudSummaryTestSubset{data: responseData, stats: completeCloudSummaryTestStats()}
+	stats := completeScanDetailV2TestStats(10, 2, 8)
+	subset := &cloudSummaryTestSubset{data: responseData, stats: stats}
 	dctx := newCloudSummaryTestDistSQLContext()
 	client := &cloudSummaryTestClient{}
 	dctx.Client = client
 	chk := chunk.NewChunkWithCapacity(nil, 0)
 
-	for _, enabled := range []bool{false, true} {
-		name := "Off"
-		if enabled {
-			name = "Stage1"
-		}
-		b.Run(name, func(b *testing.B) {
+	tests := []struct {
+		name  string
+		units statementru.UnitMask
+		want  float64
+	}{
+		{name: "Off"},
+		{name: "CPU", units: statementru.CPUWork.Mask(), want: 39},
+		{name: "CPUAndScan", units: statementru.CPUWork.Mask() | statementru.ScanBytes.Mask(), want: 79},
+	}
+	for _, test := range tests {
+		b.Run(test.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
 				dctx.RuntimeStatsColl = execdetails.NewRuntimeStatsColl(dctx.RuntimeStatsColl)
 				var statement *statementru.Statement
-				if enabled {
-					statement = newCloudSummaryTestStatement()
+				if test.units != 0 {
+					weights := statementru.Weights{
+						statementru.CPUWork:   1,
+						statementru.ScanBytes: 1,
+					}
+					statement = statementru.NewStatement(statementru.Selection{
+						Mode:          statementru.ModeCalibration,
+						Applicable:    true,
+						RequiredUnits: test.units,
+						Weights:       &weights,
+					})
 					dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
 				} else {
 					dctx.StatementRUUnitContributors = nil
@@ -141,13 +212,13 @@ func BenchmarkCloudSummarySelectToEOF(b *testing.B) {
 				if err := result.Close(); err != nil {
 					b.Fatal(err)
 				}
-				if enabled {
+				if statement != nil {
 					finish, _ := statement.Finish(statementru.TerminalSuccess)
 					total, ok := finish.Result.TotalRU()
-					if !ok || total != 39 {
-						b.Fatalf("unexpected Stage1 total: %v, %v", total, ok)
+					if !ok || total != test.want {
+						b.Fatalf("unexpected statement RU total: %v, %v", total, ok)
 					}
-					cloudSummaryBenchmarkSink = uint64(total)
+					statementRUBenchmarkSink = uint64(total)
 				}
 			}
 			b.StopTimer()

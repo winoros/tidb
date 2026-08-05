@@ -17,6 +17,7 @@ package distsql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/tikvrpc"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
 func TestFreezeCloudSummaryPlan(t *testing.T) {
@@ -107,6 +109,180 @@ func TestFreezeCloudSummaryPlan(t *testing.T) {
 	})
 }
 
+func TestRangeScanBytesOwner(t *testing.T) {
+	newOwner := func() (*statementru.Statement, *rangeScanByteEstimateOwner) {
+		weights := statementru.Weights{statementru.ScanBytes: 1}
+		statement := statementru.NewStatement(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.ScanBytes.Mask(),
+			Weights:       &weights,
+		})
+		return statement, &rangeScanByteEstimateOwner{
+			contributor: statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.ScanBytes.Mask()),
+		}
+	}
+	stats := func(totalKeys, processedKeys, processedKeysSize int64) *copr.CopRuntimeStats {
+		return completeScanDetailV2TestStats(totalKeys, processedKeys, processedKeysSize)
+	}
+
+	t.Run("formula is evaluated once per owner", func(t *testing.T) {
+		statement, owner := newOwner()
+		owner.observeResponse(stats(10, 2, 20))
+		owner.observeResponse(stats(30, 3, 15))
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(280), total)
+	})
+
+	t.Run("processed zero is authoritative zero", func(t *testing.T) {
+		statement, owner := newOwner()
+		owner.observeResponse(stats(10, 0, 0))
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Zero(t, total)
+	})
+
+	t.Run("inconsistent zero tuple fails closed", func(t *testing.T) {
+		statement, owner := newOwner()
+		owner.observeResponse(stats(10, 0, 1))
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.StatePartial, finish.Result.Outcome().State)
+	})
+
+	for _, test := range []struct {
+		name   string
+		detail [3]int64
+	}{
+		{name: "processed exceeds total", detail: [3]int64{1, 2, 4}},
+		{name: "missing processed size", detail: [3]int64{10, 2, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statement, owner := newOwner()
+			owner.observeResponse(stats(test.detail[0], test.detail[1], test.detail[2]))
+			owner.completeEOF()
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			require.False(t, finish.Result.HasTotal())
+			require.Equal(t, statementru.StatePartial, finish.Result.Outcome().State)
+		})
+	}
+
+	t.Run("derived value beyond exact integer boundary fails closed", func(t *testing.T) {
+		statement, owner := newOwner()
+		owner.observeResponse(stats(int64(maxExactStatementRUInteger), 1, 2))
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.StatePartial, finish.Result.Outcome().State)
+	})
+
+	t.Run("derived exact integer boundary is accepted", func(t *testing.T) {
+		statement, owner := newOwner()
+		owner.observeResponse(stats(int64(maxExactStatementRUInteger), 2, 2))
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(maxExactStatementRUInteger), total)
+	})
+
+	for _, invalidFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid response order %t", invalidFirst), func(t *testing.T) {
+			statement, owner := newOwner()
+			valid := stats(10, 2, 20)
+			invalid := completeSingleCopResponseTestStats()
+			if invalidFirst {
+				owner.observeResponse(invalid)
+				owner.observeResponse(valid)
+			} else {
+				owner.observeResponse(valid)
+				owner.observeResponse(invalid)
+			}
+			owner.completeEOF()
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			require.False(t, finish.Result.HasTotal())
+			require.Equal(t, statementru.StatePartial, finish.Result.Outcome().State)
+		})
+	}
+
+	t.Run("retry evidence fails closed", func(t *testing.T) {
+		statement, owner := newOwner()
+		retried := stats(10, 2, 20)
+		retried.ReqStats.RecordRPCRuntimeStats(tikvrpc.CmdCop, time.Nanosecond)
+		owner.observeResponse(retried)
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.StatePartial, finish.Result.Outcome().State)
+	})
+}
+
+func TestPrepareRangeScanByteEstimateOwner(t *testing.T) {
+	weights := statementru.Weights{statementru.ScanBytes: 1}
+	newStatement := func() *statementru.Statement {
+		return statementru.NewStatement(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.ScanBytes.Mask(),
+			Weights:       &weights,
+		})
+	}
+
+	statement := newStatement()
+	dctx := newCloudSummaryTestDistSQLContext()
+	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+	request := &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		StoreType:      kv.TiKV,
+		Cacheable:      true,
+		StoreBatchSize: 4,
+	}
+	owner := prepareRangeScanByteEstimateOwner(dctx, request)
+	require.NotNil(t, owner)
+	require.False(t, request.Cacheable)
+	require.Zero(t, request.StoreBatchSize)
+	stats := completeScanDetailV2TestStats(4, 2, 6)
+	owner.observeResponse(stats)
+	owner.completeEOF()
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	total, ok := finish.Result.TotalRU()
+	require.True(t, ok)
+	require.Equal(t, float64(12), total)
+
+	statement = newStatement()
+	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+	require.Nil(t, prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiFlash}))
+	finish, first = statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	require.False(t, finish.Result.HasTotal())
+	require.Equal(t, statementru.StateUnavailable, finish.Result.Outcome().State)
+
+	cpuWeights := statementru.Weights{statementru.CPUWork: 1}
+	cpuOnly := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask(),
+		Weights:       &cpuWeights,
+	})
+	dctx.StatementRUUnitContributors = cpuOnly.UnitContributorRegistrar()
+	require.Nil(t, prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiKV}))
+}
+
 func TestCloudSummaryScanProtoCompatibility(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -177,13 +353,57 @@ func TestPrepareCloudSummaryOwner(t *testing.T) {
 	require.NotNil(t, updated.CollectExecutionSummaries)
 	require.True(t, updated.GetCollectExecutionSummaries())
 
-	owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())
+	owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
 	owner.completeEOF()
 	finish, _ := statement.Finish(statementru.TerminalSuccess)
 	require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
 	total, ok := finish.Result.TotalRU()
 	require.True(t, ok)
 	require.Equal(t, float64(39), total)
+
+	scanWeights := statementru.Weights{statementru.ScanBytes: 1}
+	scanOnly := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.ScanBytes.Mask(),
+		Weights:       &scanWeights,
+	})
+	dctx.StatementRUUnitContributors = scanOnly.UnitContributorRegistrar()
+	require.Nil(t, prepareCloudSummaryOwner(dctx, &kv.Request{
+		Tp:        kv.ReqTypeDAG,
+		Data:      data,
+		StoreType: kv.TiKV,
+	}))
+
+	hashWeights := statementru.Weights{statementru.HashStateRows: 1}
+	hashOnly := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.HashStateRows.Mask(),
+		Weights:       &hashWeights,
+	})
+	dctx.StatementRUUnitContributors = hashOnly.UnitContributorRegistrar()
+	hashDAG := cloudSummaryTestDAG()
+	hashDAG.Executors[1] = &tipb.Executor{
+		Tp: tipb.ExecType_TypeAggregation,
+		Aggregation: &tipb.Aggregation{
+			GroupBy: cloudSummaryTestExprs(1),
+			AggFunc: cloudSummaryTestExprs(1),
+		},
+	}
+	hashData, err := hashDAG.Marshal()
+	require.NoError(t, err)
+	require.Nil(t, prepareCloudSummaryOwner(dctx, &kv.Request{
+		Tp:        kv.ReqTypeDAG,
+		Data:      hashData,
+		StoreType: kv.TiKV,
+	}))
+	hashFinish, first := hashOnly.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StateUnavailable,
+		Reason: statementru.ReasonUnsupported,
+	}, hashFinish.Result.Outcome())
 }
 
 func TestSelectEnablesCloudSummaryCollection(t *testing.T) {
@@ -191,7 +411,7 @@ func TestSelectEnablesCloudSummaryCollection(t *testing.T) {
 	dctx := newCloudSummaryTestDistSQLContext()
 	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
 	client := &cloudSummaryTestClient{response: &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
-		newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats()),
+		newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
 	}}}
 	dctx.Client = client
 	dag := cloudSummaryTestDAG()
@@ -216,6 +436,199 @@ func TestSelectEnablesCloudSummaryCollection(t *testing.T) {
 	total, ok := finish.Result.TotalRU()
 	require.True(t, ok)
 	require.Equal(t, float64(39), total)
+}
+
+func TestSelectCollectsRangeScanBytes(t *testing.T) {
+	weights := statementru.Weights{statementru.ScanBytes: 1}
+	statement := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.ScanBytes.Mask(),
+		Weights:       &weights,
+	})
+	dctx := newCloudSummaryTestDistSQLContext()
+	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+	stats := completeScanDetailV2TestStats(10, 2, 8)
+	client := &cloudSummaryTestClient{response: &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+		newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), stats),
+	}}}
+	dctx.Client = client
+	dag := cloudSummaryTestDAG()
+	data, err := dag.Marshal()
+	require.NoError(t, err)
+	request := &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		Data:           data,
+		StoreType:      kv.TiKV,
+		Cacheable:      true,
+		StoreBatchSize: 4,
+	}
+	result, err := Select(context.Background(), dctx, request, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client.option)
+	require.True(t, client.option.EnableCollectExecutionInfo)
+	require.False(t, request.Cacheable)
+	require.Zero(t, request.StoreBatchSize)
+	require.NoError(t, result.Next(context.Background(), chunk.NewChunkWithCapacity(nil, 0)))
+	require.NoError(t, result.Close())
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	total, ok := finish.Result.TotalRU()
+	require.True(t, ok)
+	require.Equal(t, float64(40), total)
+}
+
+func TestSelectRangeScanBytesEarlyClose(t *testing.T) {
+	weights := statementru.Weights{statementru.ScanBytes: 1}
+	statement := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.ScanBytes.Mask(),
+		Weights:       &weights,
+	})
+	dctx := newCloudSummaryTestDistSQLContext()
+	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+	dctx.Client = &cloudSummaryTestClient{response: &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+		newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
+	}}}
+	dagData, err := cloudSummaryTestDAG().Marshal()
+	require.NoError(t, err)
+	result, err := Select(context.Background(), dctx, &kv.Request{
+		Tp:        kv.ReqTypeDAG,
+		Data:      dagData,
+		StoreType: kv.TiKV,
+	}, nil)
+	require.NoError(t, err)
+	require.NoError(t, result.Close())
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	require.False(t, finish.Result.HasTotal())
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StateUnavailable,
+		Reason: statementru.ReasonMissingEvidence,
+	}, finish.Result.Outcome())
+}
+
+func TestSelectRangeScanBytesFailurePaths(t *testing.T) {
+	newResult := func(t *testing.T, response *cloudSummaryTestKVResponse) (*statementru.Statement, SelectResult) {
+		weights := statementru.Weights{statementru.ScanBytes: 1}
+		statement := statementru.NewStatement(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.ScanBytes.Mask(),
+			Weights:       &weights,
+		})
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		dctx.Client = &cloudSummaryTestClient{response: response}
+		dagData, err := cloudSummaryTestDAG().Marshal()
+		require.NoError(t, err)
+		result, err := Select(context.Background(), dctx, &kv.Request{
+			Tp:        kv.ReqTypeDAG,
+			Data:      dagData,
+			StoreType: kv.TiKV,
+		}, nil)
+		require.NoError(t, err)
+		return statement, result
+	}
+	completeStats := func() *copr.CopRuntimeStats {
+		return completeScanDetailV2TestStats(10, 2, 8)
+	}
+	assertOutcome := func(t *testing.T, statement *statementru.Statement, want statementru.Outcome) {
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, want, finish.Result.Outcome())
+	}
+
+	t.Run("error after usable detail is partial", func(t *testing.T) {
+		expected := errors.New("response failed")
+		statement, result := newResult(t, &cloudSummaryTestKVResponse{
+			subsets: []kv.ResultSubset{
+				newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeStats()),
+			},
+			err: expected,
+		})
+		require.ErrorIs(t, result.Next(context.Background(), chunk.NewChunkWithCapacity(nil, 0)), expected)
+		assertOutcome(t, statement, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonIncompleteEvidence,
+		})
+	})
+
+	t.Run("decode error after usable detail is partial", func(t *testing.T) {
+		response := cloudSummaryTestResponse(10, 5, 4, 3)
+		response.EncodeType = tipb.EncodeType(255)
+		response.Chunks = []tipb.Chunk{{RowsData: []byte{1}}}
+		statement, result := newResult(t, &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+			newCloudSummaryTestSubset(t, response, completeStats()),
+		}})
+		require.ErrorContains(t, result.Next(context.Background(), chunk.NewChunkWithCapacity(nil, 1)), "unsupported encode type")
+		assertOutcome(t, statement, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonIncompleteEvidence,
+		})
+	})
+
+	t.Run("missing detail is unavailable", func(t *testing.T) {
+		statement, result := newResult(t, &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+			newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
+		}})
+		require.NoError(t, result.Next(context.Background(), chunk.NewChunkWithCapacity(nil, 0)))
+		assertOutcome(t, statement, statementru.Outcome{
+			State:  statementru.StateUnavailable,
+			Reason: statementru.ReasonMissingEvidence,
+		})
+	})
+
+	t.Run("empty detail without v2 presence is unavailable", func(t *testing.T) {
+		stats := completeSingleCopResponseTestStats()
+		stats.ScanDetail = &tikvutil.ScanDetail{}
+		statement, result := newResult(t, &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+			newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), stats),
+		}})
+		require.NoError(t, result.Next(context.Background(), chunk.NewChunkWithCapacity(nil, 0)))
+		assertOutcome(t, statement, statementru.Outcome{
+			State:  statementru.StateUnavailable,
+			Reason: statementru.ReasonMissingEvidence,
+		})
+	})
+
+	t.Run("NextRaw before observation is unavailable", func(t *testing.T) {
+		statement, result := newResult(t, &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
+			newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeStats()),
+		}})
+		_, err := result.NextRaw(context.Background())
+		require.NoError(t, err)
+		assertOutcome(t, statement, statementru.Outcome{
+			State:  statementru.StateUnavailable,
+			Reason: statementru.ReasonMissingEvidence,
+		})
+	})
+}
+
+func TestGenSelectResultFromMPPResponseRejectsStatementRU(t *testing.T) {
+	weights := statementru.Weights{
+		statementru.CPUWork:   1,
+		statementru.ScanBytes: 1,
+	}
+	statement := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.CPUWork.Mask() | statementru.ScanBytes.Mask(),
+		Weights:       &weights,
+	})
+	dctx := newCloudSummaryTestDistSQLContext()
+	dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+	result := GenSelectResultFromMPPResponse(dctx, nil, nil, 0, &cloudSummaryTestKVResponse{})
+	require.NoError(t, result.Close())
+	finish, first := statement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	require.False(t, finish.Result.HasTotal())
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StateUnavailable,
+		Reason: statementru.ReasonUnsupported,
+	}, finish.Result.Outcome())
 }
 
 func TestSelectRejectsUnmodeledCloudScanWork(t *testing.T) {
@@ -302,7 +715,7 @@ func TestSelectRejectsUnmodeledCloudScanWork(t *testing.T) {
 			dctx := newCloudSummaryTestDistSQLContext()
 			dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
 			dctx.Client = &cloudSummaryTestClient{response: &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
-				newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats()),
+				newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
 			}}}
 			dag := cloudSummaryTestDAG()
 			switch test.executorTp {
@@ -347,8 +760,8 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "multiple complete responses",
 			run: func(owner *cloudSummaryOwner) {
-				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())
-				owner.observeResponse(cloudSummaryTestResponse(2, 2, 2, 2), completeCloudSummaryTestStats())
+				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
+				owner.observeResponse(cloudSummaryTestResponse(2, 2, 2, 2), completeSingleCopResponseTestStats())
 				owner.completeEOF()
 			},
 			state:   statementru.StateComplete,
@@ -359,7 +772,7 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 			run: func(owner *cloudSummaryOwner) {
 				response := cloudSummaryTestResponse(10, 5, 4, 3)
 				response.ExecutionSummaries[1].NumIterations = nil
-				owner.observeResponse(response, completeCloudSummaryTestStats())
+				owner.observeResponse(response, completeSingleCopResponseTestStats())
 				owner.completeEOF()
 			},
 			state:  statementru.StateUnavailable,
@@ -368,8 +781,8 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "valid evidence followed by an invalid response",
 			run: func(owner *cloudSummaryOwner) {
-				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())
-				owner.observeResponse(&tipb.SelectResponse{}, completeCloudSummaryTestStats())
+				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
+				owner.observeResponse(&tipb.SelectResponse{}, completeSingleCopResponseTestStats())
 				owner.completeEOF()
 			},
 			state:  statementru.StatePartial,
@@ -378,8 +791,8 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "invalid response followed by valid evidence",
 			run: func(owner *cloudSummaryOwner) {
-				owner.observeResponse(&tipb.SelectResponse{}, completeCloudSummaryTestStats())
-				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())
+				owner.observeResponse(&tipb.SelectResponse{}, completeSingleCopResponseTestStats())
+				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
 				owner.completeEOF()
 			},
 			state:  statementru.StatePartial,
@@ -388,7 +801,7 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "retry RPC stats",
 			run: func(owner *cloudSummaryOwner) {
-				stats := completeCloudSummaryTestStats()
+				stats := completeSingleCopResponseTestStats()
 				stats.ReqStats.RecordRPCRuntimeStats(tikvrpc.CmdCop, time.Nanosecond)
 				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), stats)
 				owner.completeEOF()
@@ -399,7 +812,7 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "cache hit",
 			run: func(owner *cloudSummaryOwner) {
-				stats := completeCloudSummaryTestStats()
+				stats := completeSingleCopResponseTestStats()
 				stats.CoprCacheHit = true
 				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), stats)
 				owner.completeEOF()
@@ -410,7 +823,7 @@ func TestCloudSummaryOwnerCoverage(t *testing.T) {
 		{
 			name: "early close after evidence",
 			run: func(owner *cloudSummaryOwner) {
-				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())
+				owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
 				owner.abort()
 			},
 			state:  statementru.StatePartial,
@@ -448,7 +861,7 @@ func TestSelectResultCloudSummaryLifecycle(t *testing.T) {
 	t.Run("clean EOF commits once", func(t *testing.T) {
 		statement, owner := newCloudSummaryTestOwner()
 		response := &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
-			newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats()),
+			newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
 		}}
 		result := newCloudSummaryTestSelectResult(response, owner)
 		require.NoError(t, result.fetchResp(context.Background()))
@@ -464,7 +877,7 @@ func TestSelectResultCloudSummaryLifecycle(t *testing.T) {
 		statement, owner := newCloudSummaryTestOwner()
 		expected := errors.New("response failed")
 		response := &cloudSummaryTestKVResponse{
-			subsets: []kv.ResultSubset{newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats())},
+			subsets: []kv.ResultSubset{newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())},
 			err:     expected,
 		}
 		result := newCloudSummaryTestSelectResult(response, owner)
@@ -479,7 +892,7 @@ func TestSelectResultCloudSummaryLifecycle(t *testing.T) {
 		selectResponse.EncodeType = tipb.EncodeType(255)
 		selectResponse.Chunks = []tipb.Chunk{{RowsData: []byte{1}}}
 		response := &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
-			newCloudSummaryTestSubset(t, selectResponse, completeCloudSummaryTestStats()),
+			newCloudSummaryTestSubset(t, selectResponse, completeSingleCopResponseTestStats()),
 		}}
 		result := newCloudSummaryTestSelectResult(response, owner)
 		iter, err := result.IntoIter(nil)
@@ -497,7 +910,7 @@ func TestSelectResultCloudSummaryLifecycle(t *testing.T) {
 		for _, raw := range []bool{false, true} {
 			statement, owner := newCloudSummaryTestOwner()
 			response := &cloudSummaryTestKVResponse{subsets: []kv.ResultSubset{
-				newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeCloudSummaryTestStats()),
+				newCloudSummaryTestSubset(t, cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats()),
 			}}
 			result := newCloudSummaryTestSelectResult(response, owner)
 			if raw {
@@ -572,9 +985,20 @@ func cloudSummaryTestResponse(rows ...uint64) *tipb.SelectResponse {
 	return &tipb.SelectResponse{ExecutionSummaries: summaries}
 }
 
-func completeCloudSummaryTestStats() *copr.CopRuntimeStats {
+func completeSingleCopResponseTestStats() *copr.CopRuntimeStats {
 	stats := &copr.CopRuntimeStats{ReqStats: tikv.NewRegionRequestRuntimeStats()}
 	stats.ReqStats.RecordRPCRuntimeStats(tikvrpc.CmdCop, time.Nanosecond)
+	return stats
+}
+
+func completeScanDetailV2TestStats(totalKeys, processedKeys, processedKeysSize int64) *copr.CopRuntimeStats {
+	stats := completeSingleCopResponseTestStats()
+	stats.ScanDetailV2Present = true
+	stats.ScanDetail = &tikvutil.ScanDetail{
+		TotalKeys:         totalKeys,
+		ProcessedKeys:     processedKeys,
+		ProcessedKeysSize: processedKeysSize,
+	}
 	return stats
 }
 

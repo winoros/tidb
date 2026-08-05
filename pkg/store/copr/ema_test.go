@@ -89,6 +89,28 @@ func TestPagingResponseReadBytes(t *testing.T) {
 	require.Zero(t, pagingResponseReadBytes(nil))
 	require.Zero(t, pagingResponseReadBytes(&coprocessor.Response{}))
 
+	t.Run("preserve scan detail presence independently of values", func(t *testing.T) {
+		stats := &CopRuntimeStats{}
+		mergeCopScanDetailV2(stats, nil)
+		require.False(t, stats.ScanDetailV2Present)
+		require.Nil(t, stats.ScanDetail)
+
+		mergeCopScanDetailV2(stats, &kvrpcpb.ScanDetailV2{
+			TotalVersions:         10,
+			ProcessedVersions:     2,
+			ProcessedVersionsSize: 8,
+		})
+		require.True(t, stats.ScanDetailV2Present)
+		require.Equal(t, int64(10), stats.ScanDetail.TotalKeys)
+		require.Equal(t, int64(2), stats.ScanDetail.ProcessedKeys)
+		require.Equal(t, int64(8), stats.ScanDetail.ProcessedKeysSize)
+
+		zeroStats := &CopRuntimeStats{}
+		mergeCopScanDetailV2(zeroStats, &kvrpcpb.ScanDetailV2{})
+		require.True(t, zeroStats.ScanDetailV2Present)
+		require.NotNil(t, zeroStats.ScanDetail)
+	})
+
 	tests := []struct {
 		name        string
 		scanDetail  *kvrpcpb.ScanDetailV2

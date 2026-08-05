@@ -362,17 +362,20 @@ type selectResult struct {
 	iter *selectResultIter
 
 	statementRUCloudSummary *cloudSummaryOwner
+	statementRUScanBytes    *rangeScanByteEstimateOwner
 }
 
-func (r *selectResult) abortStatementRUCloudSummary() {
+func (r *selectResult) abortStatementRUStorageOwners() {
 	if r != nil {
 		r.statementRUCloudSummary.abort()
+		r.statementRUScanBytes.abort()
 	}
 }
 
-func (r *selectResult) completeStatementRUCloudSummary() {
+func (r *selectResult) completeStatementRUStorageOwners() {
 	if r != nil {
 		r.statementRUCloudSummary.completeEOF()
+		r.statementRUScanBytes.completeEOF()
 	}
 }
 
@@ -417,7 +420,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		duration := time.Since(startTime)
 		r.fetchDuration += duration
 		if err != nil {
-			r.abortStatementRUCloudSummary()
+			r.abortStatementRUStorageOwners()
 			// On error paths with a non-nil resultSubset (e.g. ErrMaxKeysReadExceeded),
 			// still merge CopExecDetails so ProcessedKeys reaches StmtCtx.ExecDetails
 			// (feeds tidb_keys_examined and the slow query log). Skip
@@ -437,7 +440,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 			r.memConsume(-atomic.LoadInt64(&r.selectRespSize))
 		}
 		if resultSubset == nil {
-			r.completeStatementRUCloudSummary()
+			r.completeStatementRUStorageOwners()
 			r.selectResp = nil
 			atomic.StoreInt64(&r.selectRespSize, 0)
 			if !r.durationReported {
@@ -456,7 +459,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		r.selectResp = new(tipb.SelectResponse)
 		err = r.selectResp.Unmarshal(resultSubset.GetData())
 		if err != nil {
-			r.abortStatementRUCloudSummary()
+			r.abortStatementRUStorageOwners()
 			return errors.Trace(err)
 		}
 
@@ -464,12 +467,12 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		atomic.StoreInt64(&r.selectRespSize, respSize)
 		r.memConsume(respSize)
 		if err := r.selectResp.Error; err != nil {
-			r.abortStatementRUCloudSummary()
+			r.abortStatementRUStorageOwners()
 			return dbterror.ClassTiKV.Synthesize(terror.ErrCode(err.Code), err.Msg)
 		}
 
 		if len(r.selectResp.IntermediateOutputs) != len(intermediateOutputTypes) {
-			r.abortStatementRUCloudSummary()
+			r.abortStatementRUStorageOwners()
 			return errors.Errorf(
 				"The length of intermediate output types %d mismatches the length of got intermediate outputs %d."+
 					" If a response contains intermediate outputs, you should use the SelectResultIter to read the data.",
@@ -479,7 +482,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		r.intermediateOutputTypes = intermediateOutputTypes
 
 		if err = r.ctx.SQLKiller.HandleSignal(); err != nil {
-			r.abortStatementRUCloudSummary()
+			r.abortStatementRUStorageOwners()
 			return err
 		}
 		for _, warning := range r.selectResp.Warnings {
@@ -494,8 +497,9 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 			copStats = hasStats.GetCopRuntimeStats()
 			if copStats != nil {
 				r.statementRUCloudSummary.observeResponse(r.selectResp, copStats)
+				r.statementRUScanBytes.observeResponse(copStats)
 				if err := r.updateCopRuntimeStats(ctx, copStats, resultSubset.RespTime(), false); err != nil {
-					r.abortStatementRUCloudSummary()
+					r.abortStatementRUStorageOwners()
 					return err
 				}
 				r.ctx.ExecDetails.MergeCopExecDetails(&copStats.CopExecDetails, duration)
@@ -504,6 +508,7 @@ func (r *selectResult) fetchRespWithIntermediateResults(ctx context.Context, int
 		}
 		if copStats == nil {
 			r.statementRUCloudSummary.observeResponse(r.selectResp, nil)
+			r.statementRUScanBytes.observeResponse(nil)
 		}
 		if len(r.selectResp.Chunks) != 0 {
 			break
@@ -552,7 +557,7 @@ func (r *selectResult) Next(ctx context.Context, chk *chunk.Chunk) error {
 		err = errors.Errorf("unsupported encode type:%v", encodeType)
 	}
 	if err != nil {
-		r.abortStatementRUCloudSummary()
+		r.abortStatementRUStorageOwners()
 	}
 	return err
 }
@@ -566,7 +571,7 @@ func (r *selectResult) IntoIter(intermediateFieldTypes [][]*types.FieldType) (Se
 
 // NextRaw returns the next raw partial result.
 func (r *selectResult) NextRaw(ctx context.Context) (data []byte, err error) {
-	r.abortStatementRUCloudSummary()
+	r.abortStatementRUStorageOwners()
 	failpoint.Inject("mockNextRawError", func(val failpoint.Value) {
 		if val.(bool) {
 			failpoint.Return(nil, errors.New("mockNextRawError"))
@@ -807,7 +812,7 @@ func (r *selectResult) Close() error {
 }
 
 func (r *selectResult) close() error {
-	r.abortStatementRUCloudSummary()
+	r.abortStatementRUStorageOwners()
 	metrics.DistSQLPartialCountHistogram.Observe(float64(r.partialCount))
 	respSize := atomic.SwapInt64(&r.selectRespSize, 0)
 	if respSize > 0 {
@@ -992,7 +997,7 @@ func newSelectResultIter(result *selectResult, intermediateOutputTypes [][]*type
 func (iter *selectResultIter) Next(ctx context.Context) (row SelectResultRow, err error) {
 	defer func() {
 		if err != nil {
-			iter.result.abortStatementRUCloudSummary()
+			iter.result.abortStatementRUStorageOwners()
 		}
 	}()
 	for {

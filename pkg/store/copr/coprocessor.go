@@ -2672,7 +2672,7 @@ func (worker *copIteratorWorker) collectCopRuntimeStats(copStats *CopRuntimeStat
 			copStats.TimeDetail.MergeFromTimeDetail(pbDetails.TimeDetailV2, pbDetails.TimeDetail)
 		}
 		if scanDetailV2 := pbDetails.ScanDetailV2; scanDetailV2 != nil {
-			copStats.ScanDetail.MergeFromScanDetailV2(scanDetailV2)
+			mergeCopScanDetailV2(copStats, scanDetailV2)
 		}
 		if readPoolTaskDetails := pbDetails.GetReadPoolTaskDetails(); readPoolTaskDetails != nil {
 			if copStats.ReadPoolTaskDetails == nil {
@@ -2702,6 +2702,17 @@ func (worker *copIteratorWorker) collectCopRuntimeStats(copStats *CopRuntimeStat
 		}
 	}
 	return nil
+}
+
+func mergeCopScanDetailV2(copStats *CopRuntimeStats, scanDetailV2 *kvrpcpb.ScanDetailV2) {
+	if copStats == nil || scanDetailV2 == nil {
+		return
+	}
+	copStats.ScanDetailV2Present = true
+	if copStats.ScanDetail == nil {
+		copStats.ScanDetail = &util.ScanDetail{}
+	}
+	copStats.ScanDetail.MergeFromScanDetailV2(scanDetailV2)
 }
 
 func (worker *copIteratorWorker) collectKVClientRuntimeStats(copStats *CopRuntimeStats, bo *Backoffer, rpcCtx *tikv.RPCContext) {
@@ -2742,6 +2753,9 @@ type CopRuntimeStats struct {
 	execdetails.CopExecDetails
 	ReqStats            *tikv.RegionRequestRuntimeStats
 	ReadPoolTaskDetails *util.PoolTaskDetails
+	// ScanDetailV2Present distinguishes an explicit all-zero detail from a
+	// response that omitted ScanDetailV2 entirely.
+	ScanDetailV2Present bool
 
 	CoprCacheHit bool
 }
