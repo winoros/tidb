@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/txnkv/txnsnapshot"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
 type statementRUPointReporter struct {
@@ -176,6 +177,108 @@ func TestStatementRUPointExecutorsRealWiringFailsClosedWithoutScanDetail(t *test
 			drainStatementRUPointRecordSet(t, rs)
 			requireMissingPointReadScanDetail(t, test.operation(stats.GetPointReadStats()))
 			require.Empty(t, reporter.reports)
+		})
+	}
+}
+
+func TestStatementRUNetworkResponseContextPaths(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		prepareSQL          string
+		pointGet            bool
+		querySQL            string
+		expectAuthoritative bool
+	}{
+		{name: "ordinary Exec and lazy Next", querySQL: "select * from t where id in (1, 2)", expectAuthoritative: true},
+		{
+			name:                "prepared PointGet and lazy Next",
+			prepareSQL:          "prepare point_stmt from 'select * from t where id = 1'",
+			pointGet:            true,
+			querySQL:            "execute point_stmt",
+			expectAuthoritative: true,
+		},
+		{
+			name:                "prepared range Exec and lazy Next",
+			prepareSQL:          "prepare range_stmt from 'select * from t where id in (1, 2)'",
+			querySQL:            "execute range_stmt",
+			expectAuthoritative: true,
+		},
+		{
+			name:       "prepared unaudited SHOW fails closed",
+			prepareSQL: "prepare show_stmt from 'show tables'",
+			querySQL:   "execute show_stmt",
+		},
+		{name: "unaudited admin path fails closed", querySQL: "admin show ddl jobs"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := testkit.CreateMockStore(t)
+			tk := testkit.NewTestKit(t, store)
+			tk.MustExec("use test")
+			tk.MustExec("create table t (id bigint primary key, v bigint)")
+			tk.MustExec("insert into t values (1, 10), (2, 20)")
+			if test.prepareSQL != "" {
+				tk.MustExec(test.prepareSQL)
+			}
+
+			stmtNode, err := parser.New().ParseOneStmt(test.querySQL, "", "")
+			require.NoError(t, err)
+			base := context.Background()
+			require.NoError(t, tk.Session().PrepareTxnCtx(base, stmtNode))
+			require.NoError(t, executor.ResetContextOfStmt(tk.Session(), stmtNode))
+			sc := tk.Session().GetSessionVars().StmtCtx
+			weights := statementru.Weights{statementru.NetworkBytes: 1}
+			reporter := &statementRUPointReporter{}
+			require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: statementru.NetworkBytes.Mask(),
+				Weights:       &weights,
+				Reporter:      reporter,
+			}))
+			preparedCtx := executor.PrepareStatementRUNetworkContext(base, sc)
+			execStmt, err := (&executor.Compiler{Ctx: tk.Session()}).Compile(preparedCtx, stmtNode)
+			require.NoError(t, err)
+			beforeExecution := tikvutil.NetworkResponseEvidenceFromContext(execStmt.GoCtx)
+			require.True(t, beforeExecution.Enabled)
+
+			executionSibling := context.WithValue(context.Background(), struct{}{}, "execution")
+			var rs sqlexec.RecordSet
+			if test.pointGet {
+				require.NotNil(t, execStmt.PsStmt)
+				rs, err = execStmt.PointGet(executionSibling)
+			} else {
+				if test.prepareSQL != "" {
+					require.Nil(t, execStmt.PsStmt)
+				}
+				rs, err = execStmt.Exec(executionSibling)
+			}
+			require.NoError(t, err)
+			afterOpen := tikvutil.NetworkResponseEvidenceFromContext(execStmt.GoCtx)
+
+			req := rs.NewChunk(nil)
+			nextSibling := context.WithValue(context.Background(), struct{ next bool }{}, true)
+			require.NoError(t, rs.Next(nextSibling, req))
+			afterNext := tikvutil.NetworkResponseEvidenceFromContext(execStmt.GoCtx)
+			if test.expectAuthoritative {
+				require.Positive(t, req.NumRows())
+				require.Greater(t, afterNext.Started, afterOpen.Started)
+				require.Greater(t, afterNext.Started, beforeExecution.Started)
+			}
+
+			for req.NumRows() != 0 {
+				require.NoError(t, rs.Next(nextSibling, req))
+			}
+			require.NoError(t, rs.Close())
+			execStmt.FinishExecuteStmt(0, nil, false)
+			final := tikvutil.NetworkResponseEvidenceFromContext(execStmt.GoCtx)
+			if test.expectAuthoritative {
+				require.Equal(t, final.Started, final.Finished)
+				require.True(t, final.Complete())
+				require.Positive(t, final.ResponseBytes)
+				require.Equal(t, []statementru.Report{{TotalRU: float64(final.ResponseBytes)}}, reporter.reports)
+			} else {
+				require.Empty(t, reporter.reports)
+			}
 		})
 	}
 }

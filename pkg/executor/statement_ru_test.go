@@ -164,6 +164,315 @@ func TestFinishCompileWithStatementRUTransfersAfterInitialization(t *testing.T) 
 
 }
 
+func newStatementRUNetworkTestExecution(
+	t testing.TB,
+	mode statementru.Mode,
+	readOnly bool,
+	prepare bool,
+	preexistingOwner bool,
+	reporter statementru.Reporter,
+) (*ExecStmt, *statementru.Statement, context.Context) {
+	t.Helper()
+	weights := statementru.Weights{statementru.NetworkBytes: 1}
+	sc := stmtctx.NewStmtCtx()
+	sc.IsReadOnly = readOnly
+	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+		Mode:          mode,
+		Applicable:    true,
+		RequiredUnits: statementru.NetworkBytes.Mask(),
+		Weights:       &weights,
+		Reporter:      reporter,
+	}))
+	ctx := context.Background()
+	if preexistingOwner {
+		ctx = tikvutil.ContextWithNetworkResponseEvidence(ctx)
+	}
+	if prepare {
+		ctx = PrepareStatementRUNetworkContext(ctx, sc)
+	}
+	execStmt, err := finishCompileWithStatementRU(&ExecStmt{GoCtx: ctx, StmtNode: &ast.SelectStmt{}}, sc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, execStmt.statementRU)
+	return execStmt, execStmt.statementRU, ctx
+}
+
+func TestStatementRUNetworkResponseCoverage(t *testing.T) {
+	type networkCase struct {
+		name                string
+		observe             func(context.Context)
+		expectedValue       float64
+		expectedPresent     statementru.UnitMask
+		expectedPartial     statementru.UnitMask
+		expectedUnavailable statementru.UnitMask
+		expectedUnsupported statementru.UnitMask
+	}
+	networkUnit := statementru.NetworkBytes.Mask()
+	tests := []networkCase{
+		{
+			name:            "enabled no requests is authoritative zero",
+			expectedPresent: networkUnit,
+		},
+		{
+			name: "complete response",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, 17, true)
+			},
+			expectedValue:   17,
+			expectedPresent: networkUnit,
+		},
+		{
+			name: "physical retry responses are additive",
+			observe: func(ctx context.Context) {
+				for _, size := range []int{5, 7} {
+					request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+					request.Finish(true, nil)
+					tikvutil.ObserveNetworkResponseBody(ctx, size, true)
+				}
+			},
+			expectedValue:   12,
+			expectedPresent: networkUnit,
+		},
+		{
+			name: "known zero body is authoritative",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, 0, true)
+			},
+			expectedPresent: networkUnit,
+		},
+		{
+			name: "unsupported request",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, false)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, 19, true)
+			},
+			expectedUnavailable: networkUnit,
+			expectedUnsupported: networkUnit,
+		},
+		{
+			name: "error with sized body is partial",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, stderrors.New("response failed"))
+				tikvutil.ObserveNetworkResponseBody(ctx, 23, true)
+			},
+			expectedPartial: networkUnit,
+		},
+		{
+			name: "unknown body is unavailable",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, 0, false)
+			},
+			expectedUnavailable: networkUnit,
+		},
+		{
+			name: "missing body is unavailable",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(false, nil)
+			},
+			expectedUnavailable: networkUnit,
+		},
+		{
+			name: "in flight request is unavailable",
+			observe: func(ctx context.Context) {
+				_ = tikvutil.BeginNetworkResponseRequest(ctx, true)
+			},
+			expectedUnavailable: networkUnit,
+		},
+		{
+			name: "overflow after usable body is partial",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, 29, true)
+				tikvutil.ObserveNetworkResponseBody(ctx, -1, true)
+			},
+			expectedPartial: networkUnit,
+		},
+		{
+			name: "integer outside exact float range is partial",
+			observe: func(ctx context.Context) {
+				request := tikvutil.BeginNetworkResponseRequest(ctx, true)
+				request.Finish(true, nil)
+				tikvutil.ObserveNetworkResponseBody(ctx, int(maxExactStatementRUNetworkBytes+1), true)
+			},
+			expectedPartial: networkUnit,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			execStmt, statement, ctx := newStatementRUNetworkTestExecution(
+				t, statementru.ModeCalibration, true, true, false, nil,
+			)
+			require.True(t, tikvutil.NetworkResponseEvidenceFromContext(ctx).Enabled)
+			if test.observe != nil {
+				test.observe(ctx)
+			}
+			execStmt.recordStatementRUNetworkBytes()
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			units, ok := finish.Result.Units()
+			require.True(t, ok)
+			coverage, ok := finish.Result.Coverage()
+			require.True(t, ok)
+			require.Equal(t, test.expectedValue, units[statementru.NetworkBytes])
+			require.Equal(t, test.expectedPresent, coverage.PresentUnits&networkUnit)
+			require.Equal(t, test.expectedPartial, coverage.PartialUnits&networkUnit)
+			require.Equal(t, test.expectedUnavailable, coverage.UnavailableUnits&networkUnit)
+			require.Equal(t, test.expectedUnsupported, coverage.UnsupportedUnits&networkUnit)
+		})
+	}
+
+	t.Run("missing preparation remains unavailable", func(t *testing.T) {
+		_, statement, ctx := newStatementRUNetworkTestExecution(
+			t, statementru.ModeCalibration, true, false, false, nil,
+		)
+		require.False(t, tikvutil.NetworkResponseEvidenceFromContext(ctx).Enabled)
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.ReasonMissingEvidence, finish.Result.Outcome().Reason)
+		require.False(t, finish.Result.HasTotal())
+	})
+
+	t.Run("runtime owner conflict cannot become authoritative zero", func(t *testing.T) {
+		execStmt, statement, source := newStatementRUNetworkTestExecution(
+			t, statementru.ModeCalibration, true, true, false, nil,
+		)
+		destination := tikvutil.ContextWithNetworkResponseEvidence(context.Background())
+		runtimeContext := inheritStatementRUNetworkContext(destination, execStmt)
+		request := tikvutil.BeginNetworkResponseRequest(runtimeContext, true)
+		request.Finish(true, nil)
+		tikvutil.ObserveNetworkResponseBody(runtimeContext, 19, true)
+		require.Zero(t, tikvutil.NetworkResponseEvidenceFromContext(source).ResponseBytes)
+		require.Equal(t, uint64(19), tikvutil.NetworkResponseEvidenceFromContext(destination).ResponseBytes)
+
+		execStmt.recordStatementRUNetworkBytes()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.ReasonMissingEvidence, finish.Result.Outcome().Reason)
+		require.False(t, finish.Result.HasTotal())
+	})
+
+	for _, test := range []struct {
+		name             string
+		readOnly         bool
+		tiflash          bool
+		preexistingOwner bool
+		expectedReason   statementru.Reason
+	}{
+		{name: "write statement is unsupported", expectedReason: statementru.ReasonUnsupported},
+		{name: "TiFlash statement is unsupported", readOnly: true, tiflash: true, expectedReason: statementru.ReasonUnsupported},
+		{name: "preexisting owner is unavailable", readOnly: true, preexistingOwner: true, expectedReason: statementru.ReasonMissingEvidence},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			execStmt, statement, _ := newStatementRUNetworkTestExecution(
+				t, statementru.ModeCalibration, test.readOnly, true, test.preexistingOwner, nil,
+			)
+			if test.tiflash {
+				execStmt.statementRUContext.IsTiFlash.Store(true)
+			}
+			execStmt.recordStatementRUNetworkBytes()
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, test.expectedReason, finish.Result.Outcome().Reason)
+			require.False(t, finish.Result.HasTotal())
+		})
+	}
+
+	t.Run("unaudited read-only statement is unsupported", func(t *testing.T) {
+		execStmt, statement, _ := newStatementRUNetworkTestExecution(
+			t, statementru.ModeCalibration, true, true, false, nil,
+		)
+		execStmt.StmtNode = &ast.AdminStmt{}
+		execStmt.recordStatementRUNetworkBytes()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.ReasonUnsupported, finish.Result.Outcome().Reason)
+		require.False(t, finish.Result.HasTotal())
+	})
+
+	for _, test := range []struct {
+		name     string
+		template ast.StmtNode
+		want     bool
+	}{
+		{name: "resolved select", template: &ast.SelectStmt{}, want: true},
+		{name: "resolved show", template: &ast.ShowStmt{}},
+		{name: "resolved do", template: &ast.DoStmt{}},
+		{name: "missing resolved template"},
+	} {
+		t.Run("prepared "+test.name, func(t *testing.T) {
+			execStmt := &ExecStmt{StmtNode: &ast.ExecuteStmt{}}
+			if test.template != nil {
+				execStmt.statementRUNetworkResolvedNode = test.template
+			}
+			require.Equal(t, test.want, statementRUNetworkSupportedStatement(execStmt))
+		})
+	}
+}
+
+func TestFinishExecuteStmtStatementRUNetworkReportingGate(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		finalErr         error
+		expectedTerminal statementru.TerminalStatus
+		expectedReports  int
+	}{
+		{name: "success", expectedTerminal: statementru.TerminalSuccess, expectedReports: 1},
+		{name: "error", finalErr: stderrors.New("statement failed"), expectedTerminal: statementru.TerminalError},
+		{name: "canceled", finalErr: context.Canceled, expectedTerminal: statementru.TerminalCanceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reporter := &statementRUReporterForTest{}
+			ctx := mock.NewContext()
+			sessVars := ctx.GetSessionVars()
+			sessVars.StartTime = time.Now()
+			sessVars.StmtCtx.StmtType = "Select"
+			sessVars.StmtCtx.OriginalSQL = "select 1"
+			sessVars.StmtCtx.IsReadOnly = true
+			sessVars.StmtCtx.ResetSQLDigest(sessVars.StmtCtx.OriginalSQL)
+			weights := statementru.Weights{statementru.NetworkBytes: 1}
+			require.True(t, sessVars.StmtCtx.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: statementru.NetworkBytes.Mask(),
+				Weights:       &weights,
+				Reporter:      reporter,
+			}))
+			goCtx := execdetails.ContextWithInitializedExecDetails(context.Background())
+			goCtx = PrepareStatementRUNetworkContext(goCtx, sessVars.StmtCtx)
+			execStmt, err := finishCompileWithStatementRU(&ExecStmt{
+				Ctx:      ctx,
+				GoCtx:    goCtx,
+				StmtNode: &ast.SelectStmt{},
+			}, sessVars.StmtCtx, nil)
+			require.NoError(t, err)
+			statement := execStmt.statementRU
+			request := tikvutil.BeginNetworkResponseRequest(goCtx, true)
+			request.Finish(true, nil)
+			tikvutil.ObserveNetworkResponseBody(goCtx, 31, true)
+
+			execStmt.FinishExecuteStmt(0, test.finalErr, false)
+			execStmt.FinishExecuteStmt(0, test.finalErr, false)
+			finish, first := statement.Finish(test.expectedTerminal)
+			require.False(t, first)
+			require.Equal(t, test.expectedTerminal, finish.Terminal)
+			total, ok := finish.Result.TotalRU()
+			require.True(t, ok)
+			require.Equal(t, float64(31), total)
+			require.Len(t, reporter.reports, test.expectedReports)
+		})
+	}
+}
+
 func TestStatementRUFrontendCompileCollection(t *testing.T) {
 	weights := statementru.Weights{statementru.FrontendCompileBytes: 1}
 	newStatement := func(t testing.TB) (*stmtctx.StatementContext, *statementru.Statement) {
@@ -452,6 +761,90 @@ func BenchmarkStatementRUOffHooks(b *testing.B) {
 	for range b.N {
 		execStmt.statementRU = takeStatementRUForExecution(sc)
 		execStmt.finishStatementRU(nil)
+	}
+}
+
+var statementRUNetworkBenchmarkTotal float64
+var statementRUNetworkBenchmarkContext context.Context
+
+func BenchmarkStatementRUNetworkResponseCollection(b *testing.B) {
+	type compileContextKey struct{}
+	weights := statementru.Weights{statementru.NetworkBytes: 1}
+	stmtNode := &ast.SelectStmt{}
+	for _, responses := range []int{0, 1, 128} {
+		for _, enabled := range []bool{false, true} {
+			mode := "Off"
+			if enabled {
+				mode = "ResultOnly"
+			}
+			b.Run(fmt.Sprintf("Responses=%d/%s", responses, mode), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					sc := stmtctx.NewStmtCtx()
+					sc.IsReadOnly = true
+					if enabled && !sc.ConfigureStatementRU(statementru.Selection{
+						Mode:          statementru.ModeResultOnly,
+						Applicable:    true,
+						RequiredUnits: statementru.NetworkBytes.Mask(),
+						Weights:       &weights,
+					}) {
+						b.Fatal("statement RU configuration rejected")
+					}
+					prepared := PrepareStatementRUNetworkContext(context.Background(), sc)
+					compiled := context.WithValue(prepared, compileContextKey{}, true)
+					execStmt, err := finishCompileWithStatementRU(&ExecStmt{GoCtx: compiled, StmtNode: stmtNode}, sc, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					runtimeContext := inheritStatementRUNetworkContext(context.Background(), execStmt)
+					for range responses {
+						request := tikvutil.BeginNetworkResponseRequest(runtimeContext, true)
+						if request.Active() {
+							request.Finish(true, nil)
+						}
+						tikvutil.ObserveNetworkResponseBody(runtimeContext, 1024, true)
+					}
+					execStmt.recordStatementRUNetworkBytes()
+					if execStmt.statementRU == nil {
+						statementRUNetworkBenchmarkTotal = 0
+						continue
+					}
+					finish, first := execStmt.statementRU.Finish(statementru.TerminalSuccess)
+					if !first {
+						b.Fatal("statement RU finalized more than once")
+					}
+					total, ok := finish.Result.TotalRU()
+					if !ok || total != float64(responses*1024) {
+						b.Fatalf("unexpected network RU total: total=%v ok=%v", total, ok)
+					}
+					statementRUNetworkBenchmarkTotal = total
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkStatementRUNetworkNextContextInheritance(b *testing.B) {
+	type callerContextKey struct{}
+	for _, calls := range []int{1, 128} {
+		for _, enabled := range []bool{false, true} {
+			mode := "Off"
+			source := context.Background()
+			if enabled {
+				mode = "ResultOnly"
+				source = tikvutil.ContextWithNetworkResponseEvidence(source)
+			}
+			stmt := &ExecStmt{GoCtx: source}
+			caller := context.WithValue(context.Background(), callerContextKey{}, true)
+			b.Run(fmt.Sprintf("Calls=%d/%s", calls, mode), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					for range calls {
+						statementRUNetworkBenchmarkContext = inheritStatementRUNetworkContext(caller, stmt)
+					}
+				}
+			})
+		}
 	}
 }
 

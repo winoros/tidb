@@ -31,10 +31,12 @@ import (
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/executor"
 	"github.com/pingcap/tidb/pkg/keyspace"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta"
 	"github.com/pingcap/tidb/pkg/meta/metadef"
+	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -43,10 +45,82 @@ import (
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/stretchr/testify/require"
+	tikvutil "github.com/tikv/client-go/v2/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+type statementRUNetworkSessionReporter struct {
+	reports []statementru.Report
+}
+
+func (r *statementRUNetworkSessionReporter) ReportStatementRU(report statementru.Report) {
+	r.reports = append(r.reports, report)
+}
+
+func TestStatementRUNetworkFinishContext(t *testing.T) {
+	ownerContext := tikvutil.ContextWithNetworkResponseEvidence(context.Background())
+	finishContext := statementRUNetworkFinishContext(&executor.ExecStmt{GoCtx: ownerContext})
+	request := tikvutil.BeginNetworkResponseRequest(finishContext, true)
+	request.Finish(true, nil)
+	tikvutil.ObserveNetworkResponseBody(finishContext, 37, true)
+	snapshot := tikvutil.NetworkResponseEvidenceFromContext(ownerContext)
+	require.True(t, snapshot.Complete())
+	require.Equal(t, uint64(37), snapshot.ResponseBytes)
+	require.False(t, tikvutil.NetworkResponseEvidenceFromContext(statementRUNetworkFinishContext(nil)).Enabled)
+}
+
+func TestStatementRUNetworkFinishErrorIsTerminal(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se, err := createSession(store)
+	require.NoError(t, err)
+	t.Cleanup(func() { se.Close() })
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table statement_ru_network_finish (id bigint primary key, v bigint)")
+	MustExec(t, se, "insert into statement_ru_network_finish values (1, 1)")
+
+	stmtNode, err := parser.New().ParseOneStmt("select * from statement_ru_network_finish where id = 1", "", "")
+	require.NoError(t, err)
+	ctx := context.Background()
+	require.NoError(t, se.PrepareTxnCtx(ctx, stmtNode))
+	require.NoError(t, executor.ResetContextOfStmt(se, stmtNode))
+	reporter := &statementRUNetworkSessionReporter{}
+	weights := statementru.Weights{statementru.NetworkBytes: 1}
+	require.True(t, se.sessionVars.StmtCtx.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.NetworkBytes.Mask(),
+		Weights:       &weights,
+		Reporter:      reporter,
+	}))
+	ctx = executor.PrepareStatementRUNetworkContext(ctx, se.sessionVars.StmtCtx)
+	statement, err := (&executor.Compiler{Ctx: se}).Compile(ctx, stmtNode)
+	require.NoError(t, err)
+	rs, err := runStmt(ctx, se, statement)
+	require.NoError(t, err)
+	require.NotNil(t, rs)
+	req := rs.NewChunk(nil)
+	for {
+		require.NoError(t, rs.Next(ctx, req))
+		if req.NumRows() == 0 {
+			break
+		}
+	}
+
+	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/session/finishStmtError", "return(true)")
+	finisher, ok := rs.(interface{ Finish() error })
+	require.True(t, ok)
+	firstErr := finisher.Finish()
+	require.ErrorContains(t, firstErr, "occur an error after finishStmt")
+	require.ErrorIs(t, finisher.Finish(), firstErr)
+	require.ErrorIs(t, rs.Close(), firstErr)
+	require.Empty(t, reporter.reports)
+}
 
 func TestGetStartMode(t *testing.T) {
 	require.Equal(t, ddl.Normal, getStartMode(currentBootstrapVersion))

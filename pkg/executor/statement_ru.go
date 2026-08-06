@@ -27,6 +27,47 @@ import (
 	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
+const maxExactStatementRUNetworkBytes = uint64(1 << 53)
+
+type statementRUNetworkAttachment struct {
+	contributor statementru.UnitContributor
+	collect     bool
+}
+
+type statementRUNetworkAttachmentContextKey struct{}
+
+// PrepareStatementRUNetworkContext installs one response-network owner before
+// compile can issue storage requests. It is a true no-op unless the statement
+// selection requires NetworkBytes. Callers must keep using the returned
+// context; calling it again on that context is idempotent.
+func PrepareStatementRUNetworkContext(ctx context.Context, sc *stmtctx.StatementContext) context.Context {
+	if ctx == nil || sc == nil {
+		return ctx
+	}
+	if attachment, _ := ctx.Value(statementRUNetworkAttachmentContextKey{}).(*statementRUNetworkAttachment); attachment != nil {
+		return ctx
+	}
+	registrar := sc.StatementRUUnitContributorRegistrar()
+	if registrar == nil || registrar.RequiredUnits()&statementru.NetworkBytes.Mask() == 0 {
+		return ctx
+	}
+	attachment := &statementRUNetworkAttachment{
+		contributor: registrar.RegisterUnitContributor(statementru.NetworkBytes.Mask()),
+	}
+	if attachment.contributor == nil {
+		return ctx
+	}
+	// A pre-existing owner belongs to an outer or otherwise unknown
+	// attribution boundary. Do not reuse it for a new statement.
+	if tikvutil.NetworkResponseEvidenceFromContext(ctx).Enabled {
+		attachment.contributor.Unavailable()
+		return context.WithValue(ctx, statementRUNetworkAttachmentContextKey{}, attachment)
+	}
+	attachment.collect = true
+	ctx = tikvutil.ContextWithNetworkResponseEvidence(ctx)
+	return context.WithValue(ctx, statementRUNetworkAttachmentContextKey{}, attachment)
+}
+
 func takeStatementRUForExecution(sc *stmtctx.StatementContext) *statementru.Statement {
 	if sc == nil {
 		return nil
@@ -42,7 +83,76 @@ func finishCompileWithStatementRU(stmt *ExecStmt, sc *stmtctx.StatementContext, 
 	}
 	stmt.statementRUContext = sc
 	stmt.statementRU = takeStatementRUForExecution(sc)
+	if stmt.statementRU != nil && stmt.GoCtx != nil {
+		attachment, _ := stmt.GoCtx.Value(statementRUNetworkAttachmentContextKey{}).(*statementRUNetworkAttachment)
+		if attachment != nil && attachment.collect {
+			stmt.statementRUNetworkContributor = attachment.contributor
+		}
+	}
 	return stmt, nil
+}
+
+func (a *ExecStmt) recordStatementRUNetworkBytes() {
+	if a == nil || a.statementRUNetworkContributor == nil {
+		return
+	}
+	contributor := a.statementRUNetworkContributor
+	a.statementRUNetworkContributor = nil
+	snapshot := tikvutil.NetworkResponseEvidenceFromContext(a.GoCtx)
+	usable := snapshot.SizedBodies > 0
+
+	if a.statementRUContext == nil {
+		contributor.Unavailable()
+		return
+	}
+	if a.statementRUNetworkConflict.Load() {
+		if usable {
+			contributor.Partial()
+		} else {
+			contributor.Unavailable()
+		}
+		return
+	}
+	// The current client-go domain covers only unary TiKV read/Cop responses.
+	// Writes and TiFlash remain fail-closed even when they happen to issue no
+	// response observed by that subset.
+	if !a.statementRUContext.IsReadOnly || !statementRUNetworkSupportedStatement(a) ||
+		a.statementRUContext.IsTiFlash.Load() || snapshot.Unsupported > 0 {
+		contributor.Unsupported()
+		return
+	}
+	if snapshot.Complete() && snapshot.ResponseBytes <= maxExactStatementRUNetworkBytes {
+		var values statementru.UnitValues
+		values[statementru.NetworkBytes] = float64(snapshot.ResponseBytes)
+		contributor.Complete(values)
+		return
+	}
+	if usable {
+		contributor.Partial()
+	} else {
+		contributor.Unavailable()
+	}
+}
+
+// statementRUNetworkSupportedStatement is the currently audited statement
+// subset. Other read-only statements may issue storage requests through paths
+// that do not preserve the execution context, so an untouched owner cannot
+// prove zero. EXECUTE is classified by its resolved template, never by the
+// outer wrapper.
+func statementRUNetworkSupportedStatement(stmt *ExecStmt) bool {
+	if stmt == nil {
+		return false
+	}
+	node := stmt.StmtNode
+	if _, ok := node.(*ast.ExecuteStmt); ok {
+		node = stmt.statementRUNetworkResolvedNode
+	}
+	switch node.(type) {
+	case *ast.SelectStmt, *ast.SetOprStmt, *ast.ExplainStmt:
+		return true
+	default:
+		return false
+	}
 }
 
 func recordStatementRUFrontendCompile(

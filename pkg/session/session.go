@@ -2483,6 +2483,7 @@ func (s *session) executeStmtImpl(ctx context.Context, stmtNode ast.StmtNode) (s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	ctx = executor.PrepareStatementRUNetworkContext(ctx, sessVars.StmtCtx)
 	ruv2Metrics := execdetails.RUV2MetricsFromContext(ctx)
 	sessVars.RUV2Metrics = ruv2Metrics
 	bypass := shouldBypass(ctx, stmtNode, sessVars)
@@ -3124,27 +3125,41 @@ const ExecStmtVarKey ExecStmtVarKeyType = 0
 // RecordSet, so this struct exists and RecordSet.Close() is overridden to handle that.
 type execStmtResult struct {
 	sqlexec.RecordSet
-	se     *session
-	sql    sqlexec.Statement
-	once   sync.Once
-	closed bool
+	se        *session
+	sql       sqlexec.Statement
+	once      sync.Once
+	finishErr error
+	closed    bool
 }
 
 func (rs *execStmtResult) Finish() error {
-	var err error
 	rs.once.Do(func() {
 		var err1 error
 		if f, ok := rs.RecordSet.(interface{ Finish() error }); ok {
 			err1 = f.Finish()
 		}
-		err2 := finishStmt(context.Background(), rs.se, err, rs.sql)
+		err2 := finishStmt(statementRUNetworkFinishContext(rs.sql), rs.se, nil, rs.sql)
+		if err2 != nil {
+			if recorder, ok := rs.RecordSet.(interface{ RecordStatementFinishError(error) }); ok {
+				recorder.RecordStatementFinishError(err2)
+			}
+		}
 		if err1 != nil {
-			err = err1
+			rs.finishErr = err1
 		} else {
-			err = err2
+			rs.finishErr = err2
 		}
 	})
-	return err
+	return rs.finishErr
+}
+
+func statementRUNetworkFinishContext(statement sqlexec.Statement) context.Context {
+	ctx := context.Background()
+	execStmt, ok := statement.(*executor.ExecStmt)
+	if !ok || execStmt.GoCtx == nil {
+		return ctx
+	}
+	return tikvutil.ContextWithInheritedNetworkResponseEvidence(ctx, execStmt.GoCtx)
 }
 
 func (rs *execStmtResult) Close() error {
@@ -3187,7 +3202,7 @@ func (rs *execStmtResult) TryDetach() (sqlexec.RecordSet, bool, error) {
 
 	// Now, a transaction is not needed for the detached record set, so we commit the transaction and cleanup
 	// the session state.
-	err = finishStmt(context.Background(), rs.se, nil, rs.sql)
+	err = finishStmt(statementRUNetworkFinishContext(rs.sql), rs.se, nil, rs.sql)
 	if err != nil {
 		cursorHandle.Close()
 		err2 := detachedRS.Close()

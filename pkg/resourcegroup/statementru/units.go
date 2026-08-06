@@ -27,8 +27,10 @@ const (
 	// the documented processed-key average proxy, but exact and estimated
 	// values for the same owner are mutually exclusive.
 	ScanBytes
-	// NetworkBytes is storage response payload bytes attributable to the
-	// statement, counted once for each accepted physical response.
+	// NetworkBytes is the encoded protobuf response-body size attributable to
+	// the statement, counted once for each accepted physical response. It does
+	// not include compression, transport framing, or TLS overhead; unsupported
+	// storage commands make the unit incomplete instead of changing its meaning.
 	NetworkBytes
 	// HashStateRows is successful HashJoin build admission count or the exact
 	// completed HashAgg logical group count.

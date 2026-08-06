@@ -187,6 +187,7 @@ func (a *recordSet) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		ctx = tikvtrace.ContextWithTraceID(ctx, a.traceID)
 	}
 	ctx = inheritStmtRUV2Context(ctx, a.stmt)
+	ctx = inheritStatementRUNetworkContext(ctx, a.stmt)
 
 	e := a.executor
 	if e == nil {
@@ -218,6 +219,17 @@ func inheritStmtRUV2Context(ctx context.Context, stmt *ExecStmt) context.Context
 		return ctx
 	}
 	return execdetails.ContextWithInheritedRUV2Details(ctx, stmt.GoCtx)
+}
+
+func inheritStatementRUNetworkContext(ctx context.Context, stmt *ExecStmt) context.Context {
+	if stmt == nil || stmt.GoCtx == nil {
+		return ctx
+	}
+	inherited, result := util.InheritNetworkResponseEvidence(ctx, stmt.GoCtx)
+	if result == util.NetworkResponseEvidenceConflict {
+		stmt.statementRUNetworkConflict.Store(true)
+	}
+	return inherited
 }
 
 func (a *recordSet) chunkConfig() (fields []*types.FieldType, initCap int, maxChunkSize int) {
@@ -281,6 +293,15 @@ func (a *recordSet) Finish() error {
 		a.lastErrs = append(a.lastErrs, err)
 	}
 	return err
+}
+
+// RecordStatementFinishError retains an error produced after executor close so
+// CloseRecordSet can pass the actual logical terminal status to statement
+// finalization.
+func (a *recordSet) RecordStatementFinishError(err error) {
+	if err != nil {
+		a.lastErrs = append(a.lastErrs, err)
+	}
 }
 
 func (a *recordSet) Close() error {
@@ -401,6 +422,11 @@ type ExecStmt struct {
 	// session's current context can temporarily rotate during transaction replay.
 	statementRU        *statementru.Statement
 	statementRUContext *stmtctx.StatementContext
+	// statementRUNetworkContributor drains the one pre-compile response owner
+	// immediately before statement-RU finalization.
+	statementRUNetworkContributor  statementru.UnitContributor
+	statementRUNetworkConflict     atomic.Bool
+	statementRUNetworkResolvedNode ast.StmtNode
 }
 
 // GetStmtNode returns the stmtNode inside Statement
@@ -410,6 +436,7 @@ func (a *ExecStmt) GetStmtNode() ast.StmtNode {
 
 // PointGet short path for point exec directly from plan, keep only necessary steps
 func (a *ExecStmt) PointGet(ctx context.Context) (*recordSet, error) {
+	ctx = inheritStatementRUNetworkContext(ctx, a)
 	r, ctx := tracing.StartRegionEx(ctx, "ExecStmt.PointGet")
 	defer r.End()
 	if r.Span != nil {
@@ -587,6 +614,7 @@ func IsFastPlan(p base.Plan) bool {
 // like the INSERT, UPDATE statements, it executes in this function. If the Executor returns
 // result, execution is done after this function returns, in the returned sqlexec.RecordSet Next method.
 func (a *ExecStmt) Exec(ctx context.Context) (_ sqlexec.RecordSet, err error) {
+	ctx = inheritStatementRUNetworkContext(ctx, a)
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -1714,6 +1742,7 @@ func (a *ExecStmt) FinishExecuteStmt(txnTS uint64, err error, hasMoreResults boo
 
 	a.finalizeStatementRUV2Metrics()
 	a.recordStatementRUWriteDetails(execDetail.CommitDetail, err, a.readStatementRUCommitEvidence())
+	a.recordStatementRUNetworkBytes()
 	a.finishStatementRU(err)
 	a.updateNetworkTrafficStatsAndMetrics()
 	// `LowSlowQuery` and `SummaryStmt` must be called before recording `PrevStmt`.
