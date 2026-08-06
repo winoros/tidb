@@ -18,22 +18,31 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/meta_storagepb"
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
 	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/planner/property"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/sqlkiller"
 	"github.com/pingcap/tidb/pkg/util/topsql"
 	topsqlmock "github.com/pingcap/tidb/pkg/util/topsql/collector/mock"
 	topsqlstate "github.com/pingcap/tidb/pkg/util/topsql/state"
@@ -73,6 +82,67 @@ func (m *sharedLockMemBufferForTest) RUnlock() {
 type sharedLockTxnForTest struct {
 	kv.Transaction
 	memBuffer kv.MemBuffer
+}
+
+type recordSetTerminalExecutorForTest struct {
+	exec.BaseExecutor
+	next  func(*chunk.Chunk) error
+	close func() error
+}
+
+func (e *recordSetTerminalExecutorForTest) Next(_ context.Context, req *chunk.Chunk) error {
+	if e.next != nil {
+		return e.next(req)
+	}
+	req.Reset()
+	return nil
+}
+
+func (e *recordSetTerminalExecutorForTest) Close() error {
+	if e.close != nil {
+		return e.close()
+	}
+	return nil
+}
+
+type recordSetTerminalReporterForTest struct {
+	reports []statementru.Report
+}
+
+func (r *recordSetTerminalReporterForTest) ReportStatementRU(report statementru.Report) {
+	r.reports = append(r.reports, report)
+}
+
+func newStatementRURecordSetForTest(t *testing.T) (*recordSet, *recordSetTerminalReporterForTest) {
+	t.Helper()
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().StartTime = time.Now()
+	reporter := &recordSetTerminalReporterForTest{}
+	weights := statementru.Weights{statementru.FrontendCompileBytes: 1}
+	statementRU := statementru.NewStatement(statementru.Selection{
+		Mode:          statementru.ModeResultOnly,
+		Applicable:    true,
+		RequiredUnits: statementru.FrontendCompileBytes.Mask(),
+		Weights:       &weights,
+		Reporter:      reporter,
+	})
+	require.NotNil(t, statementRU)
+	require.True(t, statementRU.UnitRecorder().Add(statementru.FrontendCompileBytes, 1))
+	require.True(t, statementRU.EvidenceRecorder().MarkPresent(statementru.FrontendCompileBytes.Mask()))
+
+	executorUnderTest := &recordSetTerminalExecutorForTest{
+		BaseExecutor: exec.NewBaseExecutor(sctx, expression.NewSchema(), 0),
+	}
+	plan := physicalop.PhysicalTableDual{}.Init(sctx.GetPlanCtx(), &property.StatsInfo{}, 0)
+	plan.SetSchema(expression.NewSchema())
+	stmt := &ExecStmt{
+		Ctx:         sctx,
+		GoCtx:       context.Background(),
+		Plan:        plan,
+		StmtNode:    &ast.SelectStmt{},
+		statementRU: statementRU,
+	}
+	return &recordSet{executor: executorUnderTest, stmt: stmt}, reporter
 }
 
 func (t *sharedLockTxnForTest) GetMemBuffer() kv.MemBuffer {
@@ -148,6 +218,313 @@ func TestRecordSetNextAfterFinish(t *testing.T) {
 	err := rs.Next(context.Background(), chunk.NewChunkWithCapacity([]*types.FieldType{types.NewFieldType(mysql.TypeLonglong)}, 1))
 	require.Error(t, err)
 	require.True(t, exeerrors.ErrQueryInterrupted.Equal(err), err)
+}
+
+func TestRecordSetStatementRUTerminal(t *testing.T) {
+	assertFrozenTerminal := func(
+		t *testing.T,
+		rs *recordSet,
+		reporter *recordSetTerminalReporterForTest,
+		terminal statementru.TerminalStatus,
+	) {
+		t.Helper()
+		require.Empty(t, reporter.reports)
+		finish, first := rs.stmt.statementRU.Finish(statementru.TerminalSuccess)
+		require.False(t, first)
+		require.Equal(t, terminal, finish.Terminal)
+	}
+
+	t.Run("kill after Finish but before Close", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		require.NoError(t, rs.Next(context.Background(), rs.NewChunk(nil)))
+		require.NoError(t, rs.Finish())
+
+		killer := &rs.stmt.Ctx.GetSessionVars().SQLKiller
+		killer.SendKillSignal(sqlkiller.QueryInterrupted)
+		t.Cleanup(killer.Reset)
+		require.NoError(t, rs.Close())
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalCanceled)
+	})
+
+	t.Run("kill before Next", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		killer := &rs.stmt.Ctx.GetSessionVars().SQLKiller
+		killer.SendKillSignal(sqlkiller.QueryInterrupted)
+		t.Cleanup(killer.Reset)
+
+		require.Error(t, rs.Next(context.Background(), rs.NewChunk(nil)))
+		require.NoError(t, rs.Close())
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalCanceled)
+	})
+
+	t.Run("recovered outer Next panic", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetNextAfterExecForTest",
+			func(stmt *ExecStmt) {
+				if stmt == rs.stmt {
+					panic("record-set outer Next panic")
+				}
+			},
+		)
+
+		require.Error(t, rs.Next(context.Background(), rs.NewChunk(nil)))
+		require.NoError(t, rs.Close())
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalError)
+	})
+
+	t.Run("recovered Finish panic", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		panicErr := exeerrors.ErrQueryInterrupted.GenWithStackByArgs()
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetFinishAfterExecutorCloseForTest",
+			func(stmt *ExecStmt) {
+				if stmt == rs.stmt {
+					panic(panicErr)
+				}
+			},
+		)
+
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_ = rs.Finish()
+		}()
+		recoveredErr, ok := recovered.(error)
+		require.True(t, ok, "recovered value %T", recovered)
+		require.True(t, exeerrors.ErrQueryInterrupted.Equal(recoveredErr), recoveredErr)
+		require.NoError(t, rs.Close())
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalCanceled)
+	})
+
+	t.Run("Finish publishes terminal evidence before once completion", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		executorUnderTest := rs.executor.(*recordSetTerminalExecutorForTest)
+		finishErr := errors.New("record-set executor close failed")
+		executorUnderTest.close = func() error { return finishErr }
+		terminalVisibleAfterOnce := make(chan bool, 1)
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetFinishAfterOnceForTest",
+			func(stmt *ExecStmt) {
+				if stmt == rs.stmt {
+					terminalVisibleAfterOnce <- rs.hasTerminalErr()
+				}
+			},
+		)
+
+		require.ErrorIs(t, rs.Finish(), finishErr)
+		select {
+		case visible := <-terminalVisibleAfterOnce:
+			require.True(t, visible, "sync.Once published completion before terminal evidence")
+		case <-time.After(5 * time.Second):
+			t.Fatal("Finish did not reach the post-once boundary")
+		}
+		require.NoError(t, rs.Close())
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalError)
+	})
+
+	t.Run("Finish waits for admitted Next executor snapshot", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		executorUnderTest := rs.executor.(*recordSetTerminalExecutorForTest)
+		beforeExecutorSnapshot := make(chan struct{})
+		beforeExecutorTake := make(chan struct{})
+		releaseExecutorSnapshot := make(chan struct{})
+		executorClosed := make(chan bool, 1)
+		var releaseSnapshotOnce sync.Once
+		t.Cleanup(func() {
+			releaseSnapshotOnce.Do(func() { close(releaseExecutorSnapshot) })
+		})
+		var executorSnapshotReleased atomic.Bool
+		executorUnderTest.close = func() error {
+			executorClosed <- executorSnapshotReleased.Load()
+			return nil
+		}
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetBeforeExecutorSnapshotForTest",
+			func(stmt *ExecStmt) {
+				if stmt != rs.stmt {
+					return
+				}
+				close(beforeExecutorSnapshot)
+				<-releaseExecutorSnapshot
+				executorSnapshotReleased.Store(true)
+			},
+		)
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetBeforeExecutorTakeForTest",
+			func(stmt *ExecStmt) {
+				if stmt == rs.stmt {
+					close(beforeExecutorTake)
+				}
+			},
+		)
+
+		req := rs.NewChunk(nil)
+		nextErr := make(chan error, 1)
+		go func() { nextErr <- rs.Next(context.Background(), req) }()
+		select {
+		case <-beforeExecutorSnapshot:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Next did not reach the executor snapshot boundary")
+		}
+
+		closeErr := make(chan error, 1)
+		go func() { closeErr <- rs.Close() }()
+		select {
+		case <-beforeExecutorTake:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Finish did not reach the executor take boundary")
+		}
+		releaseSnapshotOnce.Do(func() { close(releaseExecutorSnapshot) })
+		select {
+		case snapshotReleased := <-executorClosed:
+			require.True(t, snapshotReleased, "Finish took the executor before the admitted Next snapshot")
+		case <-time.After(5 * time.Second):
+			t.Fatal("Finish did not close the executor after the snapshot was released")
+		}
+		select {
+		case err := <-nextErr:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Next did not return after the executor snapshot was released")
+		}
+		select {
+		case err := <-closeErr:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return after the admitted Next completed")
+		}
+		require.Len(t, reporter.reports, 1)
+		finish, first := rs.stmt.statementRU.Finish(statementru.TerminalError)
+		require.False(t, first)
+		require.Equal(t, statementru.TerminalSuccess, finish.Terminal)
+	})
+
+	t.Run("kill while concurrent Close waits for outer Next", func(t *testing.T) {
+		rs, reporter := newStatementRURecordSetForTest(t)
+		executorUnderTest := rs.executor.(*recordSetTerminalExecutorForTest)
+		afterExec := make(chan struct{})
+		executorCloseCalled := make(chan struct{})
+		beforeTerminalWait := make(chan struct{})
+		terminalBarrierAcquired := make(chan bool, 1)
+		releaseNext := make(chan struct{})
+		releaseTerminalWait := make(chan struct{})
+		var releaseNextOnce sync.Once
+		var releaseTerminalWaitOnce sync.Once
+		t.Cleanup(func() {
+			releaseNextOnce.Do(func() { close(releaseNext) })
+			releaseTerminalWaitOnce.Do(func() { close(releaseTerminalWait) })
+		})
+		var outerNextReleased atomic.Bool
+		var executorNextCalls atomic.Int32
+		executorUnderTest.next = func(req *chunk.Chunk) error {
+			executorNextCalls.Add(1)
+			req.Reset()
+			return nil
+		}
+		executorUnderTest.close = func() error {
+			close(executorCloseCalled)
+			return nil
+		}
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetNextAfterExecForTest",
+			func(stmt *ExecStmt) {
+				if stmt != rs.stmt {
+					return
+				}
+				close(afterExec)
+				<-releaseNext
+				outerNextReleased.Store(true)
+			},
+		)
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetBeforeTerminalWaitForTest",
+			func(stmt *ExecStmt) {
+				if stmt != rs.stmt {
+					return
+				}
+				close(beforeTerminalWait)
+				<-releaseTerminalWait
+			},
+		)
+		testfailpoint.EnableCall(
+			t,
+			"github.com/pingcap/tidb/pkg/executor/statementRURecordSetTerminalBarrierAcquiredForTest",
+			func(stmt *ExecStmt) {
+				if stmt == rs.stmt {
+					terminalBarrierAcquired <- outerNextReleased.Load()
+				}
+			},
+		)
+
+		nextErr := make(chan error, 1)
+		go func() {
+			nextErr <- rs.Next(context.Background(), rs.NewChunk(nil))
+		}()
+		select {
+		case <-afterExec:
+		case <-time.After(5 * time.Second):
+			t.Fatal("outer Next did not reach the post-executor boundary")
+		}
+
+		closeErr := make(chan error, 1)
+		go func() {
+			closeErr <- rs.Close()
+		}()
+		select {
+		case <-executorCloseCalled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not close the executor before waiting for outer Next")
+		}
+		select {
+		case <-beforeTerminalWait:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not reach the statement-RU terminal wait boundary")
+		}
+		rejectedNextErr := make(chan error, 1)
+		go func() {
+			rejectedNextErr <- rs.Next(context.Background(), rs.NewChunk(nil))
+		}()
+		select {
+		case err := <-rejectedNextErr:
+			require.True(t, exeerrors.ErrQueryInterrupted.Equal(err), err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Next ingress was not rejected after Close began")
+		}
+		require.Equal(t, int32(1), executorNextCalls.Load())
+		killer := &rs.stmt.Ctx.GetSessionVars().SQLKiller
+		killer.SendKillSignal(sqlkiller.QueryInterrupted)
+		t.Cleanup(killer.Reset)
+		releaseTerminalWaitOnce.Do(func() { close(releaseTerminalWait) })
+
+		releaseNextOnce.Do(func() { close(releaseNext) })
+		select {
+		case err := <-nextErr:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("outer Next did not return after release")
+		}
+		select {
+		case nextReleased := <-terminalBarrierAcquired:
+			require.True(t, nextReleased, "Close acquired the terminal barrier before outer Next released it")
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not acquire the statement-RU terminal barrier")
+		}
+		select {
+		case err := <-closeErr:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return after outer Next completed and kill was sampled")
+		}
+		assertFrozenTerminal(t, rs, reporter, statementru.TerminalCanceled)
+	})
 }
 
 func ruKeyForStmt(t *testing.T, stmt *ExecStmt) stmtstats.RUKey {

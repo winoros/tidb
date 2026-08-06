@@ -795,6 +795,9 @@ func TestStatementRUTerminalClassificationAndLabels(t *testing.T) {
 		{name: "wrapped deadline", err: fmt.Errorf("wrapped: %w", context.DeadlineExceeded), want: statementru.TerminalCanceled},
 		{name: "TiDB query interrupted", err: exeerrors.ErrQueryInterrupted.GenWithStackByArgs(), want: statementru.TerminalCanceled},
 		{name: "TiDB max execution time", err: exeerrors.ErrMaxExecTimeExceeded.GenWithStackByArgs(), want: statementru.TerminalCanceled},
+		{name: "joined TiDB query interrupted", err: stderrors.Join(stderrors.New("close failed"), exeerrors.ErrQueryInterrupted.GenWithStackByArgs()), want: statementru.TerminalCanceled},
+		{name: "joined TiDB max execution time", err: stderrors.Join(stderrors.New("close failed"), exeerrors.ErrMaxExecTimeExceeded.GenWithStackByArgs()), want: statementru.TerminalCanceled},
+		{name: "joined wrapped TiDB query interrupted", err: stderrors.Join(stderrors.New("close failed"), fmt.Errorf("wrapped: %w", exeerrors.ErrQueryInterrupted.GenWithStackByArgs())), want: statementru.TerminalCanceled},
 	}
 	for _, tt := range terminalTests {
 		t.Run(tt.name, func(t *testing.T) {

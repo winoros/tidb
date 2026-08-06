@@ -103,11 +103,28 @@ type recordSet struct {
 	executor exec.Executor
 	// The `Fields` method may be called after `Close`, and the executor is cleared in the `Close` function.
 	// Therefore, we need to store the schema in `recordSet` to avoid a null pointer exception when calling `executor.Schema()`.
-	schema     *expression.Schema
-	stmt       *ExecStmt
-	lastErrs   []error
-	txnStartTS uint64
-	once       sync.Once
+	schema         *expression.Schema
+	stmt           *ExecStmt
+	txnStartTS     uint64
+	once           sync.Once
+	terminalErrsMu sync.Mutex
+	terminalErrs   []error
+	// Selected Next nests terminal -> executor during admission and terminal ->
+	// terminal-errors during completion; it never holds executor while recording
+	// an error. Finish never holds terminal and closes the captured executor
+	// outside executor, so it can unblock Next without creating a lock cycle.
+	// statementRUClosing closes the selected outer-Next ingress before executor
+	// shutdown starts.
+	statementRUClosing atomic.Bool
+	// statementRUExecutorMu orders a selected Next executor snapshot against
+	// Finish clearing the record-set executor. It is held only while copying or
+	// clearing the interface; executor Next and Close deliberately run outside it
+	// so Close can unblock an active Next.
+	statementRUExecutorMu sync.Mutex
+	// statementRUTerminalMu orders selected statement-RU finalization after the
+	// complete outer Next boundary. Close must close the executor first so an
+	// active Next can be unblocked before Close waits on this mutex.
+	statementRUTerminalMu sync.Mutex
 	// traceID stores the trace ID for this statement execution.
 	// It's injected into the context during Next() to ensure trace correlation
 	// across TiDB -> client-go -> TiKV during lazy execution.
@@ -164,14 +181,57 @@ func colNames2ResultFields(schema *expression.Schema, names []*types.FieldName, 
 // next query.
 // If stmt is not nil and chunk with some rows inside, we simply update last query found rows by the number of row in chunk.
 func (a *recordSet) Next(ctx context.Context, req *chunk.Chunk) (err error) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
+	statementRUSelected := a.stmt != nil && a.stmt.statementRU != nil
+	var e exec.Executor
+	if statementRUSelected {
+		// A rejected ingress is outside the accepted statement execution and must
+		// not mutate terminal evidence, including when it started just before
+		// closing but reaches the admission check afterward.
+		if a.isStatementRUClosing() {
+			return exeerrors.ErrQueryInterrupted.GenWithStackByArgs()
 		}
-		err = util2.GetRecoverError(r)
-		logutil.Logger(ctx).Warn("execute sql panic", zap.String("sql", a.stmt.GetTextToLog(false)), zap.Stack("stack"))
-	}()
+		a.statementRUTerminalMu.Lock()
+		statementRUAccepted := false
+		statementRUExecutorLocked := false
+		defer func() {
+			r := recover()
+			if r != nil {
+				err = util2.GetRecoverError(r)
+				logutil.Logger(ctx).Warn("execute sql panic", zap.String("sql", a.stmt.GetTextToLog(false)), zap.Stack("stack"))
+			}
+			if statementRUExecutorLocked {
+				a.statementRUExecutorMu.Unlock()
+			}
+			// Record terminal evidence before releasing the finalization barrier.
+			// Close relies on this order when it races with outer Next.
+			if statementRUAccepted {
+				a.recordTerminalErr(err)
+			}
+			a.statementRUTerminalMu.Unlock()
+		}()
+		a.statementRUExecutorMu.Lock()
+		statementRUExecutorLocked = true
+		if a.isStatementRUClosing() {
+			return exeerrors.ErrQueryInterrupted.GenWithStackByArgs()
+		}
+		statementRUAccepted = true
+		// Snapshot the interface before admission completes. Finish clears it
+		// under the same mutex, then may close the captured executor concurrently
+		// to unblock this accepted Next.
+		failpoint.InjectCall("statementRURecordSetBeforeExecutorSnapshotForTest", a.stmt)
+		e = a.executor
+		a.statementRUExecutorMu.Unlock()
+		statementRUExecutorLocked = false
+	} else {
+		defer func() {
+			r := recover()
+			if r != nil {
+				err = util2.GetRecoverError(r)
+				logutil.Logger(ctx).Warn("execute sql panic", zap.String("sql", a.stmt.GetTextToLog(false)), zap.Stack("stack"))
+			}
+			a.recordTerminalErr(err)
+		}()
+	}
 	if a.stmt != nil {
 		if err := a.stmt.Ctx.GetSessionVars().SQLKiller.HandleSignal(); err != nil {
 			return err
@@ -189,16 +249,19 @@ func (a *recordSet) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	ctx = inheritStmtRUV2Context(ctx, a.stmt)
 	ctx = inheritStatementRUNetworkContext(ctx, a.stmt)
 
-	e := a.executor
+	if !statementRUSelected {
+		e = a.executor
+	}
 	if e == nil {
 		err = exeerrors.ErrQueryInterrupted.GenWithStackByArgs()
-		a.lastErrs = append(a.lastErrs, err)
 		return err
 	}
 
 	err = a.stmt.next(ctx, e, req)
+	if statementRUSelected {
+		failpoint.InjectCall("statementRURecordSetNextAfterExecForTest", a.stmt)
+	}
 	if err != nil {
-		a.lastErrs = append(a.lastErrs, err)
 		return err
 	}
 	numRows := req.NumRows()
@@ -212,6 +275,35 @@ func (a *recordSet) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		a.stmt.Ctx.GetSessionVars().StmtCtx.AddFoundRows(uint64(numRows))
 	}
 	return nil
+}
+
+func (a *recordSet) recordTerminalErr(err error) {
+	if err == nil {
+		return
+	}
+	a.terminalErrsMu.Lock()
+	a.terminalErrs = append(a.terminalErrs, err)
+	a.terminalErrsMu.Unlock()
+}
+
+func (a *recordSet) terminalErr() error {
+	a.terminalErrsMu.Lock()
+	defer a.terminalErrsMu.Unlock()
+	return errors.Join(a.terminalErrs...)
+}
+
+func (a *recordSet) hasTerminalErr() bool {
+	a.terminalErrsMu.Lock()
+	defer a.terminalErrsMu.Unlock()
+	return len(a.terminalErrs) != 0
+}
+
+func (a *recordSet) markStatementRUClosing() {
+	a.statementRUClosing.Store(true)
+}
+
+func (a *recordSet) isStatementRUClosing() bool {
+	return a.statementRUClosing.Load()
 }
 
 func inheritStmtRUV2Context(ctx context.Context, stmt *ExecStmt) context.Context {
@@ -267,12 +359,42 @@ func (a *recordSet) NewChunk(alloc chunk.Allocator) *chunk.Chunk {
 	return alloc.Alloc(e.RetFieldTypes(), e.InitCap(), e.MaxChunkSize())
 }
 
-func (a *recordSet) Finish() error {
-	var err error
+func (a *recordSet) Finish() (err error) {
 	a.once.Do(func() {
-		if a.executor != nil {
-			err = exec.Close(a.executor)
+		// Record terminal evidence inside the once callback. sync.Once publishes
+		// completion only after this defer runs, so a concurrent Finish or Close
+		// cannot observe the callback as complete before its error or panic is
+		// visible.
+		defer func() {
+			if r := recover(); r != nil {
+				a.recordTerminalErr(util2.GetRecoverError(r))
+				panic(r)
+			}
+			a.recordTerminalErr(err)
+		}()
+
+		statementRUSelected := a.stmt != nil && a.stmt.statementRU != nil
+		var executorToClose exec.Executor
+		if statementRUSelected {
+			// Finish itself also closes ingress because it may be called before
+			// Close after the final fetch.
+			a.markStatementRUClosing()
+			failpoint.InjectCall("statementRURecordSetBeforeExecutorTakeForTest", a.stmt)
+			a.statementRUExecutorMu.Lock()
+			executorToClose = a.executor
 			a.executor = nil
+			a.statementRUExecutorMu.Unlock()
+		} else if a.executor != nil {
+			executorToClose = a.executor
+		}
+		if executorToClose != nil {
+			err = exec.Close(executorToClose)
+			if !statementRUSelected {
+				a.executor = nil
+			}
+		}
+		if statementRUSelected {
+			failpoint.InjectCall("statementRURecordSetFinishAfterExecutorCloseForTest", a.stmt)
 		}
 		cteErr := resetCTEStorageMap(a.stmt.Ctx)
 		if cteErr != nil {
@@ -282,15 +404,16 @@ func (a *recordSet) Finish() error {
 			err = cteErr
 		}
 		if a.stmt != nil {
-			status := a.stmt.Ctx.GetSessionVars().SQLKiller.GetKillSignal()
-			inWriteResultSet := a.stmt.Ctx.GetSessionVars().SQLKiller.InWriteResultSet.Load()
+			killer := &a.stmt.Ctx.GetSessionVars().SQLKiller
+			status := killer.GetKillSignal()
+			inWriteResultSet := killer.InWriteResultSet.Load()
 			if status > 0 && inWriteResultSet {
 				logutil.BgLogger().Warn("kill, this SQL might be stuck in the network stack while writing packets to the client.", zap.Uint64("connection ID", a.stmt.Ctx.GetSessionVars().ConnectionID))
 			}
 		}
 	})
-	if err != nil {
-		a.lastErrs = append(a.lastErrs, err)
+	if a.stmt != nil && a.stmt.statementRU != nil {
+		failpoint.InjectCall("statementRURecordSetFinishAfterOnceForTest", a.stmt)
 	}
 	return err
 }
@@ -299,23 +422,52 @@ func (a *recordSet) Finish() error {
 // CloseRecordSet can pass the actual logical terminal status to statement
 // finalization.
 func (a *recordSet) RecordStatementFinishError(err error) {
-	if err != nil {
-		a.lastErrs = append(a.lastErrs, err)
+	a.recordTerminalErr(err)
+}
+
+func (a *recordSet) recordStatementRUKillSignal() {
+	if a.stmt == nil || a.stmt.statementRU == nil {
+		return
 	}
+	// A kill can arrive after the last successful Next, or even after Finish,
+	// while the server is still writing the response. Sample it at the actual
+	// Close finalization boundary so it cannot become a production RU report.
+	killer := &a.stmt.Ctx.GetSessionVars().SQLKiller
+	a.recordTerminalErr(killer.HandleSignal())
 }
 
 func (a *recordSet) Close() error {
+	statementRUSelected := a.stmt != nil && a.stmt.statementRU != nil
+	if statementRUSelected {
+		// Reject new selected Next ingress before closing the executor. A Next
+		// already inside the terminal barrier remains active and is unblocked by
+		// Finish below before Close waits for it.
+		a.markStatementRUClosing()
+	}
 	err := a.Finish()
 	if err != nil {
 		logutil.BgLogger().Error("close recordSet error", zap.Error(err))
 	}
-	a.stmt.CloseRecordSet(a.txnStartTS, errors.Join(a.lastErrs...))
+	if statementRUSelected {
+		// Finish closes the executor before this wait. Reversing the order can
+		// deadlock an active Next that needs executor close to unblock. Holding
+		// the barrier through CloseRecordSet also prevents a later Next from
+		// racing statement-RU finalization.
+		failpoint.InjectCall("statementRURecordSetBeforeTerminalWaitForTest", a.stmt)
+		a.statementRUTerminalMu.Lock()
+		defer a.statementRUTerminalMu.Unlock()
+		// This is the selected statement's terminal linearization point. Sample
+		// SQLKiller only after every accepted outer Next has recorded its result.
+		a.recordStatementRUKillSignal()
+		failpoint.InjectCall("statementRURecordSetTerminalBarrierAcquiredForTest", a.stmt)
+	}
+	a.stmt.CloseRecordSet(a.txnStartTS, a.terminalErr())
 	return err
 }
 
 // OnFetchReturned implements commandLifeCycle#OnFetchReturned
 func (a *recordSet) OnFetchReturned() {
-	a.stmt.LogSlowQuery(a.txnStartTS, len(a.lastErrs) == 0, true)
+	a.stmt.LogSlowQuery(a.txnStartTS, !a.hasTerminalErr(), true)
 }
 
 // TryDetach creates a new `RecordSet` which doesn't depend on the current session context.

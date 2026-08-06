@@ -327,11 +327,33 @@ func statementRUTerminalStatus(finalErr error) statementru.TerminalStatus {
 	}
 	if stderrors.Is(finalErr, context.Canceled) ||
 		stderrors.Is(finalErr, context.DeadlineExceeded) ||
-		exeerrors.ErrQueryInterrupted.Equal(finalErr) ||
-		exeerrors.ErrMaxExecTimeExceeded.Equal(finalErr) {
+		statementRUIsExecutionCanceled(finalErr) {
 		return statementru.TerminalCanceled
 	}
 	return statementru.TerminalError
+}
+
+// statementRUIsExecutionCanceled preserves TiDB error identity through
+// errors.Join. pingcap/errors Equal follows a single Cause chain but does not
+// traverse the standard multi-error Unwrap contract.
+func statementRUIsExecutionCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if exeerrors.ErrQueryInterrupted.Equal(err) || exeerrors.ErrMaxExecTimeExceeded.Equal(err) {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range wrapped.Unwrap() {
+			if statementRUIsExecutionCanceled(child) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return statementRUIsExecutionCanceled(wrapped.Unwrap())
+	}
+	return false
 }
 
 func statementRUTerminalLabel(status statementru.TerminalStatus) string {

@@ -2185,6 +2185,61 @@ func BenchmarkCompleteLoadErr(b *testing.B) {
 	}
 }
 
+type statementRURecordSetBenchmarkExecutor struct {
+	exec.BaseExecutor
+}
+
+var statementRURecordSetBenchmarkSink *recordSet
+
+func (e *statementRURecordSetBenchmarkExecutor) Next(_ context.Context, req *chunk.Chunk) error {
+	req.Reset()
+	return nil
+}
+
+func BenchmarkStatementRURecordSetNextBoundary(b *testing.B) {
+	weights := statementru.Weights{statementru.FrontendCompileBytes: 1}
+	for _, enabled := range []bool{false, true} {
+		name := "off"
+		if enabled {
+			name = "result_only"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := mock.NewContext()
+			stmt := &ExecStmt{Ctx: ctx}
+			if enabled {
+				stmt.statementRU = statementru.NewStatement(statementru.Selection{
+					Mode:          statementru.ModeResultOnly,
+					Applicable:    true,
+					RequiredUnits: statementru.FrontendCompileBytes.Mask(),
+					Weights:       &weights,
+				})
+			}
+			executorUnderTest := &statementRURecordSetBenchmarkExecutor{
+				BaseExecutor: exec.NewBaseExecutor(ctx, expression.NewSchema(), 0),
+			}
+			recordSet := &recordSet{executor: executorUnderTest, stmt: stmt}
+			req := recordSet.NewChunk(nil)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if err := recordSet.Next(context.Background(), req); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStatementRURecordSetConstruction(b *testing.B) {
+	ctx := mock.NewContext()
+	stmt := &ExecStmt{Ctx: ctx}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		statementRURecordSetBenchmarkSink = &recordSet{stmt: stmt}
+	}
+}
+
 func BenchmarkStatementRUFrontendCompileCollection(b *testing.B) {
 	stmt := &ast.SelectStmt{}
 	stmt.SetText(nil, "select * from t where a = ?")
