@@ -92,6 +92,8 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 			require.True(t, first)
 			require.Equal(t, TerminalSuccess, finish.Terminal)
 			require.True(t, finish.ReportSelected)
+			_, hasDiagnostic := finish.Diagnostic()
+			require.False(t, hasDiagnostic)
 			total, ok := finish.Result.TotalRU()
 			require.True(t, ok)
 			require.Equal(t, delta*2, total)
@@ -106,24 +108,145 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 		}
 	})
 
-	t.Run("calibration retains details without production reporting", func(t *testing.T) {
+	t.Run("calibration exposes candidate details without production reporting", func(t *testing.T) {
+		for _, delta := range []float64{4, 0} {
+			reporter := &recordingStatementRUReporter{}
+			statement := NewStatement(Selection{
+				Mode:          ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: CPUWork.Mask(),
+				Weights:       &weights,
+				Reporter:      reporter,
+			})
+			require.True(t, statement.UnitRecorder().Add(CPUWork, delta))
+			require.True(t, statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.False(t, finish.ReportSelected)
+
+			diagnostic, ok := finish.Diagnostic()
+			require.True(t, ok)
+			require.Equal(t, TerminalSuccess, diagnostic.Terminal())
+			require.Equal(t, Outcome{State: StateComplete, Reason: ReasonNone}, diagnostic.Outcome())
+			require.Equal(t, delta, diagnostic.Units()[CPUWork])
+			require.Equal(t, CPUWork.Mask(), diagnostic.Coverage().RequiredUnits)
+			candidate, present := diagnostic.CandidateTotalRU()
+			require.True(t, present)
+			require.Equal(t, delta*2, candidate)
+
+			units := diagnostic.Units()
+			units[CPUWork] = 99
+			coverage := diagnostic.Coverage()
+			coverage.RequiredUnits = AllUnits
+			require.Equal(t, float64(99), units[CPUWork])
+			require.Equal(t, AllUnits, coverage.RequiredUnits)
+			require.Equal(t, delta, diagnostic.Units()[CPUWork])
+			require.Equal(t, CPUWork.Mask(), diagnostic.Coverage().RequiredUnits)
+			require.False(t, statement.UnitRecorder().Add(CPUWork, 1))
+			require.Empty(t, reporter.all())
+		}
+	})
+
+	t.Run("calibration diagnostic preserves unavailable and incomplete outcomes", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			weights *Weights
+			prepare func(*testing.T, *Statement)
+			outcome Outcome
+		}{
+			{
+				name:    "weights unavailable",
+				prepare: func(t *testing.T, s *Statement) { require.True(t, s.EvidenceRecorder().MarkPresent(CPUWork.Mask())) },
+				outcome: Outcome{State: StateUnavailable, Reason: ReasonWeightsUnavailable},
+			},
+			{
+				name:    "partial",
+				weights: &weights,
+				prepare: func(t *testing.T, s *Statement) { require.True(t, s.EvidenceRecorder().MarkPartial(CPUWork.Mask())) },
+				outcome: Outcome{State: StatePartial, Reason: ReasonIncompleteEvidence},
+			},
+			{
+				name:    "unavailable",
+				weights: &weights,
+				prepare: func(*testing.T, *Statement) {},
+				outcome: Outcome{State: StateUnavailable, Reason: ReasonMissingEvidence},
+			},
+			{
+				name:    "unsupported",
+				weights: &weights,
+				prepare: func(t *testing.T, s *Statement) {
+					require.True(t, s.EvidenceRecorder().MarkUnsupported(CPUWork.Mask()))
+				},
+				outcome: Outcome{State: StateUnavailable, Reason: ReasonUnsupported},
+			},
+			{
+				name:    "invalid",
+				weights: &weights,
+				prepare: func(t *testing.T, s *Statement) { require.False(t, s.UnitRecorder().Add(CPUWork, -1)) },
+				outcome: Outcome{State: StateInvalid, Reason: ReasonInvalidObservation},
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				statement := NewStatement(Selection{
+					Mode:          ModeCalibration,
+					Applicable:    true,
+					RequiredUnits: CPUWork.Mask(),
+					Weights:       tt.weights,
+				})
+				tt.prepare(t, statement)
+				finish, first := statement.Finish(TerminalSuccess)
+				require.True(t, first)
+				diagnostic, ok := finish.Diagnostic()
+				require.True(t, ok)
+				require.Equal(t, tt.outcome, diagnostic.Outcome())
+				_, present := diagnostic.CandidateTotalRU()
+				require.False(t, present)
+			})
+		}
+	})
+
+	t.Run("diagnostic terminal is orthogonal to a complete candidate", func(t *testing.T) {
+		for _, terminal := range []TerminalStatus{TerminalError, TerminalCanceled} {
+			statement := NewStatement(Selection{
+				Mode:          ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: CPUWork.Mask(),
+				Weights:       &weights,
+			})
+			require.True(t, statement.UnitRecorder().Add(CPUWork, 3))
+			require.True(t, statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
+			finish, first := statement.Finish(terminal)
+			require.True(t, first)
+			require.False(t, finish.ReportSelected)
+			diagnostic, ok := finish.Diagnostic()
+			require.True(t, ok)
+			require.Equal(t, terminal, diagnostic.Terminal())
+			candidate, present := diagnostic.CandidateTotalRU()
+			require.True(t, present)
+			require.Equal(t, float64(6), candidate)
+		}
+	})
+
+	t.Run("explain uses the same frozen diagnostic view", func(t *testing.T) {
 		reporter := &recordingStatementRUReporter{}
 		statement := NewStatement(Selection{
-			Mode:          ModeCalibration,
+			Mode:          ModeExplain,
 			Applicable:    true,
 			RequiredUnits: CPUWork.Mask(),
 			Weights:       &weights,
 			Reporter:      reporter,
 		})
-		require.True(t, statement.UnitRecorder().Add(CPUWork, 4))
 		require.True(t, statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
 		finish, first := statement.Finish(TerminalSuccess)
 		require.True(t, first)
 		require.False(t, finish.ReportSelected)
-		units, retained := finish.Result.Units()
-		require.True(t, retained)
-		require.Equal(t, float64(4), units[CPUWork])
 		require.Empty(t, reporter.all())
+		diagnostic, ok := finish.Diagnostic()
+		require.True(t, ok)
+		candidate, present := diagnostic.CandidateTotalRU()
+		require.True(t, present)
+		require.Zero(t, candidate)
 	})
 
 	t.Run("producer capabilities cannot finalize or cross-cast", func(t *testing.T) {
@@ -323,4 +446,46 @@ func TestStatementConcurrentFinishReportsOnce(t *testing.T) {
 	}
 	require.Equal(t, 1, firstCount)
 	require.Equal(t, []Report{{TotalRU: 1}}, reporter.all())
+
+	calibration := NewStatement(Selection{
+		Mode:          ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: CPUWork.Mask(),
+		Weights:       &weights,
+	})
+	require.True(t, calibration.UnitRecorder().Add(CPUWork, 2))
+	require.True(t, calibration.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
+	type diagnosticCall struct {
+		diagnostic Diagnostic
+		ok         bool
+		first      bool
+	}
+	diagnostics := make(chan diagnosticCall, goroutines)
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			finish, first := calibration.Finish(TerminalSuccess)
+			diagnostic, ok := finish.Diagnostic()
+			diagnostics <- diagnosticCall{diagnostic: diagnostic, ok: ok, first: first}
+		}()
+	}
+	wg.Wait()
+	close(diagnostics)
+	firstCount = 0
+	var expected Diagnostic
+	haveExpected := false
+	for call := range diagnostics {
+		require.True(t, call.ok)
+		if !haveExpected {
+			expected = call.diagnostic
+			haveExpected = true
+		}
+		require.Equal(t, expected, call.diagnostic)
+		if call.first {
+			firstCount++
+		}
+	}
+	require.True(t, haveExpected)
+	require.Equal(t, 1, firstCount)
 }

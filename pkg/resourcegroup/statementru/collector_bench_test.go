@@ -17,11 +17,12 @@ package statementru
 import "testing"
 
 var (
-	benchmarkAccepted  bool
-	benchmarkResult    Result
-	benchmarkFinish    FinishResult
-	benchmarkStatement *Statement
-	benchmarkUnits     UnitValues
+	benchmarkAccepted   bool
+	benchmarkDiagnostic Diagnostic
+	benchmarkResult     Result
+	benchmarkFinish     FinishResult
+	benchmarkStatement  *Statement
+	benchmarkUnits      UnitValues
 )
 
 func BenchmarkCollectorAddUnit(b *testing.B) {
@@ -164,5 +165,41 @@ func BenchmarkStatementResultOnlyOwnerLifecycle(b *testing.B) {
 		statement.UnitRecorder().Add(CPUWork, 1)
 		statement.EvidenceRecorder().MarkPresent(CPUWork.Mask())
 		benchmarkFinish, _ = statement.Finish(TerminalSuccess)
+	}
+}
+
+func BenchmarkStatementCalibrationDiagnosticLifecycle(b *testing.B) {
+	weights := Weights{CPUWork: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		statement := NewStatement(Selection{
+			Mode:          ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: CPUWork.Mask(),
+			Weights:       &weights,
+		})
+		statement.UnitRecorder().Add(CPUWork, 1)
+		statement.EvidenceRecorder().MarkPresent(CPUWork.Mask())
+		finish, _ := statement.Finish(TerminalSuccess)
+		benchmarkDiagnostic, _ = finish.Diagnostic()
+	}
+}
+
+func BenchmarkStatementDiagnosticProjection(b *testing.B) {
+	weights := Weights{CPUWork: 1}
+	statement := NewStatement(Selection{
+		Mode:          ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: CPUWork.Mask(),
+		Weights:       &weights,
+	})
+	statement.UnitRecorder().Add(CPUWork, 1)
+	statement.EvidenceRecorder().MarkPresent(CPUWork.Mask())
+	finish, _ := statement.Finish(TerminalSuccess)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		benchmarkDiagnostic, _ = finish.Diagnostic()
 	}
 }

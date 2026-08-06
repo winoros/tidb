@@ -36,4 +36,6 @@
 // Finalize takes one consistent snapshot and is idempotent. Mutations after
 // finalization are rejected and cannot change the frozen Result. Result
 // accessors return values rather than references to collector-owned state.
+// Calibration and Explain may project that result into a Diagnostic containing
+// bounded raw evidence and an explicitly non-authoritative candidate total.
 package statementru
