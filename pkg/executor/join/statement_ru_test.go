@@ -85,7 +85,12 @@ func newStatementRUJoinDataSource(ctx sessionctx.Context, failNext bool) exec.Ex
 }
 
 func configureStatementRUJoin(t testing.TB, ctx sessionctx.Context, executor exec.Executor, multiplier int) *statementru.Statement {
-	required := statementru.CPUWork.Mask() | statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask()
+	additionalUnits := statementru.JoinOutputRows.Mask()
+	switch executor.(type) {
+	case *exec.BaseExecutor, *HashJoinV1Exec, *HashJoinV2Exec:
+		additionalUnits |= statementru.HashStateRows.Mask()
+	}
+	required := statementru.CPUWork.Mask() | additionalUnits
 	weights := statementru.Weights{
 		statementru.CPUWork:        1,
 		statementru.HashStateRows:  1,
@@ -100,7 +105,7 @@ func configureStatementRUJoin(t testing.TB, ctx sessionctx.Context, executor exe
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(executor, sc, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: multiplier,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   additionalUnits,
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
@@ -108,8 +113,7 @@ func configureStatementRUJoin(t testing.TB, ctx sessionctx.Context, executor exe
 }
 
 func finishStatementRUJoin(t testing.TB, statement *statementru.Statement, terminal statementru.TerminalStatus) statementru.UnitValues {
-	required := statementru.CPUWork.Mask() | statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask()
-	require.True(t, statement.EvidenceRecorder().MarkPresent(required))
+	require.True(t, statement.EvidenceRecorder().MarkPresent(statement.UnitRecorder().CollectedUnits()))
 	finish, first := statement.Finish(terminal)
 	require.True(t, first)
 	units, ok := finish.Result.Units()
@@ -604,8 +608,7 @@ func TestStatementRUConcurrentCloseSuppressesAsyncTerminal(t *testing.T) {
 				t.Fatal("concurrent Close did not return")
 			}
 
-			required := statementru.CPUWork.Mask() | statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask()
-			require.True(t, fixture.statement.EvidenceRecorder().MarkPresent(required))
+			require.True(t, fixture.statement.EvidenceRecorder().MarkPresent(fixture.statement.UnitRecorder().CollectedUnits()))
 			finish, first := fixture.statement.Finish(statementru.TerminalCanceled)
 			require.True(t, first)
 			require.True(t, finish.Result.HasTotal())

@@ -73,6 +73,42 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 		require.Empty(t, reporter.all())
 	})
 
+	t.Run("invalid enabled selection retains only its terminal result", func(t *testing.T) {
+		invalidMask := UnitKind(UnitCount).Mask()
+		invalidWeights := Weights{CPUWork: -1}
+		for _, selection := range []Selection{
+			{Mode: ModeResultOnly, Applicable: true},
+			{
+				Mode:           ModeResultOnly,
+				Applicable:     true,
+				RequiredUnits:  CPUWork.Mask(),
+				CollectedUnits: ScanBytes.Mask(),
+			},
+			{
+				Mode:           ModeCalibration,
+				Applicable:     true,
+				RequiredUnits:  CPUWork.Mask(),
+				CollectedUnits: CPUWork.Mask() | invalidMask,
+			},
+			{
+				Mode:          ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: CPUWork.Mask(),
+				Weights:       &invalidWeights,
+			},
+		} {
+			statement := NewStatement(selection)
+			require.NotNil(t, statement)
+			require.Nil(t, statement.UnitRecorder())
+			require.Nil(t, statement.EvidenceRecorder())
+			require.Nil(t, statement.UnitContributorRegistrar())
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateInvalid, Reason: ReasonInvalidConfiguration}, finish.Result.Outcome())
+			require.False(t, finish.ReportSelected)
+		}
+	})
+
 	t.Run("result only reports complete total including zero", func(t *testing.T) {
 		for _, delta := range []float64{3, 0} {
 			reporter := &recordingStatementRUReporter{}
@@ -85,6 +121,9 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 			})
 			require.NotNil(t, statement)
 			require.Equal(t, ModeResultOnly, statement.Mode())
+			require.Equal(t, CPUWork.Mask(), statement.UnitRecorder().CollectedUnits())
+			require.Equal(t, CPUWork.Mask(), statement.UnitContributorRegistrar().RequiredUnits())
+			require.Equal(t, CPUWork.Mask(), statement.UnitContributorRegistrar().CollectedUnits())
 			require.True(t, statement.UnitRecorder().Add(CPUWork, delta))
 			require.True(t, statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
 
@@ -112,14 +151,17 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 		for _, delta := range []float64{4, 0} {
 			reporter := &recordingStatementRUReporter{}
 			statement := NewStatement(Selection{
-				Mode:          ModeCalibration,
-				Applicable:    true,
-				RequiredUnits: CPUWork.Mask(),
-				Weights:       &weights,
-				Reporter:      reporter,
+				Mode:           ModeCalibration,
+				Applicable:     true,
+				RequiredUnits:  CPUWork.Mask(),
+				CollectedUnits: CPUWork.Mask() | NetworkBytes.Mask(),
+				Weights:        &weights,
+				Reporter:       reporter,
 			})
 			require.True(t, statement.UnitRecorder().Add(CPUWork, delta))
+			require.True(t, statement.UnitRecorder().Add(NetworkBytes, 5))
 			require.True(t, statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()))
+			require.True(t, statement.EvidenceRecorder().MarkUnavailable(NetworkBytes.Mask()))
 			finish, first := statement.Finish(TerminalSuccess)
 			require.True(t, first)
 			require.False(t, finish.ReportSelected)
@@ -129,7 +171,9 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 			require.Equal(t, TerminalSuccess, diagnostic.Terminal())
 			require.Equal(t, Outcome{State: StateComplete, Reason: ReasonNone}, diagnostic.Outcome())
 			require.Equal(t, delta, diagnostic.Units()[CPUWork])
+			require.Equal(t, float64(5), diagnostic.Units()[NetworkBytes])
 			require.Equal(t, CPUWork.Mask(), diagnostic.Coverage().RequiredUnits)
+			require.Equal(t, CPUWork.Mask()|NetworkBytes.Mask(), diagnostic.Coverage().CollectedUnits)
 			candidate, present := diagnostic.CandidateTotalRU()
 			require.True(t, present)
 			require.Equal(t, delta*2, candidate)
@@ -138,10 +182,13 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 			units[CPUWork] = 99
 			coverage := diagnostic.Coverage()
 			coverage.RequiredUnits = AllUnits
+			coverage.CollectedUnits = 0
 			require.Equal(t, float64(99), units[CPUWork])
 			require.Equal(t, AllUnits, coverage.RequiredUnits)
+			require.Zero(t, coverage.CollectedUnits)
 			require.Equal(t, delta, diagnostic.Units()[CPUWork])
 			require.Equal(t, CPUWork.Mask(), diagnostic.Coverage().RequiredUnits)
+			require.Equal(t, CPUWork.Mask()|NetworkBytes.Mask(), diagnostic.Coverage().CollectedUnits)
 			require.False(t, statement.UnitRecorder().Add(CPUWork, 1))
 			require.Empty(t, reporter.all())
 		}

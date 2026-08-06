@@ -21,6 +21,8 @@ import "sync"
 // may contribute to the same unit only for disjoint physical work; callers are
 // responsible for preventing duplicate observations.
 type UnitRecorder interface {
+	// CollectedUnits returns the immutable statement-local instrumentation mask.
+	CollectedUnits() UnitMask
 	Add(UnitKind, float64) bool
 }
 
@@ -36,14 +38,16 @@ type EvidenceRecorder interface {
 }
 
 // Config contains statement-local collection configuration. RequiredUnits must
-// be nonempty; it selects which units are applicable to this statement. Weights
-// and observations outside that mask do not enter its authoritative total.
-// NewCollector copies Weights immediately. A nil Weights pointer means that
-// weights are not available; a non-nil all-zero vector is valid.
+// be a nonempty valid subset of CollectedUnits. A zero CollectedUnits defaults
+// to RequiredUnits, preserving the ResultOnly configuration. Weights outside
+// RequiredUnits do not enter the candidate total. NewCollector copies Weights
+// immediately. A nil Weights pointer means that weights are not available; a
+// non-nil all-zero vector is valid.
 type Config struct {
-	RequiredUnits UnitMask
-	Weights       *Weights
-	RetainDetails bool
+	RequiredUnits  UnitMask
+	CollectedUnits UnitMask
+	Weights        *Weights
+	RetainDetails  bool
 }
 
 // Collector accumulates one logical statement's typed RU units. Its methods
@@ -55,36 +59,40 @@ type Collector struct {
 	weights    Weights
 	hasWeights bool
 
+	invalidReason      Reason
+	configurationValid bool
+	retainDetails      bool
+	finalized          bool
+
 	values   UnitValues
 	coverage Coverage
-
-	invalidReason Reason
-
-	retainDetails bool
-	finalized     bool
-	result        Result
+	result   Result
 }
 
 // NewCollector creates a statement RU collector and freezes its configuration.
 func NewCollector(config Config) *Collector {
+	required, collected, valid := normalizeUnitSelection(config.RequiredUnits, config.CollectedUnits)
 	collector := &Collector{
 		coverage: Coverage{
-			RequiredUnits: config.RequiredUnits,
+			RequiredUnits:  required,
+			CollectedUnits: collected,
 		},
-		retainDetails: config.RetainDetails,
+		retainDetails:      config.RetainDetails,
+		configurationValid: valid,
 	}
-	if config.RequiredUnits == 0 || !config.RequiredUnits.valid() {
+	if !valid {
 		collector.invalidReason = ReasonInvalidConfiguration
 	}
 	if config.Weights != nil {
 		collector.weights = *config.Weights
 		collector.hasWeights = true
 		for i, weight := range collector.weights {
-			if config.RequiredUnits&UnitKind(i).Mask() == 0 {
+			if required&UnitKind(i).Mask() == 0 {
 				continue
 			}
 			if !validNumber(weight) {
 				collector.invalidReason = ReasonInvalidConfiguration
+				collector.configurationValid = false
 				break
 			}
 		}
@@ -92,8 +100,9 @@ func NewCollector(config Config) *Collector {
 	return collector
 }
 
-// Add adds one finite, nonnegative delta. It does not mark the corresponding
-// unit present. It returns false for invalid or late observations.
+// Add adds one finite, nonnegative delta for a collected unit. It does not mark
+// the corresponding unit present. It returns false without mutation for a valid
+// uncollected unit, and returns false for invalid or late observations.
 func (c *Collector) Add(kind UnitKind, delta float64) bool {
 	if c == nil {
 		return false
@@ -107,19 +116,16 @@ func (c *Collector) Add(kind UnitKind, delta float64) bool {
 		c.markInvalidLocked(ReasonInvalidObservation, 0)
 		return false
 	}
-	if !validNumber(delta) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.finalized {
-			return false
-		}
-		c.markInvalidLocked(ReasonInvalidObservation, kind.Mask())
-		return false
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.finalized {
+		return false
+	}
+	if c.coverage.CollectedUnits&kind.Mask() == 0 {
+		return false
+	}
+	if !validNumber(delta) {
+		c.markInvalidLocked(ReasonInvalidObservation, kind.Mask())
 		return false
 	}
 	next, ok := checkedAdd(c.values[kind], delta)
@@ -132,9 +138,10 @@ func (c *Collector) Add(kind UnitKind, delta float64) bool {
 }
 
 // AcceptVector atomically adds one fixed vector. Either every finite,
-// nonnegative slot is accepted under one lock or no value is changed. Invalid
-// or overflowing vectors invalidate the collector and return false. Evidence
-// remains the responsibility of the statement-level coordinator.
+// nonnegative collected slot is accepted under one lock or no value is changed.
+// A nonzero uncollected slot is rejected without mutation. Invalid or
+// overflowing collected slots invalidate the applicable unit and return false.
+// Evidence remains the responsibility of the statement-level coordinator.
 func (c *Collector) AcceptVector(values UnitValues) bool {
 	if c == nil {
 		return false
@@ -145,9 +152,19 @@ func (c *Collector) AcceptVector(values UnitValues) bool {
 		return false
 	}
 
+	collected := c.coverage.CollectedUnits
+	for i, delta := range values {
+		if collected&UnitKind(i).Mask() == 0 && delta != 0 {
+			return false
+		}
+	}
+
 	next := c.values
 	for i, delta := range values {
 		kind := UnitKind(i)
+		if collected&kind.Mask() == 0 {
+			continue
+		}
 		if !validNumber(delta) {
 			c.markInvalidLocked(ReasonInvalidObservation, kind.Mask())
 			return false
@@ -163,9 +180,9 @@ func (c *Collector) AcceptVector(values UnitValues) bool {
 	return true
 }
 
-// MarkPresent marks units whose complete evidence is available. Presence is
-// sticky and does not clear a previously recorded partial or unavailable state.
-// An empty mask is an accepted no-op.
+// MarkPresent marks collected units whose complete evidence is available.
+// Presence is sticky and does not clear a previously recorded partial or
+// unavailable state. An empty mask is an accepted no-op.
 func (c *Collector) MarkPresent(units UnitMask) bool {
 	return c.markEvidence(units, evidencePresent)
 }
@@ -212,6 +229,9 @@ func (c *Collector) markEvidence(units UnitMask, mark evidenceMark) bool {
 	}
 	if units == 0 {
 		return true
+	}
+	if units&^c.coverage.CollectedUnits != 0 {
+		return false
 	}
 	switch mark {
 	case evidencePresent:
@@ -336,4 +356,14 @@ func (c *Collector) retainResultDetails(result Result) Result {
 		}
 	}
 	return result
+}
+
+func normalizeUnitSelection(required, collected UnitMask) (UnitMask, UnitMask, bool) {
+	resolvedCollected := collected
+	if resolvedCollected == 0 {
+		resolvedCollected = required
+	}
+	valid := required != 0 && required.valid() && resolvedCollected != 0 && resolvedCollected.valid() &&
+		required&^resolvedCollected == 0
+	return required & AllUnits, resolvedCollected & AllUnits, valid
 }

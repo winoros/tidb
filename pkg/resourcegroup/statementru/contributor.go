@@ -18,11 +18,18 @@ import "sync"
 
 // UnitContributorRegistrar registers statement-owned contributors before
 // their physical work starts. Producers must terminate every registered
-// contributor before Statement.Finish; finalization does not wait for them.
+// contributor before Statement.Finish; finalization does not wait for them. A
+// lease must belong wholly to the required or optional unit class. A rejected
+// mixed-class lease makes its required intersection sticky partial so a caller
+// cannot accidentally turn omitted required work into an authoritative zero.
 type UnitContributorRegistrar interface {
-	// RequiredUnits returns the immutable statement-local unit selection so a
-	// producer can avoid installing owners for units that are not requested.
+	// RequiredUnits returns the immutable candidate-total mask. Multi-unit
+	// producers use it with CollectedUnits to keep each lease wholly within the
+	// required or optional class.
 	RequiredUnits() UnitMask
+	// CollectedUnits returns the immutable statement-local instrumentation mask
+	// so a producer can avoid installing owners for units that are not requested.
+	CollectedUnits() UnitMask
 	RegisterUnitContributor(UnitMask) UnitContributor
 }
 
@@ -41,13 +48,15 @@ type UnitContributor interface {
 type contributorCoordinator struct {
 	mu sync.Mutex
 
-	collector   *Collector
-	sealed      bool
-	registered  [UnitCount]uint64
-	completed   [UnitCount]uint64
-	partial     UnitMask
-	unavailable UnitMask
-	unsupported UnitMask
+	collector      *Collector
+	requiredUnits  UnitMask
+	collectedUnits UnitMask
+	sealed         bool
+	registered     [UnitCount]uint64
+	completed      [UnitCount]uint64
+	partial        UnitMask
+	unavailable    UnitMask
+	unsupported    UnitMask
 }
 
 type statementContributorRegistrar struct {
@@ -59,6 +68,13 @@ func (r *statementContributorRegistrar) RequiredUnits() UnitMask {
 		return 0
 	}
 	return r.statement.requiredUnits
+}
+
+func (r *statementContributorRegistrar) CollectedUnits() UnitMask {
+	if r == nil || r.statement == nil {
+		return 0
+	}
+	return r.statement.collectedUnits
 }
 
 func (r *statementContributorRegistrar) RegisterUnitContributor(units UnitMask) UnitContributor {
@@ -77,7 +93,11 @@ func (s *Statement) registerUnitContributor(units UnitMask) UnitContributor {
 			return nil
 		}
 		if coordinator == nil {
-			candidate := &contributorCoordinator{collector: s.collector}
+			candidate := &contributorCoordinator{
+				collector:      s.collector,
+				requiredUnits:  s.requiredUnits,
+				collectedUnits: s.collectedUnits,
+			}
 			if !s.contributors.CompareAndSwap(nil, candidate) {
 				continue
 			}
@@ -168,6 +188,16 @@ func (c *contributorCoordinator) register(units UnitMask) UnitContributor {
 	if c.sealed {
 		return nil
 	}
+	required := units & c.requiredUnits
+	if units&^c.collectedUnits != 0 {
+		c.partial |= required
+		return nil
+	}
+	optional := units &^ c.requiredUnits
+	if required != 0 && optional != 0 {
+		c.partial |= required
+		return nil
+	}
 	forEachUnit(units, func(kind UnitKind) {
 		c.registered[kind]++
 	})
@@ -189,7 +219,7 @@ func (c *contributorCoordinator) seal() {
 	for kind := UnitKind(0); kind < UnitKind(UnitCount); kind++ {
 		mask := kind.Mask()
 		registered := c.registered[kind]
-		if registered == 0 {
+		if registered == 0 && c.partial&mask == 0 {
 			continue
 		}
 		hasUnsupported := c.unsupported&mask != 0

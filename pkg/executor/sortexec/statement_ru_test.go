@@ -108,7 +108,9 @@ func configureStatementRUNonlinearForTest(t testing.TB, ctx sessionctx.Context, 
 		RequiredUnits: statementru.CPUWork.Mask(),
 		Weights:       &weights,
 	}))
-	require.True(t, exec.ConfigureStatementRUExecutor(executor, sc, exec.StatementRUExecutorConfig{NeedsUnitRecorder: true}))
+	require.True(t, exec.ConfigureStatementRUExecutor(executor, sc, exec.StatementRUExecutorConfig{
+		AdditionalUnits: statementru.CPUWork.Mask(),
+	}))
 	return sc.TakeStatementRUForExecution()
 }
 

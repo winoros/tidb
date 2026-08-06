@@ -69,6 +69,7 @@ func BenchmarkCloudSummaryPrepareOwnerLifecycle(b *testing.B) {
 		b.Fatal(err)
 	}
 	dctx := newCloudSummaryTestDistSQLContext()
+	scanWeights := statementru.Weights{statementru.ScanBytes: 1}
 
 	b.Run("Off", func(b *testing.B) {
 		dctx.StatementRUUnitContributors = nil
@@ -78,6 +79,45 @@ func BenchmarkCloudSummaryPrepareOwnerLifecycle(b *testing.B) {
 			if owner := prepareCloudSummaryOwner(dctx, request); owner != nil {
 				b.Fatal("Off mode created a cloud-summary owner")
 			}
+		}
+	})
+
+	b.Run("configured_uncollected", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			statement := statementru.NewStatement(statementru.Selection{
+				Mode:          statementru.ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: statementru.ScanBytes.Mask(),
+				Weights:       &scanWeights,
+			})
+			dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+			request := &kv.Request{Tp: kv.ReqTypeDAG, Data: dagData, StoreType: kv.TiKV}
+			if owner := prepareCloudSummaryOwner(dctx, request); owner != nil {
+				b.Fatal("uncollected CPU work created a cloud-summary owner")
+			}
+			statement.Finish(statementru.TerminalSuccess)
+		}
+	})
+
+	b.Run("optional_collected", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			statement := statementru.NewStatement(statementru.Selection{
+				Mode:           statementru.ModeResultOnly,
+				Applicable:     true,
+				RequiredUnits:  statementru.ScanBytes.Mask(),
+				CollectedUnits: statementru.ScanBytes.Mask() | statementru.CPUWork.Mask(),
+				Weights:        &scanWeights,
+			})
+			dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+			request := &kv.Request{Tp: kv.ReqTypeDAG, Data: dagData, StoreType: kv.TiKV}
+			owner := prepareCloudSummaryOwner(dctx, request)
+			if owner == nil {
+				b.Fatal("optional collected CPU work did not create a cloud-summary owner")
+			}
+			owner.abort()
+			statement.Finish(statementru.TerminalSuccess)
 		}
 	})
 

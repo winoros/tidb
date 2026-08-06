@@ -70,6 +70,7 @@ import (
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/planner/util/coreusage"
 	"github.com/pingcap/tidb/pkg/planner/util/partitionpruning"
+	"github.com/pingcap/tidb/pkg/resourcegroup/statementru"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -148,15 +149,15 @@ func (b *executorBuilder) configureStatementRUCPUWork(executor exec.Executor, mu
 	}
 }
 
-func (b *executorBuilder) configureStatementRUStateful(executor exec.Executor, multiplier int) {
+func (b *executorBuilder) configureStatementRUUnits(executor exec.Executor, multiplier int, additionalUnits statementru.UnitMask) {
 	if !b.statementRUCPUWorkEligible() {
 		return
 	}
 	if !exec.ConfigureStatementRUExecutor(executor, b.sctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: multiplier,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   additionalUnits,
 	}) {
-		b.err = errors.Errorf("cannot configure stateful statement RU work for executor %T with multiplier %d", executor, multiplier)
+		b.err = errors.Errorf("cannot configure statement RU units for executor %T with multiplier %d and additional units %d", executor, multiplier, additionalUnits)
 	}
 }
 
@@ -1838,7 +1839,7 @@ func (b *executorBuilder) buildMergeJoin(v *physicalop.PhysicalMergeJoin) exec.E
 
 	executor_metrics.ExecutorCounterMergeJoinExec.Inc()
 	if expressionCount, ok := statementRUMergeJoinExpressionCount(v); ok {
-		b.configureStatementRUStateful(e, expressionCount)
+		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
 	}
 	return e
 }
@@ -2068,7 +2069,7 @@ func (b *executorBuilder) buildHashJoin(v *physicalop.PhysicalHashJoin) exec.Exe
 	}
 	if e != nil {
 		if expressionCount, ok := statementRUHashJoinExpressionCount(v); ok {
-			b.configureStatementRUStateful(e, expressionCount)
+			b.configureStatementRUUnits(e, expressionCount, statementru.HashStateRows.Mask()|statementru.JoinOutputRows.Mask())
 		}
 	}
 	return e
@@ -2229,7 +2230,7 @@ func (b *executorBuilder) buildHashAgg(v *physicalop.PhysicalHashAgg) exec.Execu
 		return nil
 	}
 	e := b.buildHashAggFromChildExec(src, v)
-	b.configureStatementRUStateful(e, len(v.GroupByItems)+len(v.AggFuncs))
+	b.configureStatementRUUnits(e, len(v.GroupByItems)+len(v.AggFuncs), statementru.HashStateRows.Mask())
 	return e
 }
 
@@ -2816,7 +2817,7 @@ func (b *executorBuilder) buildSort(v *physicalop.PhysicalSort) exec.Executor {
 		ExecSchema:   v.Schema(),
 	}
 	executor_metrics.ExecutorCounterSortExec.Inc()
-	b.configureStatementRUStateful(&sortExec, 0)
+	b.configureStatementRUUnits(&sortExec, 0, statementru.CPUWork.Mask())
 	return &sortExec
 }
 
@@ -2858,7 +2859,7 @@ func (b *executorBuilder) buildTopN(v *physicalop.PhysicalTopN) exec.Executor {
 		t.RankInfo.TruncateKeyPrefixCharCounts = make([]int, 0, 1)
 		t.RankInfo.TruncateKeyPrefixCharCounts = append(t.RankInfo.TruncateKeyPrefixCharCounts, v.PrefixLen)
 	}
-	b.configureStatementRUStateful(t, 0)
+	b.configureStatementRUUnits(t, 0, statementru.CPUWork.Mask())
 	return t
 }
 
@@ -3619,7 +3620,7 @@ func (b *executorBuilder) buildIndexLookUpJoin(v *physicalop.PhysicalIndexJoin) 
 		return nil
 	}
 	if expressionCount, ok := statementRUIndexJoinExpressionCount(v); ok {
-		b.configureStatementRUStateful(e, expressionCount)
+		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
 	}
 	return e
 }
@@ -3872,7 +3873,7 @@ func (b *executorBuilder) buildIndexLookUpMergeJoin(v *physicalop.PhysicalIndexM
 	}
 	e.Joiners = joiners
 	if expressionCount, ok := statementRUIndexMergeJoinExpressionCount(v); ok {
-		b.configureStatementRUStateful(e, expressionCount)
+		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
 	}
 	return e
 }
@@ -3892,7 +3893,7 @@ func (b *executorBuilder) buildIndexNestedLoopHashJoin(v *physicalop.PhysicalInd
 		idxHash.Joiners[i] = e.Joiner.Clone()
 	}
 	if expressionCount, ok := statementRUIndexHashJoinExpressionCount(v); ok {
-		b.configureStatementRUStateful(idxHash, expressionCount)
+		b.configureStatementRUUnits(idxHash, expressionCount, statementru.JoinOutputRows.Mask())
 	}
 	return idxHash
 }

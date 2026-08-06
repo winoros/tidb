@@ -174,13 +174,16 @@ func BenchmarkStatementCalibrationDiagnosticLifecycle(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		statement := NewStatement(Selection{
-			Mode:          ModeCalibration,
-			Applicable:    true,
-			RequiredUnits: CPUWork.Mask(),
-			Weights:       &weights,
+			Mode:           ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | NetworkBytes.Mask(),
+			Weights:        &weights,
 		})
 		statement.UnitRecorder().Add(CPUWork, 1)
+		statement.UnitRecorder().Add(NetworkBytes, 2)
 		statement.EvidenceRecorder().MarkPresent(CPUWork.Mask())
+		statement.EvidenceRecorder().MarkPresent(NetworkBytes.Mask())
 		finish, _ := statement.Finish(TerminalSuccess)
 		benchmarkDiagnostic, _ = finish.Diagnostic()
 	}

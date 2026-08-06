@@ -322,17 +322,58 @@ func TestStatementRUPointReadWaitsForReadPhase(t *testing.T) {
 
 func TestStatementRUPointReadIgnoresUnrequestedScanBytes(t *testing.T) {
 	weights := statementru.Weights{statementru.CPUWork: 1}
-	sc := stmtctx.NewStmtCtx()
-	require.True(t, sc.ConfigureStatementRU(statementru.Selection{
-		Mode:          statementru.ModeCalibration,
-		Applicable:    true,
-		RequiredUnits: statementru.CPUWork.Mask(),
-		Weights:       &weights,
-	}))
-	attachment := prepareStatementRUPointRead(sc, nil, true)
-	require.Nil(t, attachment.stats)
-	require.Nil(t, attachment.owner)
-	require.Nil(t, attachment.registry)
+	for _, test := range []struct {
+		name      string
+		collected statementru.UnitMask
+		wantOwner bool
+	}{
+		{name: "zero defaults to required"},
+		{name: "explicit required-only mask", collected: statementru.CPUWork.Mask()},
+		{
+			name:      "optional collected scan activates owner",
+			collected: statementru.CPUWork.Mask() | statementru.ScanBytes.Mask(),
+			wantOwner: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sc := stmtctx.NewStmtCtx()
+			require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+				Mode:           statementru.ModeCalibration,
+				Applicable:     true,
+				RequiredUnits:  statementru.CPUWork.Mask(),
+				CollectedUnits: test.collected,
+				Weights:        &weights,
+			}))
+			attachment := prepareStatementRUPointRead(sc, nil, true)
+			require.Equal(t, test.wantOwner, attachment.owner != nil)
+			require.Equal(t, test.wantOwner, attachment.stats != nil)
+			require.Equal(t, test.wantOwner, attachment.registry != nil)
+
+			statement := sc.TakeStatementRUForExecution()
+			require.NotNil(t, statement)
+			cpu := statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.CPUWork.Mask())
+			require.NotNil(t, cpu)
+			var values statementru.UnitValues
+			values[statementru.CPUWork] = 7
+			require.True(t, cpu.Complete(values))
+			if attachment.owner != nil {
+				attachment.owner.finish(false)
+			}
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+			total, ok := finish.Result.TotalRU()
+			require.True(t, ok)
+			require.Equal(t, float64(7), total)
+			coverage, ok := finish.Result.Coverage()
+			require.True(t, ok)
+			if test.wantOwner {
+				require.Equal(t, statementru.ScanBytes.Mask(), coverage.UnavailableUnits)
+			} else {
+				require.Zero(t, coverage.UnavailableUnits)
+			}
+		})
+	}
 }
 
 func TestStatementRUPointReadSharedSnapshotFailsClosed(t *testing.T) {

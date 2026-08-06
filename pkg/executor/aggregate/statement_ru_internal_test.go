@@ -99,7 +99,7 @@ func newStatementRUOverflowHashAgg(t *testing.T) (*HashAggExec, *statementru.Sta
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, sc, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: 1,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   statementru.HashStateRows.Mask(),
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
@@ -233,7 +233,7 @@ func newBlockedParallelStatementRUHashAgg(t *testing.T) (*HashAggExec, *statemen
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, sc, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: 1,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   statementru.HashStateRows.Mask(),
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
@@ -434,7 +434,7 @@ func newReopenStatementRUHashAgg(t *testing.T) (*HashAggExec, *statementru.State
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, sc, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: 1,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   statementru.HashStateRows.Mask(),
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
@@ -640,7 +640,7 @@ func newSerialGenerationStatementRUHashAgg(t *testing.T) (*HashAggExec, *stateme
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, sc, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: 1,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   statementru.HashStateRows.Mask(),
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)

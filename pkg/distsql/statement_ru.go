@@ -69,14 +69,19 @@ func markMPPStatementRUUnsupported(dctx *distsqlctx.DistSQLContext) {
 	if dctx == nil || dctx.StatementRUUnitContributors == nil {
 		return
 	}
-	units := dctx.StatementRUUnitContributors.RequiredUnits() &
+	units := dctx.StatementRUUnitContributors.CollectedUnits() &
 		(statementru.CPUWork.Mask() | statementru.ScanBytes.Mask())
-	if units == 0 {
-		return
-	}
-	contributor := dctx.StatementRUUnitContributors.RegisterUnitContributor(units)
-	if contributor != nil {
-		contributor.Unsupported()
+	// CPU work can be required while scan bytes is optional (or vice versa).
+	// Register one lease per unit so the registrar never has to accept a mixed
+	// required/optional lease merely to fail an unsupported MPP path closed.
+	for _, unit := range []statementru.UnitMask{statementru.CPUWork.Mask(), statementru.ScanBytes.Mask()} {
+		if units&unit == 0 {
+			continue
+		}
+		contributor := dctx.StatementRUUnitContributors.RegisterUnitContributor(unit)
+		if contributor != nil {
+			contributor.Unsupported()
+		}
 	}
 }
 
@@ -84,7 +89,7 @@ func prepareRangeScanByteEstimateOwner(dctx *distsqlctx.DistSQLContext, request 
 	if dctx == nil || request == nil || dctx.StatementRUUnitContributors == nil || request.Tp != kv.ReqTypeDAG {
 		return nil
 	}
-	if dctx.StatementRUUnitContributors.RequiredUnits()&statementru.ScanBytes.Mask() == 0 {
+	if dctx.StatementRUUnitContributors.CollectedUnits()&statementru.ScanBytes.Mask() == 0 {
 		return nil
 	}
 	contributor := dctx.StatementRUUnitContributors.RegisterUnitContributor(statementru.ScanBytes.Mask())
@@ -107,30 +112,36 @@ func prepareCloudSummaryOwner(dctx *distsqlctx.DistSQLContext, request *kv.Reque
 	if dctx == nil || request == nil || dctx.StatementRUUnitContributors == nil || request.Tp != kv.ReqTypeDAG {
 		return nil
 	}
-	requiredUnits := dctx.StatementRUUnitContributors.RequiredUnits()
-	cpuRequired := requiredUnits&statementru.CPUWork.Mask() != 0
-	hashStateRequired := requiredUnits&statementru.HashStateRows.Mask() != 0
-	if !cpuRequired && !hashStateRequired {
+	collectedUnits := dctx.StatementRUUnitContributors.CollectedUnits()
+	collectCPU := collectedUnits&statementru.CPUWork.Mask() != 0
+	collectHashState := collectedUnits&statementru.HashStateRows.Mask() != 0
+	if !collectCPU && !collectHashState {
 		return nil
 	}
 	if request.StoreType != kv.TiKV || request.BatchCop {
-		if cpuRequired {
+		if collectCPU {
 			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnsupported)
+		}
+		if collectHashState {
+			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.HashStateRows.Mask(), cloudSummaryPlanUnsupported)
 		}
 		return nil
 	}
 
 	var dag tipb.DAGRequest
 	if err := dag.Unmarshal(request.Data); err != nil {
-		if cpuRequired {
+		if collectCPU {
 			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.CPUWork.Mask(), cloudSummaryPlanUnavailable)
+		}
+		if collectHashState {
+			finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.HashStateRows.Mask(), cloudSummaryPlanUnavailable)
 		}
 		return nil
 	}
-	if hashStateRequired && dagHasHashAggregation(&dag) {
+	if collectHashState && dagHasHashAggregation(&dag) {
 		finishImmediateCloudSummaryContributor(dctx.StatementRUUnitContributors, statementru.HashStateRows.Mask(), cloudSummaryPlanUnsupported)
 	}
-	if !cpuRequired {
+	if !collectCPU {
 		return nil
 	}
 	plan, status := freezeCloudSummaryPlan(&dag)

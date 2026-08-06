@@ -2157,8 +2157,9 @@ func BenchmarkStatementRUMutationPreparation(b *testing.B) {
 			b.Error(err)
 		}
 	})
-	weights := statementru.Weights{statementru.CPUWork: 1}
-	newLazyTxn := func(b *testing.B, enabled bool) (*LazyTxn, kv.Transaction) {
+	cpuWeights := statementru.Weights{statementru.CPUWork: 1}
+	networkWeights := statementru.Weights{statementru.NetworkBytes: 1}
+	newLazyTxn := func(b *testing.B, mode string) (*LazyTxn, kv.Transaction) {
 		inner, err := store.Begin()
 		if err != nil {
 			b.Fatal(err)
@@ -2167,13 +2168,28 @@ func BenchmarkStatementRUMutationPreparation(b *testing.B) {
 			_ = inner.Rollback()
 		})
 		sc := stmtctx.NewStmtCtx()
-		if enabled && !sc.ConfigureStatementRU(statementru.Selection{
-			Mode:          statementru.ModeResultOnly,
-			Applicable:    true,
-			RequiredUnits: statementru.CPUWork.Mask(),
-			Weights:       &weights,
-		}) {
-			b.Fatal("statement RU configuration rejected")
+		switch mode {
+		case "off":
+		case "collected_disjoint":
+			if !sc.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: statementru.NetworkBytes.Mask(),
+				Weights:       &networkWeights,
+			}) {
+				b.Fatal("statement RU disjoint configuration rejected")
+			}
+		case "result_only":
+			if !sc.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: statementru.CPUWork.Mask(),
+				Weights:       &cpuWeights,
+			}) {
+				b.Fatal("statement RU configuration rejected")
+			}
+		default:
+			b.Fatalf("unknown statement RU benchmark mode %q", mode)
 		}
 		lazyTxn := &LazyTxn{Transaction: inner}
 		lazyTxn.bindStatementRU(&variable.SessionVars{StmtCtx: sc})
@@ -2181,20 +2197,16 @@ func BenchmarkStatementRUMutationPreparation(b *testing.B) {
 	}
 
 	b.Run("buffer_get/inner_direct", func(b *testing.B) {
-		_, inner := newLazyTxn(b, false)
+		_, inner := newLazyTxn(b, "off")
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {
 			statementRUMemBufferBenchSink = inner.GetMemBuffer()
 		}
 	})
-	for _, enabled := range []bool{false, true} {
-		name := "off"
-		if enabled {
-			name = "result_only"
-		}
-		b.Run("buffer_get/"+name, func(b *testing.B) {
-			lazyTxn, _ := newLazyTxn(b, enabled)
+	for _, mode := range []string{"off", "collected_disjoint", "result_only"} {
+		b.Run("buffer_get/"+mode, func(b *testing.B) {
+			lazyTxn, _ := newLazyTxn(b, mode)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -2213,14 +2225,10 @@ func BenchmarkStatementRUMutationPreparation(b *testing.B) {
 			if getterPerMutation {
 				shape = "getter_per_mutation"
 			}
-			for _, enabled := range []bool{false, true} {
-				mode := "off"
-				if enabled {
-					mode = "result_only"
-				}
+			for _, mode := range []string{"off", "collected_disjoint", "result_only"} {
 				name := fmt.Sprintf("%s_%d/%s", shape, mutationCount, mode)
 				b.Run(name, func(b *testing.B) {
-					lazyTxn, inner := newLazyTxn(b, enabled)
+					lazyTxn, inner := newLazyTxn(b, mode)
 					value := []byte("value")
 					warmupBuffer := inner.GetMemBuffer()
 					for i, key := range keys {

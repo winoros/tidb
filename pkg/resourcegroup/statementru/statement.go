@@ -54,13 +54,16 @@ type Reporter interface {
 // Selection is the statement-local decision frozen before execution. Applicable
 // distinguishes lifecycle eligibility from evidence support: an inapplicable
 // statement selects true Off, while an applicable statement whose selected unit
-// producer is unsupported uses EvidenceRecorder.MarkUnsupported.
+// producer is unsupported uses EvidenceRecorder.MarkUnsupported. RequiredUnits
+// is the nonempty candidate-total mask. CollectedUnits may be its superset for
+// optional diagnostics; zero defaults to RequiredUnits.
 type Selection struct {
-	Mode          Mode
-	Applicable    bool
-	RequiredUnits UnitMask
-	Weights       *Weights
-	Reporter      Reporter
+	Mode           Mode
+	Applicable     bool
+	RequiredUnits  UnitMask
+	CollectedUnits UnitMask
+	Weights        *Weights
+	Reporter       Reporter
 }
 
 // TerminalStatus is the bounded final logical-statement status.
@@ -87,14 +90,16 @@ type FinishResult struct {
 // Statement owns one logical statement's collector and exactly-once finish.
 // Transparent retries keep using the same Statement.
 type Statement struct {
-	mode          Mode
-	requiredUnits UnitMask
-	collector     *Collector
-	reporter      Reporter
-	unit          statementUnitRecorder
-	evidence      statementEvidenceRecorder
-	contributors  atomic.Pointer[contributorCoordinator]
-	registrar     statementContributorRegistrar
+	mode                 Mode
+	requiredUnits        UnitMask
+	collectedUnits       UnitMask
+	producerCapabilities bool
+	collector            *Collector
+	reporter             Reporter
+	unit                 statementUnitRecorder
+	evidence             statementEvidenceRecorder
+	contributors         atomic.Pointer[contributorCoordinator]
+	registrar            statementContributorRegistrar
 
 	finishOnce sync.Once
 	finish     FinishResult
@@ -104,11 +109,21 @@ type Statement struct {
 // interfaces. Returning Collector directly would let producers type-assert to
 // Finalize or to the other recorder interface.
 type statementUnitRecorder struct {
-	collector *Collector
+	statement *Statement
+}
+
+func (r *statementUnitRecorder) CollectedUnits() UnitMask {
+	if r == nil || r.statement == nil {
+		return 0
+	}
+	return r.statement.collectedUnits
 }
 
 func (r *statementUnitRecorder) Add(kind UnitKind, delta float64) bool {
-	return r.collector.Add(kind, delta)
+	if r == nil || r.statement == nil {
+		return false
+	}
+	return r.statement.collector.Add(kind, delta)
 }
 
 type statementEvidenceRecorder struct {
@@ -132,25 +147,30 @@ func (r *statementEvidenceRecorder) MarkUnsupported(units UnitMask) bool {
 }
 
 // NewStatement translates a frozen selection into a statement owner. Off,
-// inapplicable, and invalid modes return nil without allocating. Invalid modes
-// fail closed because no supported collection contract was selected.
+// inapplicable, and invalid modes return nil without allocating. A valid enabled
+// mode with invalid unit configuration returns an owner whose Finish result is
+// InvalidConfiguration, but exposes no producer capabilities.
 func NewStatement(selection Selection) *Statement {
 	if selection.Mode == ModeOff || !selection.Mode.valid() || !selection.Applicable {
 		return nil
 	}
+	required, collected, _ := normalizeUnitSelection(selection.RequiredUnits, selection.CollectedUnits)
 	retainDetails := selection.Mode == ModeCalibration || selection.Mode == ModeExplain
 	collector := NewCollector(Config{
-		RequiredUnits: selection.RequiredUnits,
-		Weights:       selection.Weights,
-		RetainDetails: retainDetails,
+		RequiredUnits:  selection.RequiredUnits,
+		CollectedUnits: selection.CollectedUnits,
+		Weights:        selection.Weights,
+		RetainDetails:  retainDetails,
 	})
 	statement := &Statement{
-		mode:          selection.Mode,
-		requiredUnits: selection.RequiredUnits,
-		collector:     collector,
-		reporter:      selection.Reporter,
+		mode:                 selection.Mode,
+		requiredUnits:        required,
+		collectedUnits:       collected,
+		producerCapabilities: collector.configurationValid,
+		collector:            collector,
+		reporter:             selection.Reporter,
 	}
-	statement.unit.collector = collector
+	statement.unit.statement = statement
 	statement.evidence.collector = collector
 	statement.registrar.statement = statement
 	return statement
@@ -166,7 +186,7 @@ func (s *Statement) Mode() Mode {
 
 // UnitRecorder returns the narrow value-recording seam for unit producers.
 func (s *Statement) UnitRecorder() UnitRecorder {
-	if s == nil {
+	if s == nil || !s.producerCapabilities {
 		return nil
 	}
 	return &s.unit
@@ -174,7 +194,7 @@ func (s *Statement) UnitRecorder() UnitRecorder {
 
 // EvidenceRecorder returns the statement-level coverage-coordination seam.
 func (s *Statement) EvidenceRecorder() EvidenceRecorder {
-	if s == nil {
+	if s == nil || !s.producerCapabilities {
 		return nil
 	}
 	return &s.evidence
@@ -183,7 +203,7 @@ func (s *Statement) EvidenceRecorder() EvidenceRecorder {
 // UnitContributorRegistrar returns the statement-owned contributor lifecycle
 // capability. It does not expose finalization or direct evidence mutation.
 func (s *Statement) UnitContributorRegistrar() UnitContributorRegistrar {
-	if s == nil {
+	if s == nil || !s.producerCapabilities {
 		return nil
 	}
 	return &s.registrar

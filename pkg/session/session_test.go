@@ -174,6 +174,38 @@ func TestStatementRUMutationPreparationCollection(t *testing.T) {
 	vars.StmtCtx = offSC
 	require.Same(t, inner.GetMemBuffer(), lazyTxn.GetMemBuffer())
 
+	nonCPUWeights := statementru.Weights{statementru.NetworkBytes: 1}
+	nonCPU := stmtctx.NewStmtCtx()
+	require.True(t, nonCPU.ConfigureStatementRU(statementru.Selection{
+		Mode:          statementru.ModeCalibration,
+		Applicable:    true,
+		RequiredUnits: statementru.NetworkBytes.Mask(),
+		Weights:       &nonCPUWeights,
+	}))
+	vars.StmtCtx = nonCPU
+	require.Nil(t, lazyTxn.statementRUCPUWorkRecorder())
+	require.Same(t, inner.GetMemBuffer(), lazyTxn.GetMemBuffer())
+
+	optionalCPU := stmtctx.NewStmtCtx()
+	require.True(t, optionalCPU.ConfigureStatementRU(statementru.Selection{
+		Mode:           statementru.ModeCalibration,
+		Applicable:     true,
+		RequiredUnits:  statementru.NetworkBytes.Mask(),
+		CollectedUnits: statementru.NetworkBytes.Mask() | statementru.CPUWork.Mask(),
+		Weights:        &nonCPUWeights,
+	}))
+	vars.StmtCtx = optionalCPU
+	require.NotNil(t, lazyTxn.statementRUCPUWorkRecorder())
+	require.Same(t, buffer, lazyTxn.GetMemBuffer())
+	require.NoError(t, lazyTxn.Set(kv.Key("optional-cpu"), []byte("value")))
+	optionalStatement := optionalCPU.TakeStatementRUForExecution()
+	require.True(t, optionalStatement.EvidenceRecorder().MarkPresent(statementru.NetworkBytes.Mask()|statementru.CPUWork.Mask()))
+	optionalFinish, first := optionalStatement.Finish(statementru.TerminalSuccess)
+	require.True(t, first)
+	optionalUnits, ok := optionalFinish.Result.Units()
+	require.True(t, ok)
+	require.Equal(t, float64(1), optionalUnits[statementru.CPUWork])
+
 	history := stmtctx.NewStmtCtx()
 	target := stmtctx.NewStmtCtx()
 	require.True(t, history.ConfigureStatementRU(statementru.Selection{

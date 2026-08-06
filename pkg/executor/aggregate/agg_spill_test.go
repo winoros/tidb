@@ -528,7 +528,7 @@ func configureStatementRUForHashAggTest(t testing.TB, ctx sessionctx.Context, ag
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(aggExec, ctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
 		CPUWorkMultiplier: multiplier,
-		NeedsUnitRecorder: true,
+		AdditionalUnits:   statementru.HashStateRows.Mask(),
 	}))
 	statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
 	require.NotNil(t, statement)

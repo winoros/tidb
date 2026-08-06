@@ -14,11 +14,14 @@
 
 package statementru
 
-// Coverage is a frozen, bounded summary of statement evidence. Partial,
-// unavailable, unsupported, and invalid masks retain per-unit diagnostic causes;
-// only their intersections with RequiredUnits affect production eligibility.
+// Coverage is a frozen, bounded summary of statement evidence. RequiredUnits
+// determines candidate-total eligibility, while CollectedUnits is the superset
+// producers were allowed to observe. Partial, unavailable, unsupported, and
+// invalid masks retain per-unit diagnostic causes; only their intersections
+// with RequiredUnits affect production eligibility.
 type Coverage struct {
 	RequiredUnits    UnitMask
+	CollectedUnits   UnitMask
 	PresentUnits     UnitMask
 	PartialUnits     UnitMask
 	UnavailableUnits UnitMask

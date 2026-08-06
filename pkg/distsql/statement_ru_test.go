@@ -281,6 +281,81 @@ func TestPrepareRangeScanByteEstimateOwner(t *testing.T) {
 	})
 	dctx.StatementRUUnitContributors = cpuOnly.UnitContributorRegistrar()
 	require.Nil(t, prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiKV}))
+
+	newCPUStatement := func(collected statementru.UnitMask) *statementru.Statement {
+		return statementru.NewStatement(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.CPUWork.Mask(),
+			CollectedUnits: collected,
+			Weights:        &cpuWeights,
+		})
+	}
+	completeCPU := func(t *testing.T, statement *statementru.Statement, value float64) {
+		t.Helper()
+		contributor := statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.CPUWork.Mask())
+		require.NotNil(t, contributor)
+		var values statementru.UnitValues
+		values[statementru.CPUWork] = value
+		require.True(t, contributor.Complete(values))
+	}
+
+	for _, test := range []struct {
+		name      string
+		collected statementru.UnitMask
+	}{
+		{name: "zero defaults to required", collected: 0},
+		{name: "explicit required-only mask", collected: statementru.CPUWork.Mask()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statement := newCPUStatement(test.collected)
+			dctx := newCloudSummaryTestDistSQLContext()
+			dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+			require.Nil(t, prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiKV}))
+			completeCPU(t, statement, 7)
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			total, ok := finish.Result.TotalRU()
+			require.True(t, ok)
+			require.Equal(t, float64(7), total)
+		})
+	}
+
+	t.Run("optional collected scan activates owner", func(t *testing.T) {
+		statement := newCPUStatement(statementru.CPUWork.Mask() | statementru.ScanBytes.Mask())
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		owner := prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiKV})
+		require.NotNil(t, owner)
+		owner.observeResponse(completeScanDetailV2TestStats(4, 2, 6))
+		owner.completeEOF()
+		completeCPU(t, statement, 7)
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(7), total)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Equal(t, statementru.CPUWork.Mask()|statementru.ScanBytes.Mask(), coverage.PresentUnits)
+	})
+
+	t.Run("optional scan failure remains diagnostic", func(t *testing.T) {
+		statement := newCPUStatement(statementru.CPUWork.Mask() | statementru.ScanBytes.Mask())
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		require.Nil(t, prepareRangeScanByteEstimateOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, StoreType: kv.TiFlash}))
+		completeCPU(t, statement, 7)
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(7), total)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Equal(t, statementru.ScanBytes.Mask(), coverage.UnsupportedUnits)
+	})
 }
 
 func TestCloudSummaryScanProtoCompatibility(t *testing.T) {
@@ -404,6 +479,136 @@ func TestPrepareCloudSummaryOwner(t *testing.T) {
 		State:  statementru.StateUnavailable,
 		Reason: statementru.ReasonUnsupported,
 	}, hashFinish.Result.Outcome())
+
+	t.Run("optional collected CPU activates owner", func(t *testing.T) {
+		statement := statementru.NewStatement(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.ScanBytes.Mask(),
+			CollectedUnits: statementru.ScanBytes.Mask() | statementru.CPUWork.Mask(),
+			Weights:        &scanWeights,
+		})
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		owner := prepareCloudSummaryOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, Data: data, StoreType: kv.TiKV})
+		require.NotNil(t, owner)
+		owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
+		owner.completeEOF()
+		scan := statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.ScanBytes.Mask())
+		require.NotNil(t, scan)
+		var values statementru.UnitValues
+		values[statementru.ScanBytes] = 5
+		require.True(t, scan.Complete(values))
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(5), total)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Equal(t, statementru.CPUWork.Mask()|statementru.ScanBytes.Mask(), coverage.PresentUnits)
+	})
+
+	t.Run("optional hash-state failure remains diagnostic", func(t *testing.T) {
+		weights := statementru.Weights{statementru.CPUWork: 1}
+		statement := statementru.NewStatement(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.CPUWork.Mask(),
+			CollectedUnits: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+			Weights:        &weights,
+		})
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		owner := prepareCloudSummaryOwner(dctx, &kv.Request{Tp: kv.ReqTypeDAG, Data: hashData, StoreType: kv.TiKV})
+		require.NotNil(t, owner)
+		owner.observeResponse(cloudSummaryTestResponse(10, 5, 4, 3), completeSingleCopResponseTestStats())
+		owner.completeEOF()
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+		total, ok := finish.Result.TotalRU()
+		require.True(t, ok)
+		require.Equal(t, float64(39), total)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Equal(t, statementru.HashStateRows.Mask(), coverage.UnsupportedUnits)
+	})
+
+	t.Run("early failures terminate every collected cloud unit", func(t *testing.T) {
+		for _, test := range []struct {
+			name                string
+			required            statementru.UnitMask
+			collected           statementru.UnitMask
+			request             *kv.Request
+			expectedUnavailable statementru.UnitMask
+			expectedUnsupported statementru.UnitMask
+			expectedReason      statementru.Reason
+		}{
+			{
+				name:                "hash-only unsupported store",
+				required:            statementru.HashStateRows.Mask(),
+				request:             &kv.Request{Tp: kv.ReqTypeDAG, Data: hashData, StoreType: kv.TiFlash},
+				expectedUnavailable: statementru.HashStateRows.Mask(),
+				expectedUnsupported: statementru.HashStateRows.Mask(),
+				expectedReason:      statementru.ReasonUnsupported,
+			},
+			{
+				name:                "hash-only malformed DAG",
+				required:            statementru.HashStateRows.Mask(),
+				request:             &kv.Request{Tp: kv.ReqTypeDAG, Data: []byte("malformed"), StoreType: kv.TiKV},
+				expectedUnavailable: statementru.HashStateRows.Mask(),
+				expectedReason:      statementru.ReasonMissingEvidence,
+			},
+			{
+				name:                "required CPU and optional hash unsupported store",
+				required:            statementru.CPUWork.Mask(),
+				collected:           statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				request:             &kv.Request{Tp: kv.ReqTypeDAG, Data: hashData, StoreType: kv.TiFlash},
+				expectedUnavailable: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				expectedUnsupported: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				expectedReason:      statementru.ReasonUnsupported,
+			},
+			{
+				name:                "required CPU and optional hash malformed DAG",
+				required:            statementru.CPUWork.Mask(),
+				collected:           statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				request:             &kv.Request{Tp: kv.ReqTypeDAG, Data: []byte("malformed"), StoreType: kv.TiKV},
+				expectedUnavailable: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
+				expectedReason:      statementru.ReasonMissingEvidence,
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				weights := statementru.Weights{}
+				for kind := statementru.UnitKind(0); kind < statementru.UnitKind(statementru.UnitCount); kind++ {
+					if test.required&kind.Mask() != 0 {
+						weights[kind] = 1
+					}
+				}
+				statement := statementru.NewStatement(statementru.Selection{
+					Mode:           statementru.ModeCalibration,
+					Applicable:     true,
+					RequiredUnits:  test.required,
+					CollectedUnits: test.collected,
+					Weights:        &weights,
+				})
+				dctx := newCloudSummaryTestDistSQLContext()
+				dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+				require.Nil(t, prepareCloudSummaryOwner(dctx, test.request))
+
+				finish, first := statement.Finish(statementru.TerminalSuccess)
+				require.True(t, first)
+				require.Equal(t, statementru.Outcome{
+					State:  statementru.StateUnavailable,
+					Reason: test.expectedReason,
+				}, finish.Result.Outcome())
+				coverage, ok := finish.Result.Coverage()
+				require.True(t, ok)
+				require.Equal(t, test.expectedUnavailable, coverage.UnavailableUnits)
+				require.Equal(t, test.expectedUnsupported, coverage.UnsupportedUnits)
+			})
+		}
+	})
 }
 
 func TestSelectEnablesCloudSummaryCollection(t *testing.T) {
@@ -629,6 +834,30 @@ func TestGenSelectResultFromMPPResponseRejectsStatementRU(t *testing.T) {
 		State:  statementru.StateUnavailable,
 		Reason: statementru.ReasonUnsupported,
 	}, finish.Result.Outcome())
+
+	t.Run("required and optional units use separate unsupported leases", func(t *testing.T) {
+		statement := statementru.NewStatement(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.CPUWork.Mask(),
+			CollectedUnits: statementru.CPUWork.Mask() | statementru.ScanBytes.Mask(),
+			Weights:        &weights,
+		})
+		dctx := newCloudSummaryTestDistSQLContext()
+		dctx.StatementRUUnitContributors = statement.UnitContributorRegistrar()
+		result := GenSelectResultFromMPPResponse(dctx, nil, nil, 0, &cloudSummaryTestKVResponse{})
+		require.NoError(t, result.Close())
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StateUnavailable,
+			Reason: statementru.ReasonUnsupported,
+		}, finish.Result.Outcome())
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Zero(t, coverage.PartialUnits)
+		require.Equal(t, statementru.CPUWork.Mask()|statementru.ScanBytes.Mask(), coverage.UnsupportedUnits)
+	})
 }
 
 func TestSelectRejectsUnmodeledCloudScanWork(t *testing.T) {

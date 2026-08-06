@@ -342,6 +342,28 @@ func TestStatementRUNetworkResponseCoverage(t *testing.T) {
 		require.False(t, finish.Result.HasTotal())
 	})
 
+	t.Run("uncollected network unit installs no owner", func(t *testing.T) {
+		weights := statementru.Weights{statementru.CPUWork: 1}
+		sc := stmtctx.NewStmtCtx()
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.CPUWork.Mask(),
+			Weights:       &weights,
+		}))
+
+		ctx := PrepareStatementRUNetworkContext(context.Background(), sc)
+
+		require.False(t, tikvutil.NetworkResponseEvidenceFromContext(ctx).Enabled)
+		statement := sc.TakeStatementRUForExecution()
+		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		coverage, ok := finish.Result.Coverage()
+		require.True(t, ok)
+		require.Zero(t, coverage.CollectedUnits&networkUnit)
+	})
+
 	t.Run("runtime owner conflict cannot become authoritative zero", func(t *testing.T) {
 		execStmt, statement, source := newStatementRUNetworkTestExecution(
 			t, statementru.ModeCalibration, true, true, false, nil,
@@ -556,6 +578,28 @@ func TestStatementRUFrontendCompileCollection(t *testing.T) {
 		require.Equal(t, float64(len("select ?")), units[statementru.FrontendCompileBytes])
 		require.Equal(t, statementru.FrontendCompileBytes.Mask(), coverage.PresentUnits)
 	})
+
+	t.Run("uncollected frontend unit is skipped", func(t *testing.T) {
+		cpuWeights := statementru.Weights{statementru.CPUWork: 1}
+		sc := stmtctx.NewStmtCtx()
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.CPUWork.Mask(),
+			Weights:       &cpuWeights,
+		}))
+		statement := sc.TakeStatementRUForExecution()
+		stmt := &ast.SelectStmt{}
+		stmt.SetText(nil, "select should not be measured")
+
+		recordStatementRUFrontendCompile(sc, false, stmt, nil)
+
+		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+		units, coverage := finish(t, statement)
+		require.Zero(t, units[statementru.FrontendCompileBytes])
+		require.Zero(t, coverage.PresentUnits&statementru.FrontendCompileBytes.Mask())
+		require.Zero(t, coverage.UnavailableUnits&statementru.FrontendCompileBytes.Mask())
+	})
 }
 
 func TestStatementRUWriteDetailCollection(t *testing.T) {
@@ -574,6 +618,8 @@ func TestStatementRUWriteDetailCollection(t *testing.T) {
 		preparedDDL         bool
 		expectedKeys        float64
 		expectedBytes       float64
+		requiredUnits       statementru.UnitMask
+		collectedUnits      statementru.UnitMask
 		expectedPresent     statementru.UnitMask
 		expectedMissing     statementru.UnitMask
 		expectedUnsupported statementru.UnitMask
@@ -585,6 +631,40 @@ func TestStatementRUWriteDetailCollection(t *testing.T) {
 			expectedKeys:    3,
 			expectedBytes:   21,
 			expectedPresent: writeUnits,
+		},
+		{
+			name:            "selected keys do not depend on bytes",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			requiredUnits:   statementru.WriteKeys.Mask(),
+			collectedUnits:  statementru.WriteKeys.Mask(),
+			expectedKeys:    3,
+			expectedPresent: statementru.WriteKeys.Mask(),
+		},
+		{
+			name:            "selected bytes do not depend on keys",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3, WriteSize: 21},
+			requiredUnits:   statementru.WriteBytes.Mask(),
+			collectedUnits:  statementru.WriteBytes.Mask(),
+			expectedBytes:   21,
+			expectedPresent: statementru.WriteBytes.Mask(),
+		},
+		{
+			name:            "available keys survive unavailable bytes",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteKeys: 3},
+			expectedKeys:    3,
+			expectedPresent: statementru.WriteKeys.Mask(),
+			expectedMissing: statementru.WriteBytes.Mask(),
+		},
+		{
+			name:            "available bytes survive unavailable keys",
+			stmtNode:        &ast.InsertStmt{},
+			detail:          &tikvutil.CommitDetails{WriteSize: 21},
+			expectedBytes:   21,
+			expectedPresent: statementru.WriteBytes.Mask(),
+			expectedMissing: statementru.WriteKeys.Mask(),
 		},
 		{name: "ambiguous zero", stmtNode: &ast.CommitStmt{}, detail: &tikvutil.CommitDetails{}, expectedMissing: writeUnits},
 		{name: "missing detail", stmtNode: &ast.CommitStmt{}, expectedMissing: writeUnits},
@@ -635,11 +715,20 @@ func TestStatementRUWriteDetailCollection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			requiredUnits := tt.requiredUnits
+			if requiredUnits == 0 {
+				requiredUnits = writeUnits
+			}
+			collectedUnits := tt.collectedUnits
+			if collectedUnits == 0 {
+				collectedUnits = writeUnits
+			}
 			statement := statementru.NewStatement(statementru.Selection{
-				Mode:          statementru.ModeCalibration,
-				Applicable:    true,
-				RequiredUnits: writeUnits,
-				Weights:       &weights,
+				Mode:           statementru.ModeCalibration,
+				Applicable:     true,
+				RequiredUnits:  requiredUnits,
+				CollectedUnits: collectedUnits,
+				Weights:        &weights,
 			})
 			execStmt := &ExecStmt{StmtNode: tt.stmtNode, statementRU: statement}
 			if tt.preparedDDL {
@@ -964,34 +1053,35 @@ func TestStatementRUStatefulJoinExpressionCount(t *testing.T) {
 
 func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 	tests := []struct {
-		name string
-		new  func(exec.BaseExecutor) exec.Executor
+		name            string
+		additionalUnits statementru.UnitMask
+		new             func(exec.BaseExecutor) exec.Executor
 	}{
-		{name: "Sort", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "Sort", additionalUnits: statementru.CPUWork.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &sortexec.SortExec{BaseExecutor: base}
 		}},
-		{name: "TopN", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "TopN", additionalUnits: statementru.CPUWork.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &sortexec.TopNExec{SortExec: sortexec.SortExec{BaseExecutor: base}}
 		}},
-		{name: "HashAgg", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "HashAgg", additionalUnits: statementru.HashStateRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &aggregate.HashAggExec{BaseExecutor: base}
 		}},
-		{name: "HashJoinV1", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "HashJoinV1", additionalUnits: statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.HashJoinV1Exec{BaseExecutor: base}
 		}},
-		{name: "HashJoinV2", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "HashJoinV2", additionalUnits: statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.HashJoinV2Exec{BaseExecutor: base}
 		}},
-		{name: "MergeJoin", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "MergeJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.MergeJoinExec{BaseExecutor: base}
 		}},
-		{name: "IndexJoin", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "IndexJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.IndexLookUpJoin{BaseExecutor: base}
 		}},
-		{name: "IndexHashJoin", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "IndexHashJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.IndexNestedLoopHashJoin{IndexLookUpJoin: join.IndexLookUpJoin{BaseExecutor: base}}
 		}},
-		{name: "IndexMergeJoin", new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "IndexMergeJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.IndexLookUpMergeJoin{BaseExecutor: base}
 		}},
 	}
@@ -1000,20 +1090,20 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := mock.NewContext()
 			weights := statementru.Weights{
-				statementru.CPUWork:       1,
-				statementru.HashStateRows: 1,
+				statementru.CPUWork: 1,
 			}
 			sc := ctx.GetSessionVars().StmtCtx
 			require.True(t, sc.ConfigureStatementRU(statementru.Selection{
-				Mode:          statementru.ModeCalibration,
-				Applicable:    true,
-				RequiredUnits: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask(),
-				Weights:       &weights,
+				Mode:           statementru.ModeCalibration,
+				Applicable:     true,
+				RequiredUnits:  statementru.CPUWork.Mask(),
+				CollectedUnits: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask(),
+				Weights:        &weights,
 			}))
 			executorUnderTest := tt.new(exec.NewBaseExecutor(ctx, expression.NewSchema(), 0))
 			builder := &executorBuilder{sctx: ctx}
 
-			builder.configureStatementRUStateful(executorUnderTest, 1)
+			builder.configureStatementRUUnits(executorUnderTest, 1, tt.additionalUnits)
 
 			require.NoError(t, builder.err)
 			provider, ok := executorUnderTest.(interface{ StatementRUEnabled() bool })
@@ -1021,10 +1111,29 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 			require.True(t, provider.StatementRUEnabled())
 			require.False(t, exec.ConfigureStatementRUExecutor(executorUnderTest, sc, exec.StatementRUExecutorConfig{
 				CPUWorkMultiplier: 1,
-				NeedsUnitRecorder: true,
+				AdditionalUnits:   tt.additionalUnits,
 			}))
 		})
 	}
+
+	t.Run("disjoint producer installs no hook", func(t *testing.T) {
+		ctx := mock.NewContext()
+		weights := statementru.Weights{statementru.NetworkBytes: 1}
+		sc := ctx.GetSessionVars().StmtCtx
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.NetworkBytes.Mask(),
+			Weights:       &weights,
+		}))
+		executorUnderTest := &sortexec.SortExec{BaseExecutor: exec.NewBaseExecutor(ctx, expression.NewSchema(), 0)}
+		builder := &executorBuilder{sctx: ctx}
+
+		builder.configureStatementRUUnits(executorUnderTest, 1, statementru.CPUWork.Mask())
+
+		require.NoError(t, builder.err)
+		require.False(t, executorUnderTest.StatementRUEnabled())
+	})
 }
 
 func TestStatementRUSelectedRecordSetDoesNotDetach(t *testing.T) {

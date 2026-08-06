@@ -48,7 +48,7 @@ func PrepareStatementRUNetworkContext(ctx context.Context, sc *stmtctx.Statement
 		return ctx
 	}
 	registrar := sc.StatementRUUnitContributorRegistrar()
-	if registrar == nil || registrar.RequiredUnits()&statementru.NetworkBytes.Mask() == 0 {
+	if registrar == nil || registrar.CollectedUnits()&statementru.NetworkBytes.Mask() == 0 {
 		return ctx
 	}
 	attachment := &statementRUNetworkAttachment{
@@ -168,11 +168,14 @@ func recordStatementRUFrontendCompile(
 	if unitRecorder == nil {
 		return
 	}
+	unitMask := statementru.FrontendCompileBytes.Mask()
+	if unitRecorder.CollectedUnits()&unitMask == 0 {
+		return
+	}
 	evidenceRecorder := sc.StatementRUEvidenceRecorder()
 	if evidenceRecorder == nil {
 		return
 	}
-	unitMask := statementru.FrontendCompileBytes.Mask()
 	if cacheHit {
 		evidenceRecorder.MarkPresent(unitMask)
 		return
@@ -243,29 +246,45 @@ func (a *ExecStmt) recordStatementRUWriteDetails(
 	if unitRecorder == nil || evidenceRecorder == nil {
 		return
 	}
+	collectedWriteUnits := unitRecorder.CollectedUnits() & writeUnits
+	if collectedWriteUnits == 0 {
+		return
+	}
 	if a.statementRUOwnsDDL() {
-		evidenceRecorder.MarkUnsupported(writeUnits)
+		evidenceRecorder.MarkUnsupported(collectedWriteUnits)
 		return
 	}
 	if commitEvidence.pipelined {
-		evidenceRecorder.MarkUnsupported(writeUnits)
+		evidenceRecorder.MarkUnsupported(collectedWriteUnits)
 		return
 	}
 	// Current client-go does not expose authoritative zero, complete pipelined
 	// flush totals, or a final-successful-attempt presence bit. TiDB can also
 	// replay before client-go creates CommitDetails. Keep every such path
-	// unavailable until that dependency contract lands; only a positive,
-	// non-retried ordinary pair is complete in this layer.
-	if commitEvidence.wholeTxnRetried || commitDetail == nil || commitDetail.TxnRetry > 0 ||
-		commitDetail.WriteKeys <= 0 || commitDetail.WriteSize <= 0 {
-		evidenceRecorder.MarkUnavailable(writeUnits)
+	// unavailable until that dependency contract lands. On an ordinary,
+	// non-retried commit, each selected positive detail is independently
+	// complete; an absent detail for one unit does not discard the other.
+	if commitEvidence.wholeTxnRetried || commitDetail == nil || commitDetail.TxnRetry > 0 {
+		evidenceRecorder.MarkUnavailable(collectedWriteUnits)
 		return
 	}
-	keysAccepted := unitRecorder.Add(statementru.WriteKeys, float64(commitDetail.WriteKeys))
-	bytesAccepted := unitRecorder.Add(statementru.WriteBytes, float64(commitDetail.WriteSize))
-	if keysAccepted && bytesAccepted {
-		evidenceRecorder.MarkPresent(writeUnits)
+	var present, unavailable statementru.UnitMask
+	if collectedWriteUnits&statementru.WriteKeys.Mask() != 0 {
+		if commitDetail.WriteKeys > 0 && unitRecorder.Add(statementru.WriteKeys, float64(commitDetail.WriteKeys)) {
+			present |= statementru.WriteKeys.Mask()
+		} else {
+			unavailable |= statementru.WriteKeys.Mask()
+		}
 	}
+	if collectedWriteUnits&statementru.WriteBytes.Mask() != 0 {
+		if commitDetail.WriteSize > 0 && unitRecorder.Add(statementru.WriteBytes, float64(commitDetail.WriteSize)) {
+			present |= statementru.WriteBytes.Mask()
+		} else {
+			unavailable |= statementru.WriteBytes.Mask()
+		}
+	}
+	evidenceRecorder.MarkPresent(present)
+	evidenceRecorder.MarkUnavailable(unavailable)
 }
 
 type statementRUCommitEvidence struct {

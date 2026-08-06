@@ -303,7 +303,7 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 			Weights:       &weights,
 		}))
 		require.True(t, ConfigureStatementRUExecutor(executor, ctx.GetSessionVars().StmtCtx, StatementRUExecutorConfig{
-			NeedsUnitRecorder: true,
+			AdditionalUnits: statementru.HashStateRows.Mask(),
 		}))
 		require.True(t, executor.StatementRUEnabled())
 		executor.RecordStatementRUUnit(statementru.HashStateRows, 7)
@@ -316,6 +316,98 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 		units, ok := result.Result.Units()
 		require.True(t, ok)
 		require.Equal(t, float64(7), units[statementru.HashStateRows])
+	})
+
+	t.Run("fully disjoint producer installs no hook", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		weights := statementru.Weights{statementru.NetworkBytes: 1}
+		require.True(t, ctx.GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.NetworkBytes.Mask(),
+			Weights:       &weights,
+		}))
+
+		require.True(t, ConfigureStatementRUExecutor(executor, ctx.GetSessionVars().StmtCtx, StatementRUExecutorConfig{
+			CPUWorkMultiplier: 3,
+			AdditionalUnits:   statementru.HashStateRows.Mask(),
+		}))
+		require.False(t, executor.StatementRUEnabled())
+	})
+
+	t.Run("CPU multiplier is disabled when only an additional unit intersects", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		weights := statementru.Weights{statementru.NetworkBytes: 1}
+		sc := ctx.GetSessionVars().StmtCtx
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.NetworkBytes.Mask(),
+			CollectedUnits: statementru.NetworkBytes.Mask() | statementru.HashStateRows.Mask(),
+			Weights:        &weights,
+		}))
+		require.True(t, ConfigureStatementRUExecutor(executor, sc, StatementRUExecutorConfig{
+			CPUWorkMultiplier: 3,
+			AdditionalUnits:   statementru.HashStateRows.Mask(),
+		}))
+		require.True(t, executor.StatementRUEnabled())
+		require.Zero(t, executor.statementRUHook.multiplier)
+
+		executor.RecordStatementRUCPUWork(11)
+		executor.RecordStatementRUUnit(statementru.HashStateRows, 7)
+		statement := sc.TakeStatementRUForExecution()
+		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.NetworkBytes.Mask()|statementru.HashStateRows.Mask()))
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		units, ok := finish.Result.Units()
+		require.True(t, ok)
+		require.Zero(t, units[statementru.CPUWork])
+		require.Equal(t, float64(7), units[statementru.HashStateRows])
+	})
+
+	t.Run("installed hook accepts only its frozen producer mask", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		weights := statementru.Weights{statementru.CPUWork: 1}
+		sc := ctx.GetSessionVars().StmtCtx
+		require.True(t, sc.ConfigureStatementRU(statementru.Selection{
+			Mode:           statementru.ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  statementru.CPUWork.Mask(),
+			CollectedUnits: statementru.CPUWork.Mask() | statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask(),
+			Weights:        &weights,
+		}))
+		require.True(t, ConfigureStatementRUExecutor(executor, sc, StatementRUExecutorConfig{
+			CPUWorkMultiplier: 1,
+			AdditionalUnits:   statementru.HashStateRows.Mask(),
+		}))
+
+		executor.RecordStatementRUCPUWork(2)
+		executor.RecordStatementRUUnit(statementru.HashStateRows, 7)
+		executor.RecordStatementRUUnit(statementru.JoinOutputRows, 11)
+		statement := sc.TakeStatementRUForExecution()
+		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+		units, ok := finish.Result.Units()
+		require.True(t, ok)
+		require.Equal(t, float64(2), units[statementru.CPUWork])
+		require.Equal(t, float64(7), units[statementru.HashStateRows])
+		require.Zero(t, units[statementru.JoinOutputRows])
+	})
+
+	t.Run("invalid additional unit mask is rejected", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		invalid := statementru.UnitMask(1 << statementru.UnitCount)
+
+		require.False(t, ConfigureStatementRUExecutor(executor, ctx.GetSessionVars().StmtCtx, StatementRUExecutorConfig{
+			AdditionalUnits: invalid,
+		}))
+		require.False(t, executor.StatementRUEnabled())
 	})
 
 	t.Run("derived base does not inherit formula", func(t *testing.T) {
@@ -342,7 +434,7 @@ func TestInvalidateStatementRUUnit(t *testing.T) {
 		Weights:       &weights,
 	}))
 	require.True(t, ConfigureStatementRUExecutor(executor, sc, StatementRUExecutorConfig{
-		NeedsUnitRecorder: true,
+		AdditionalUnits: statementru.CPUWork.Mask(),
 	}))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
@@ -359,17 +451,28 @@ func TestInvalidateStatementRUUnit(t *testing.T) {
 }
 
 func BenchmarkStatementRUCPUWorkHook(b *testing.B) {
-	for _, enabled := range []bool{false, true} {
-		name := "disabled"
-		if enabled {
-			name = "enabled"
-		}
-		b.Run(name, func(b *testing.B) {
+	for _, mode := range []string{"disabled", "collected_disjoint", "enabled"} {
+		b.Run(mode, func(b *testing.B) {
 			ctx := mock.NewContext()
 			child := newMockStatementRUExecutor(ctx, 1)
 			parent := newMockStatementRUExecutor(ctx, 1, child)
 			var statement *statementru.Statement
-			if enabled {
+			switch mode {
+			case "collected_disjoint":
+				weights := statementru.Weights{statementru.NetworkBytes: 1}
+				sc := ctx.GetSessionVars().StmtCtx
+				if !sc.ConfigureStatementRU(statementru.Selection{
+					Mode:          statementru.ModeCalibration,
+					Applicable:    true,
+					RequiredUnits: statementru.NetworkBytes.Mask(),
+					Weights:       &weights,
+				}) || !ConfigureStatementRUCPUWork(parent, sc, 1) {
+					b.Fatal("statement RU disjoint configuration rejected")
+				}
+				if parent.StatementRUEnabled() {
+					b.Fatal("disjoint collection installed a CPU hook")
+				}
+			case "enabled":
 				statement = configureStatementRUCPUWorkForTest(b, ctx, parent, 1)
 			}
 			req := parent.NewChunk()
@@ -382,7 +485,7 @@ func BenchmarkStatementRUCPUWorkHook(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			if enabled {
+			if statement != nil {
 				require.Equal(b, float64(b.N), statementRUCPUWorkUnits(b, statement, statementru.TerminalSuccess))
 			}
 		})

@@ -59,7 +59,10 @@ func TestCollectorAdd(t *testing.T) {
 	if total, ok = result.TotalRU(); !ok || total != 204 {
 		t.Fatalf("weights were not frozen: %v, %v", total, ok)
 	}
-
+	coverage, ok := result.Coverage()
+	if !ok || coverage.RequiredUnits != AllUnits || coverage.CollectedUnits != AllUnits {
+		t.Fatalf("zero collected mask did not default to required: %+v, %v", coverage, ok)
+	}
 }
 
 func TestCollectorAcceptVectorAtomic(t *testing.T) {
@@ -86,6 +89,30 @@ func TestCollectorAcceptVectorAtomic(t *testing.T) {
 	if collector.AcceptVector(UnitValues{CPUWork: 1}) {
 		t.Fatal("late vector was accepted")
 	}
+
+	t.Run("uncollected vector is rejected atomically", func(t *testing.T) {
+		collector := NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | ScanBytes.Mask(),
+			Weights:        &weights,
+			RetainDetails:  true,
+		})
+		if !collector.AcceptVector(UnitValues{CPUWork: 2}) {
+			t.Fatal("collected vector was rejected")
+		}
+		if collector.AcceptVector(UnitValues{CPUWork: 10, NetworkBytes: 1}) {
+			t.Fatal("vector containing an uncollected unit was accepted")
+		}
+		if !collector.MarkPresent(CPUWork.Mask()) {
+			t.Fatal("required coverage was rejected")
+		}
+		result := collector.Finalize()
+		assertOutcome(t, result, StateComplete, ReasonNone)
+		units, ok := result.Units()
+		if !ok || units[CPUWork] != 2 || units[NetworkBytes] != 0 {
+			t.Fatalf("rejected vector mutated values: %+v, %v", units, ok)
+		}
+	})
 }
 
 func TestStatementUnitContributors(t *testing.T) {
@@ -104,6 +131,9 @@ func TestStatementUnitContributors(t *testing.T) {
 		registrar := statement.UnitContributorRegistrar()
 		if got := registrar.RequiredUnits(); got != CPUWork.Mask() {
 			t.Fatalf("unexpected required units: %v", got)
+		}
+		if got := registrar.CollectedUnits(); got != CPUWork.Mask() {
+			t.Fatalf("unexpected collected units: %v", got)
 		}
 		first := registrar.RegisterUnitContributor(CPUWork.Mask())
 		second := registrar.RegisterUnitContributor(CPUWork.Mask())
@@ -212,8 +242,20 @@ func TestStatementUnitContributors(t *testing.T) {
 	})
 
 	t.Run("unsupported optional unit is isolated", func(t *testing.T) {
-		statement := newStatement()
+		statement := NewStatement(Selection{
+			Mode:           ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | HashStateRows.Mask(),
+			Weights:        &weights,
+		})
 		registrar := statement.UnitContributorRegistrar()
+		if got := registrar.RequiredUnits(); got != CPUWork.Mask() {
+			t.Fatalf("unexpected required units: %v", got)
+		}
+		if got := registrar.CollectedUnits(); got != CPUWork.Mask()|HashStateRows.Mask() {
+			t.Fatalf("unexpected collected units: %v", got)
+		}
 		cpu := registrar.RegisterUnitContributor(CPUWork.Mask())
 		hash := registrar.RegisterUnitContributor(HashStateRows.Mask())
 		if !cpu.Complete(UnitValues{CPUWork: 4}) || !hash.Unsupported() {
@@ -224,6 +266,94 @@ func TestStatementUnitContributors(t *testing.T) {
 		coverage, ok := finish.Result.Coverage()
 		if !ok || coverage.UnsupportedUnits != HashStateRows.Mask() {
 			t.Fatalf("optional unsupported evidence was lost: %+v, %v", coverage, ok)
+		}
+		if coverage.RequiredUnits != CPUWork.Mask() ||
+			coverage.CollectedUnits != CPUWork.Mask()|HashStateRows.Mask() {
+			t.Fatalf("required and collected masks were not frozen: %+v", coverage)
+		}
+	})
+
+	t.Run("registrations stay within one collected eligibility class", func(t *testing.T) {
+		statement := NewStatement(Selection{
+			Mode:           ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | HashStateRows.Mask(),
+			Weights:        &weights,
+		})
+		registrar := statement.UnitContributorRegistrar()
+		if registrar.RegisterUnitContributor(0) != nil {
+			t.Fatal("empty registration was accepted")
+		}
+		if registrar.RegisterUnitContributor(UnitKind(UnitCount).Mask()) != nil {
+			t.Fatal("invalid registration was accepted")
+		}
+		if registrar.RegisterUnitContributor(NetworkBytes.Mask()) != nil {
+			t.Fatal("uncollected registration was accepted")
+		}
+		if registrar.RegisterUnitContributor(CPUWork.Mask()|HashStateRows.Mask()) != nil {
+			t.Fatal("mixed required and optional registration was accepted")
+		}
+		required := registrar.RegisterUnitContributor(CPUWork.Mask())
+		if required == nil || !required.Complete(UnitValues{CPUWork: 3}) {
+			t.Fatal("valid required registration was rejected after mixed registration")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StatePartial, ReasonIncompleteEvidence)
+		coverage, ok := finish.Result.Coverage()
+		if !ok || coverage.PartialUnits != CPUWork.Mask() || coverage.InvalidUnits != 0 {
+			t.Fatalf("mixed registration did not fail required coverage closed: %+v, %v", coverage, ok)
+		}
+	})
+
+	t.Run("required and uncollected registration fails required coverage closed", func(t *testing.T) {
+		statement := NewStatement(Selection{
+			Mode:          ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: CPUWork.Mask(),
+			Weights:       &weights,
+		})
+		registrar := statement.UnitContributorRegistrar()
+		if registrar.RegisterUnitContributor(CPUWork.Mask()|NetworkBytes.Mask()) != nil {
+			t.Fatal("required and uncollected registration was accepted")
+		}
+		required := registrar.RegisterUnitContributor(CPUWork.Mask())
+		if required == nil || !required.Complete(UnitValues{CPUWork: 3}) {
+			t.Fatal("valid required registration was rejected")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StatePartial, ReasonIncompleteEvidence)
+		coverage, ok := finish.Result.Coverage()
+		if !ok || coverage.PartialUnits != CPUWork.Mask() || coverage.InvalidUnits != 0 {
+			t.Fatalf("rejected required and uncollected lease did not fail closed: %+v, %v", coverage, ok)
+		}
+	})
+
+	t.Run("optional contributor failure cannot change required candidate", func(t *testing.T) {
+		statement := NewStatement(Selection{
+			Mode:           ModeCalibration,
+			Applicable:     true,
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | HashStateRows.Mask(),
+			Weights:        &weights,
+		})
+		if !statement.UnitRecorder().Add(CPUWork, 7) ||
+			!statement.EvidenceRecorder().MarkPresent(CPUWork.Mask()) {
+			t.Fatal("required streaming evidence was rejected")
+		}
+		optional := statement.UnitContributorRegistrar().RegisterUnitContributor(HashStateRows.Mask())
+		if optional == nil || optional.Complete(UnitValues{CPUWork: 1}) {
+			t.Fatal("optional contributor accepted an out-of-lease vector")
+		}
+		finish, _ := statement.Finish(TerminalSuccess)
+		assertOutcome(t, finish.Result, StateComplete, ReasonNone)
+		total, ok := finish.Result.TotalRU()
+		if !ok || total != 7 {
+			t.Fatalf("optional failure changed required candidate: %v, %v", total, ok)
+		}
+		coverage, ok := finish.Result.Coverage()
+		if !ok || coverage.PartialUnits != HashStateRows.Mask() || coverage.InvalidUnits != 0 {
+			t.Fatalf("optional failure diagnostics were not isolated: %+v, %v", coverage, ok)
 		}
 	})
 
@@ -341,7 +471,11 @@ func TestCollectorCoverageOutcomes(t *testing.T) {
 
 	t.Run("optional evidence does not change missing required outcome", func(t *testing.T) {
 		optionalWeights := Weights{CPUWork: 1}
-		collector := NewCollector(Config{RequiredUnits: CPUWork.Mask(), Weights: &optionalWeights})
+		collector := NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | ScanBytes.Mask() | NetworkBytes.Mask(),
+			Weights:        &optionalWeights,
+		})
 		collector.Add(NetworkBytes, 1)
 		collector.MarkUnsupported(ScanBytes.Mask())
 		assertOutcome(t, collector.Finalize(), StateUnavailable, ReasonMissingEvidence)
@@ -364,13 +498,65 @@ func TestCollectorCoverageOutcomes(t *testing.T) {
 		assertOutcome(t, collector.Finalize(), StateUnavailable, ReasonMissingEvidence)
 	})
 
+	t.Run("uncollected observations are rejected without mutation", func(t *testing.T) {
+		cpuWeights := Weights{CPUWork: 1}
+		collector := NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | ScanBytes.Mask(),
+			Weights:        &cpuWeights,
+			RetainDetails:  true,
+		})
+		if !collector.Add(CPUWork, 2) || !collector.MarkPresent(CPUWork.Mask()) {
+			t.Fatal("required observation was rejected")
+		}
+		if collector.Add(NetworkBytes, 9) {
+			t.Fatal("uncollected scalar was accepted")
+		}
+		if collector.AcceptVector(UnitValues{CPUWork: 100, NetworkBytes: 1}) {
+			t.Fatal("vector containing an uncollected unit was accepted")
+		}
+		if collector.MarkPartial(CPUWork.Mask() | NetworkBytes.Mask()) {
+			t.Fatal("mixed collected and uncollected evidence was accepted")
+		}
+		if collector.MarkUnsupported(NetworkBytes.Mask()) {
+			t.Fatal("uncollected evidence was accepted")
+		}
+
+		result := collector.Finalize()
+		assertOutcome(t, result, StateComplete, ReasonNone)
+		total, ok := result.TotalRU()
+		if !ok || total != 2 {
+			t.Fatalf("rejected observations changed the total: %v, %v", total, ok)
+		}
+		units, ok := result.Units()
+		if !ok || units[CPUWork] != 2 || units[NetworkBytes] != 0 {
+			t.Fatalf("rejected observations changed retained units: %+v, %v", units, ok)
+		}
+		coverage, ok := result.Coverage()
+		if !ok || coverage.PresentUnits != CPUWork.Mask() ||
+			coverage.PartialUnits != 0 || coverage.UnavailableUnits != 0 ||
+			coverage.UnsupportedUnits != 0 || coverage.InvalidUnits != 0 {
+			t.Fatalf("rejected observations changed retained coverage: %+v, %v", coverage, ok)
+		}
+	})
+
 	t.Run("required mask configuration", func(t *testing.T) {
 		assertOutcome(t, NewCollector(Config{}).Finalize(), StateInvalid, ReasonInvalidConfiguration)
+		assertOutcome(t, NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: ScanBytes.Mask(),
+		}).Finalize(), StateInvalid, ReasonInvalidConfiguration)
+		assertOutcome(t, NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | UnitKind(UnitCount).Mask(),
+		}).Finalize(), StateInvalid, ReasonInvalidConfiguration)
 
 		weightsWithNonApplicableUnit := Weights{CPUWork: 1, ScanBytes: 100}
 		collector := NewCollector(Config{RequiredUnits: CPUWork.Mask(), Weights: &weightsWithNonApplicableUnit})
 		collector.Add(CPUWork, 2)
-		collector.Add(ScanBytes, 10)
+		if collector.Add(ScanBytes, 10) {
+			t.Fatal("uncollected weighted unit was accepted")
+		}
 		collector.MarkPresent(CPUWork.Mask())
 		result := collector.Finalize()
 		assertOutcome(t, result, StateComplete, ReasonNone)
@@ -379,7 +565,11 @@ func TestCollectorCoverageOutcomes(t *testing.T) {
 		}
 
 		weightsWithInvalidNonApplicableUnit := Weights{CPUWork: 1, ScanBytes: math.NaN()}
-		collector = NewCollector(Config{RequiredUnits: CPUWork.Mask(), Weights: &weightsWithInvalidNonApplicableUnit})
+		collector = NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | ScanBytes.Mask(),
+			Weights:        &weightsWithInvalidNonApplicableUnit,
+		})
 		collector.Add(CPUWork, 2)
 		collector.MarkPresent(CPUWork.Mask())
 		result = collector.Finalize()
@@ -398,6 +588,8 @@ func TestCollectorCoverageOutcomes(t *testing.T) {
 		cpuWeights := Weights{CPUWork: 2, NetworkBytes: 100}
 		collector := NewCollector(Config{
 			RequiredUnits: CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask() | ScanBytes.Mask() | NetworkBytes.Mask() |
+				HashStateRows.Mask(),
 			Weights:       &cpuWeights,
 			RetainDetails: true,
 		})
@@ -525,6 +717,34 @@ func TestCollectorInvalidArithmetic(t *testing.T) {
 			t.Fatal("invalid unit mask was accepted")
 		}
 		assertOutcome(t, collector.Finalize(), StateInvalid, ReasonInvalidConfiguration)
+
+		collector = NewCollector(Config{
+			RequiredUnits:  CPUWork.Mask(),
+			CollectedUnits: CPUWork.Mask(),
+			RetainDetails:  true,
+		})
+		if collector.MarkPartial(CPUWork.Mask() | invalidMask) {
+			t.Fatal("mixed valid and invalid unit mask was accepted")
+		}
+		result := collector.Finalize()
+		assertOutcome(t, result, StateInvalid, ReasonInvalidConfiguration)
+		coverage, ok := result.Coverage()
+		if !ok {
+			t.Fatal("invalid configuration details were not retained")
+		}
+		for name, mask := range map[string]UnitMask{
+			"required":    coverage.RequiredUnits,
+			"collected":   coverage.CollectedUnits,
+			"present":     coverage.PresentUnits,
+			"partial":     coverage.PartialUnits,
+			"unavailable": coverage.UnavailableUnits,
+			"unsupported": coverage.UnsupportedUnits,
+			"invalid":     coverage.InvalidUnits,
+		} {
+			if !mask.valid() {
+				t.Fatalf("%s coverage escaped the bounded unit mask: %+v", name, coverage)
+			}
+		}
 	})
 
 	t.Run("multiplication overflow", func(t *testing.T) {
@@ -604,11 +824,12 @@ func TestCollectorFinalization(t *testing.T) {
 		t.Fatal("coverage was not retained")
 	}
 	coverage.PresentUnits = 0
-	if coverage.PresentUnits != 0 {
+	coverage.CollectedUnits = 0
+	if coverage.PresentUnits != 0 || coverage.CollectedUnits != 0 {
 		t.Fatal("caller-owned coverage copy was not mutable")
 	}
 	coverageAgain, _ := first.Coverage()
-	if coverageAgain.PresentUnits != CPUWork.Mask() {
+	if coverageAgain.PresentUnits != CPUWork.Mask() || coverageAgain.CollectedUnits != CPUWork.Mask() {
 		t.Fatal("result exposed mutable coverage storage")
 	}
 

@@ -624,6 +624,8 @@ func executeStatementRUPointBenchmarkQuery(
 	collectRuntimeStats bool,
 	reporter *statementRUPointBenchmarkReporter,
 	weights *statementru.Weights,
+	requiredUnits statementru.UnitMask,
+	collectedUnits statementru.UnitMask,
 ) {
 	b.Helper()
 	stmtNode, err := parser.New().ParseOneStmt(sql, "", "")
@@ -641,13 +643,14 @@ func executeStatementRUPointBenchmarkQuery(
 	if collectRuntimeStats {
 		sc.RuntimeStatsColl = execdetails.NewRuntimeStatsColl(nil)
 	}
-	if reporter != nil {
+	if requiredUnits != 0 {
 		if !sc.ConfigureStatementRU(statementru.Selection{
-			Mode:          statementru.ModeResultOnly,
-			Applicable:    true,
-			RequiredUnits: statementru.ScanBytes.Mask(),
-			Weights:       weights,
-			Reporter:      reporter,
+			Mode:           statementru.ModeResultOnly,
+			Applicable:     true,
+			RequiredUnits:  requiredUnits,
+			CollectedUnits: collectedUnits,
+			Weights:        weights,
+			Reporter:       reporter,
 		}) {
 			b.Fatal("statement RU configuration rejected")
 		}
@@ -690,12 +693,23 @@ func BenchmarkStatementRUPointReadMatrix(b *testing.B) {
 	modes := []struct {
 		name                string
 		collectRuntimeStats bool
-		collectStatementRU  bool
+		requiredUnits       statementru.UnitMask
+		collectedUnits      statementru.UnitMask
+		reportResult        bool
 	}{
 		{name: "Off"},
-		{name: "ScanBytesResultOnly", collectStatementRU: true},
+		{name: "configured_uncollected", requiredUnits: statementru.CPUWork.Mask()},
+		{
+			name:           "optional_collected",
+			requiredUnits:  statementru.CPUWork.Mask(),
+			collectedUnits: statementru.CPUWork.Mask() | statementru.ScanBytes.Mask(),
+		},
+		{name: "ScanBytesResultOnly", requiredUnits: statementru.ScanBytes.Mask(), reportResult: true},
 		{name: "RuntimeStats", collectRuntimeStats: true},
-		{name: "RuntimeStatsScanBytesResultOnly", collectRuntimeStats: true, collectStatementRU: true},
+		{
+			name: "RuntimeStatsScanBytesResultOnly", collectRuntimeStats: true,
+			requiredUnits: statementru.ScanBytes.Mask(), reportResult: true,
+		},
 	}
 	for _, query := range queries {
 		for _, source := range []struct {
@@ -707,7 +721,7 @@ func BenchmarkStatementRUPointReadMatrix(b *testing.B) {
 		} {
 			for _, mode := range modes {
 				modeName := mode.name
-				if mode.collectStatementRU {
+				if mode.reportResult {
 					if source.rotateTxn {
 						modeName += "Unavailable"
 					} else {
@@ -722,20 +736,29 @@ func BenchmarkStatementRUPointReadMatrix(b *testing.B) {
 					tk.MustExec("insert into t values (1, 10), (2, 20)")
 					tk.MustExec("begin")
 					if !source.rotateTxn {
-						executeStatementRUPointBenchmarkQuery(b, tk, query.sql, false, nil, nil)
+						executeStatementRUPointBenchmarkQuery(b, tk, query.sql, false, nil, nil, 0, 0)
 					}
 
 					var reporter *statementRUPointBenchmarkReporter
 					var weights *statementru.Weights
-					if mode.collectStatementRU {
+					if mode.requiredUnits != 0 {
+						weights = &statementru.Weights{}
+						if mode.requiredUnits&statementru.CPUWork.Mask() != 0 {
+							(*weights)[statementru.CPUWork] = 1
+						}
+						if mode.requiredUnits&statementru.ScanBytes.Mask() != 0 {
+							(*weights)[statementru.ScanBytes] = 1
+						}
+					}
+					if mode.reportResult {
 						reporter = &statementRUPointBenchmarkReporter{}
-						weights = &statementru.Weights{statementru.ScanBytes: 1}
 					}
 					b.ReportAllocs()
 					b.ResetTimer()
 					for range b.N {
 						executeStatementRUPointBenchmarkQuery(
 							b, tk, query.sql, mode.collectRuntimeStats, reporter, weights,
+							mode.requiredUnits, mode.collectedUnits,
 						)
 						if source.rotateTxn {
 							b.StopTimer()
@@ -747,7 +770,7 @@ func BenchmarkStatementRUPointReadMatrix(b *testing.B) {
 					b.StopTimer()
 					tk.MustExec("rollback")
 					expectedReports := 0
-					if !source.rotateTxn && mode.collectStatementRU {
+					if !source.rotateTxn && mode.reportResult {
 						expectedReports = b.N
 					}
 					reportCount := 0

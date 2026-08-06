@@ -123,7 +123,7 @@ func (b *statementRUMutationMemBuffer) recordMutation() {
 	if b == nil || b.owner == nil {
 		return
 	}
-	if recorder := b.owner.statementRUUnitRecorder(); recorder != nil {
+	if recorder := b.owner.statementRUCPUWorkRecorder(); recorder != nil {
 		recorder.Add(statementru.CPUWork, 1)
 	}
 }
@@ -173,20 +173,25 @@ func (txn *LazyTxn) setTransaction(inner kv.Transaction) {
 	// replaced under targetMu when the next transaction becomes valid.
 }
 
-func (txn *LazyTxn) statementRUUnitRecorder() statementru.UnitRecorder {
+func (txn *LazyTxn) statementRUCPUWorkRecorder() statementru.UnitRecorder {
 	vars := txn.statementRUVars
 	if vars == nil || vars.StmtCtx == nil {
 		return nil
 	}
-	return vars.StmtCtx.StatementRUUnitRecorder()
+	recorder := vars.StmtCtx.StatementRUUnitRecorder()
+	if recorder == nil || recorder.CollectedUnits()&statementru.CPUWork.Mask() == 0 {
+		return nil
+	}
+	return recorder
 }
 
 // GetMemBuffer overrides the embedded transaction method so foreground encoded
-// mutation preparation shares the current logical statement recorder. Off
-// returns the original buffer without allocating a wrapper.
+// mutation preparation shares the current logical statement CPUWork recorder.
+// Off and selections that do not collect CPUWork return the original buffer
+// without allocating a wrapper.
 func (txn *LazyTxn) GetMemBuffer() kv.MemBuffer {
 	buffer := txn.Transaction.GetMemBuffer()
-	if txn.statementRUUnitRecorder() == nil {
+	if txn.statementRUCPUWorkRecorder() == nil {
 		return buffer
 	}
 	if !txn.statementRUMutationBuffer.hasTarget(buffer) {
@@ -200,7 +205,7 @@ func (txn *LazyTxn) GetMemBuffer() kv.MemBuffer {
 
 // Set records foreground paths that mutate through Transaction directly.
 func (txn *LazyTxn) Set(key kv.Key, value []byte) error {
-	if recorder := txn.statementRUUnitRecorder(); recorder != nil {
+	if recorder := txn.statementRUCPUWorkRecorder(); recorder != nil {
 		recorder.Add(statementru.CPUWork, 1)
 	}
 	return txn.Transaction.Set(key, value)
@@ -208,7 +213,7 @@ func (txn *LazyTxn) Set(key kv.Key, value []byte) error {
 
 // Delete records foreground paths that mutate through Transaction directly.
 func (txn *LazyTxn) Delete(key kv.Key) error {
-	if recorder := txn.statementRUUnitRecorder(); recorder != nil {
+	if recorder := txn.statementRUCPUWorkRecorder(); recorder != nil {
 		recorder.Add(statementru.CPUWork, 1)
 	}
 	return txn.Transaction.Delete(key)

@@ -96,6 +96,7 @@ func needNextIOAcc(trackRUV2 bool, parentAcc *nextIOAcc, childCount int) bool {
 type statementRUHook struct {
 	recorder   statementru.UnitRecorder
 	multiplier float64
+	allowed    statementru.UnitMask
 }
 
 func (h *statementRUHook) recordInputRows(rows int64) {
@@ -106,7 +107,7 @@ func (h *statementRUHook) recordInputRows(rows int64) {
 }
 
 func (h *statementRUHook) recordUnit(kind statementru.UnitKind, delta float64) {
-	if h == nil {
+	if h == nil || h.allowed&kind.Mask() == 0 {
 		return
 	}
 	h.recorder.Add(kind, delta)
@@ -116,31 +117,45 @@ type statementRUProvider interface {
 	installStatementRUHook(*statementRUHook) bool
 }
 
-// StatementRUExecutorConfig freezes the common recorder configuration for one
-// executor. NeedsUnitRecorder keeps the hook for operators that emit nonlinear
-// or non-CPU terminal units even when their linear CPU multiplier is zero.
+// StatementRUExecutorConfig freezes the units one executor can produce.
+// AdditionalUnits contains terminal or nonlinear units beyond the linear
+// CPUWork formula selected by a positive CPUWorkMultiplier.
 type StatementRUExecutorConfig struct {
 	CPUWorkMultiplier int
-	NeedsUnitRecorder bool
+	AdditionalUnits   statementru.UnitMask
 }
 
 // ConfigureStatementRUExecutor installs one frozen executor recorder. An
 // enabled hook can be installed only once during executor construction.
 func ConfigureStatementRUExecutor(e Executor, sc *stmtctx.StatementContext, config StatementRUExecutorConfig) bool {
 	provider, ok := e.(statementRUProvider)
-	if !ok || config.CPUWorkMultiplier < 0 {
+	if !ok || config.CPUWorkMultiplier < 0 || config.AdditionalUnits&^statementru.AllUnits != 0 {
 		return false
 	}
 	if sc == nil {
 		return true
 	}
+	producedUnits := config.AdditionalUnits
+	if config.CPUWorkMultiplier > 0 {
+		producedUnits |= statementru.CPUWork.Mask()
+	}
 	recorder := sc.StatementRUUnitRecorder()
-	if recorder == nil || config.CPUWorkMultiplier == 0 && !config.NeedsUnitRecorder {
+	if recorder == nil {
 		return true
+	}
+	collectedUnits := recorder.CollectedUnits()
+	allowedUnits := producedUnits & collectedUnits
+	if allowedUnits == 0 {
+		return true
+	}
+	multiplier := config.CPUWorkMultiplier
+	if allowedUnits&statementru.CPUWork.Mask() == 0 {
+		multiplier = 0
 	}
 	return provider.installStatementRUHook(&statementRUHook{
 		recorder:   recorder,
-		multiplier: float64(config.CPUWorkMultiplier),
+		multiplier: float64(multiplier),
+		allowed:    allowedUnits,
 	})
 }
 

@@ -85,7 +85,7 @@ func prepareStatementRUPointRead(
 	if registrar == nil {
 		return statementRUPointReadAttachment{stats: stats}
 	}
-	if registrar.RequiredUnits()&statementru.ScanBytes.Mask() == 0 {
+	if registrar.CollectedUnits()&statementru.ScanBytes.Mask() == 0 {
 		return statementRUPointReadAttachment{stats: stats}
 	}
 	scan := registrar.RegisterUnitContributor(statementru.ScanBytes.Mask())
