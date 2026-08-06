@@ -832,6 +832,9 @@ const (
 	StmtSafeTSCacheKey
 	// StmtExternalTSCacheKey is a variable for externalTS calculation/cache of one stmt.
 	StmtExternalTSCacheKey
+	// StmtPointReadRURegistryCacheKey owns statement-local point-read runtime
+	// stats attachments. The cached value is private to pkg/executor.
+	StmtPointReadRURegistryCacheKey
 )
 
 // GetOrStoreStmtCache gets the cached value of the given key if it exists, otherwise stores the value.

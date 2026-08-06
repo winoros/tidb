@@ -5918,13 +5918,10 @@ func (b *executorBuilder) buildBatchPointGet(plan *physicalop.BatchPointGetPlan)
 		e.snapshot.SetOption(kv.ReplicaReadAdjuster, newReplicaReadAdjuster(e.Ctx(), plan.GetAvgRowSize()))
 	}
 	if e.RuntimeStats() != nil {
-		snapshotStats := &txnsnapshot.SnapshotRuntimeStats{}
 		e.stats = &runtimeStatsWithSnapshot{
-			SnapshotRuntimeStats: snapshotStats,
+			SnapshotRuntimeStats: &txnsnapshot.SnapshotRuntimeStats{},
 		}
-		e.snapshot.SetOption(kv.CollectRuntimeStats, snapshotStats)
 	}
-
 	if plan.IndexInfo != nil {
 		sctx := b.sctx.GetSessionVars().StmtCtx
 		sctx.IndexNames = append(sctx.IndexNames, plan.TblInfo.Name.O+":"+plan.IndexInfo.Name.O)

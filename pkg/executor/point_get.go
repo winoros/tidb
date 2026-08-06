@@ -145,7 +145,8 @@ type PointGetExecutor struct {
 	// virtualColumnRetFieldTypes records the RetFieldTypes of virtual columns.
 	virtualColumnRetFieldTypes []*types.FieldType
 
-	stats *runtimeStatsWithSnapshot
+	stats                *runtimeStatsWithSnapshot
+	statementRUPointRead statementRUPointReadAttachment
 }
 
 // GetPhysID returns the physical id used, either the table's id or a partition's ID
@@ -227,12 +228,11 @@ func (e *PointGetExecutor) Init(p *physicalop.PointGetPlan) {
 		}
 	})
 
+	e.statementRUPointRead.reset()
 	if e.RuntimeStats() != nil {
-		snapshotStats := &txnsnapshot.SnapshotRuntimeStats{}
 		e.stats = &runtimeStatsWithSnapshot{
-			SnapshotRuntimeStats: snapshotStats,
+			SnapshotRuntimeStats: &txnsnapshot.SnapshotRuntimeStats{},
 		}
-		e.snapshot.SetOption(kv.CollectRuntimeStats, snapshotStats)
 	} else {
 		e.stats = nil
 	}
@@ -255,8 +255,11 @@ func (e *PointGetExecutor) buildVirtualColumnInfo() {
 }
 
 // Open implements the Executor interface.
-func (e *PointGetExecutor) Open(context.Context) error {
-	var err error
+func (e *PointGetExecutor) Open(context.Context) (err error) {
+	e.statementRUPointRead.reset()
+	failpoint.Inject("statementRUPointGetOpenError", func() {
+		failpoint.Return(errors.New("injected point get open error"))
+	})
 	e.txn, err = e.Ctx().Txn(false)
 	if err != nil {
 		return err
@@ -265,11 +268,26 @@ func (e *PointGetExecutor) Open(context.Context) error {
 		return err
 	}
 	setOptionForTopSQL(e.Ctx().GetSessionVars().StmtCtx, e.snapshot)
+	var snapshotStats *txnsnapshot.SnapshotRuntimeStats
+	if e.stats != nil {
+		snapshotStats = e.stats.SnapshotRuntimeStats
+	}
+	stmtCtx := e.Ctx().GetSessionVars().StmtCtx
+	e.statementRUPointRead = prepareStatementRUPointRead(
+		stmtCtx,
+		snapshotStats,
+		!e.lock && stmtCtx.IsReadOnly,
+	)
+	if _, cacheTable := e.snapshot.(cacheTableSnapshot); cacheTable {
+		e.statementRUPointRead.markLocalBypass()
+	}
+	e.statementRUPointRead.install(e.snapshot)
 	return nil
 }
 
 // Close implements the Executor interface.
 func (e *PointGetExecutor) Close() error {
+	e.statementRUPointRead.close()
 	if e.stats != nil {
 		defer func() {
 			sc := e.Ctx().GetSessionVars().StmtCtx
@@ -281,10 +299,7 @@ func (e *PointGetExecutor) Close() error {
 			}
 		}()
 	}
-	if e.RuntimeStats() != nil && e.snapshot != nil {
-		e.snapshot.SetOption(kv.CollectRuntimeStats, nil)
-	}
-	if e.indexUsageReporter != nil {
+	if e.indexUsageReporter != nil && e.stats != nil {
 		tableID := e.tblInfo.ID
 		physicalTableID := GetPhysID(e.tblInfo, e.partitionDefIdx)
 		kvReqTotal := e.stats.SnapshotRuntimeStats.GetCmdRPCCount(tikvrpc.CmdGet)
@@ -300,14 +315,27 @@ func (e *PointGetExecutor) Close() error {
 }
 
 // Next implements the Executor interface.
-func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
+func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	req.Reset()
+	completesReadPhase := false
+	if e.statementRUPointRead.owner != nil {
+		if !e.statementRUPointRead.beginNext() {
+			return nil
+		}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				e.statementRUPointRead.finishCall(false, completesReadPhase)
+				panic(recovered)
+			}
+			e.statementRUPointRead.finishCall(err == nil, completesReadPhase)
+		}()
+	}
 	if e.done {
 		return nil
 	}
 	e.done = true
+	completesReadPhase = true
 
-	var err error
 	tblID := GetPhysID(e.tblInfo, e.partitionDefIdx)
 	if e.lock {
 		e.UpdateDeltaForTableID(tblID)
@@ -669,6 +697,7 @@ func (e *PointGetExecutor) get(ctx context.Context, key kv.Key) ([]byte, error) 
 		// different for pessimistic transaction.
 		val, err = kv.GetValue(ctx, e.txn.GetMemBuffer(), key)
 		if err == nil {
+			e.statementRUPointRead.markLocalBypass()
 			return val, err
 		}
 		if !kv.IsErrNotFound(err) {
@@ -688,6 +717,9 @@ func (e *PointGetExecutor) get(ctx context.Context, key kv.Key) ([]byte, error) 
 	lock := e.tblInfo.Lock
 	if lock != nil && (lock.Tp == ast.TableLockRead || lock.Tp == ast.TableLockReadOnly) {
 		if e.Ctx().GetSessionVars().EnablePointGetCache {
+			// UnionGet does not expose whether the table cache or snapshot
+			// supplied the value, so this path is conservatively incomplete.
+			e.statementRUPointRead.markLocalBypass()
 			cacheDB := e.Ctx().GetStore().GetMemCache()
 			val, err = cacheDB.UnionGet(ctx, e.tblInfo.ID, e.snapshot, key)
 			if err != nil {

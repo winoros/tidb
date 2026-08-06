@@ -43,6 +43,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/rowcodec"
 	tikv "github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/txnkv/txnsnapshot"
 )
 
 // BatchPointGetExec executes a bunch of point select queries.
@@ -80,8 +81,9 @@ type BatchPointGetExec struct {
 	// virtualColumnRetFieldTypes records the RetFieldTypes of virtual columns.
 	virtualColumnRetFieldTypes []*types.FieldType
 
-	snapshot kv.Snapshot
-	stats    *runtimeStatsWithSnapshot
+	snapshot             kv.Snapshot
+	stats                *runtimeStatsWithSnapshot
+	statementRUPointRead statementRUPointReadAttachment
 }
 
 // buildVirtualColumnInfo saves virtual column indices and sort them in definition order
@@ -96,7 +98,11 @@ func (e *BatchPointGetExec) buildVirtualColumnInfo() {
 }
 
 // Open implements the Executor interface.
-func (e *BatchPointGetExec) Open(context.Context) error {
+func (e *BatchPointGetExec) Open(context.Context) (err error) {
+	e.statementRUPointRead.reset()
+	failpoint.Inject("statementRUBatchPointGetOpenError", func() {
+		failpoint.Return(errors.New("injected batch point get open error"))
+	})
 	sessVars := e.Ctx().GetSessionVars()
 	txnCtx := sessVars.TxnCtx
 	txn, err := e.Ctx().Txn(false)
@@ -106,18 +112,42 @@ func (e *BatchPointGetExec) Open(context.Context) error {
 	e.txn = txn
 
 	setOptionForTopSQL(e.Ctx().GetSessionVars().StmtCtx, e.snapshot)
+	var snapshotStats *txnsnapshot.SnapshotRuntimeStats
+	if e.stats != nil {
+		snapshotStats = e.stats.SnapshotRuntimeStats
+	}
+	stmtCtx := e.Ctx().GetSessionVars().StmtCtx
+	e.statementRUPointRead = prepareStatementRUPointRead(
+		stmtCtx,
+		snapshotStats,
+		!e.lock && stmtCtx.IsReadOnly,
+	)
 	var batchGetter kv.BatchGetter = e.snapshot
 	if txn.Valid() {
 		lock := e.tblInfo.Lock
 		if e.lock {
 			batchGetter = driver.NewBufferBatchGetter(txn.GetMemBuffer(), &PessimisticLockCacheGetter{txnCtx: txnCtx}, e.snapshot)
 		} else if lock != nil && (lock.Tp == ast.TableLockRead || lock.Tp == ast.TableLockReadOnly) && e.Ctx().GetSessionVars().EnablePointGetCache {
+			// The cache union does not expose per-key provenance. Refuse to
+			// treat its snapshot stats as complete even on a cache miss.
+			e.statementRUPointRead.markLocalBypass()
 			batchGetter = newCacheBatchGetter(e.Ctx(), e.tblInfo.ID, e.snapshot)
 		} else {
-			batchGetter = driver.NewBufferBatchGetter(txn.GetMemBuffer(), nil, e.snapshot)
+			var buffer driver.BatchBufferGetter = txn.GetMemBuffer()
+			if e.statementRUPointRead.owner != nil {
+				buffer = &statementRUPointReadBatchBuffer{
+					MemBuffer:  txn.GetMemBuffer(),
+					attachment: &e.statementRUPointRead,
+				}
+			}
+			batchGetter = driver.NewBufferBatchGetter(buffer, nil, e.snapshot)
 		}
 	}
 	e.batchGetter = batchGetter
+	if _, cacheTable := e.snapshot.(cacheTableSnapshot); cacheTable {
+		e.statementRUPointRead.markLocalBypass()
+	}
+	e.statementRUPointRead.install(e.snapshot)
 	return nil
 }
 
@@ -180,7 +210,8 @@ func MockNewCacheTableSnapShot(snapshot kv.Snapshot, memBuffer kv.MemBuffer) *ca
 
 // Close implements the Executor interface.
 func (e *BatchPointGetExec) Close() error {
-	if e.RuntimeStats() != nil {
+	e.statementRUPointRead.close()
+	if e.stats != nil {
 		defer func() {
 			sc := e.Ctx().GetSessionVars().StmtCtx
 			sc.MergeReadPoolTaskDetails(e.stats.SnapshotRuntimeStats.GetReadPoolTaskDetails())
@@ -192,9 +223,6 @@ func (e *BatchPointGetExec) Close() error {
 		}()
 	}
 
-	if e.RuntimeStats() != nil && e.snapshot != nil {
-		e.snapshot.SetOption(kv.CollectRuntimeStats, nil)
-	}
 	if e.indexUsageReporter != nil && e.stats != nil {
 		kvReqTotal := e.stats.GetCmdRPCCount(tikvrpc.CmdBatchGet)
 		// We cannot distinguish how many rows are coming from each partition. Here, we calculate all index usages
@@ -206,16 +234,30 @@ func (e *BatchPointGetExec) Close() error {
 			e.indexUsageReporter.ReportPointGetIndexUsageForHandle(e.tblInfo, e.tblInfo.ID, kvReqTotal, rows)
 		}
 	}
-	e.inited = 0
+	atomic.StoreUint32(&e.inited, 0)
 	e.index = 0
 	return nil
 }
 
 // Next implements the Executor interface.
-func (e *BatchPointGetExec) Next(ctx context.Context, req *chunk.Chunk) error {
+func (e *BatchPointGetExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	req.Reset()
+	completesReadPhase := false
+	if e.statementRUPointRead.owner != nil {
+		if !e.statementRUPointRead.beginNext() {
+			return nil
+		}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				e.statementRUPointRead.finishCall(false, completesReadPhase)
+				panic(recovered)
+			}
+			e.statementRUPointRead.finishCall(err == nil, completesReadPhase)
+		}()
+	}
 	if atomic.CompareAndSwapUint32(&e.inited, 0, 1) {
-		if err := e.initialize(ctx); err != nil {
+		completesReadPhase = true
+		if err = e.initialize(ctx); err != nil {
 			return err
 		}
 		if e.lock {
@@ -232,14 +274,14 @@ func (e *BatchPointGetExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	start := e.index
 	for !req.IsFull() && e.index < len(e.values) {
 		handle, val := e.handles[e.index], e.values[e.index]
-		err := DecodeRowValToChunk(sctx, schema, e.tblInfo, handle, val, req, e.rowDecoder)
+		err = DecodeRowValToChunk(sctx, schema, e.tblInfo, handle, val, req, e.rowDecoder)
 		if err != nil {
 			return err
 		}
 		e.index++
 	}
 
-	err := fillRowChecksum(sctx, start, e.index, schema, e.tblInfo, e.values, e.handles, req, nil)
+	err = fillRowChecksum(sctx, start, e.index, schema, e.tblInfo, e.values, e.handles, req, nil)
 	if err != nil {
 		return err
 	}
