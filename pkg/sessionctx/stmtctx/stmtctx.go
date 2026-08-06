@@ -317,6 +317,7 @@ type StatementContext struct {
 		unit         statementru.UnitRecorder
 		evidence     statementru.EvidenceRecorder
 		contributors statementru.UnitContributorRegistrar
+		localCPUWork statementru.LocalCPUWorkRegistrar
 	}
 	statementRUCommitPipelined bool
 	statementRUWholeTxnRetried bool
@@ -1256,16 +1257,22 @@ func (sc *StatementContext) ResetForRetry() {
 }
 
 // ConfigureStatementRU freezes one selection and, when enabled, constructs its
-// owner without exposing finalization to the selecting caller. It returns false
-// only if this StatementContext was already configured. Off, inapplicable, and
-// invalid-mode selections are accepted as fail-closed Off without allocating an
-// owner. ResetForRetry deliberately preserves the frozen decision.
+// owner without exposing finalization to the selecting caller. This production
+// adapter also activates TiDB's local CPUWork domain when CPUWork is collected;
+// statementru.NewStatement itself remains generic for remote-only owners. It
+// returns false only if this StatementContext was already configured. Off,
+// inapplicable, and invalid-mode selections are accepted as fail-closed Off
+// without allocating an owner. ResetForRetry deliberately preserves the frozen
+// decision.
 func (sc *StatementContext) ConfigureStatementRU(selection statementru.Selection) bool {
 	if sc.statementRUAttached {
 		return false
 	}
-	sc.statementRUAttached = true
 	statement := statementru.NewStatement(selection)
+	if registrar := statement.LocalCPUWorkRegistrar(); registrar != nil && !registrar.Activate() {
+		return false
+	}
+	sc.statementRUAttached = true
 	sc.statementRU = statement
 	return true
 }
@@ -1315,6 +1322,19 @@ func (sc *StatementContext) StatementRUUnitContributorRegistrar() statementru.Un
 	return sc.statementRU.UnitContributorRegistrar()
 }
 
+// StatementRULocalCPUWorkRegistrar returns the statement-owned local streaming
+// CPUWork lifecycle capability. It follows the same retry override as value
+// producers.
+func (sc *StatementContext) StatementRULocalCPUWorkRegistrar() statementru.LocalCPUWorkRegistrar {
+	if sc.statementRUOverride.active {
+		return sc.statementRUOverride.localCPUWork
+	}
+	if sc.statementRU == nil {
+		return nil
+	}
+	return sc.statementRU.LocalCPUWorkRegistrar()
+}
+
 // WithStatementRUProducerOverride routes producers using this historical
 // StatementContext to target for the callback's dynamic scope. A nil target is
 // an explicit Off override and must not fall back to the historical statement's
@@ -1327,15 +1347,18 @@ func (sc *StatementContext) WithStatementRUProducerOverride(target *StatementCon
 	var unit statementru.UnitRecorder
 	var evidence statementru.EvidenceRecorder
 	var contributors statementru.UnitContributorRegistrar
+	var localCPUWork statementru.LocalCPUWorkRegistrar
 	if target != nil {
 		unit = target.StatementRUUnitRecorder()
 		evidence = target.StatementRUEvidenceRecorder()
 		contributors = target.StatementRUUnitContributorRegistrar()
+		localCPUWork = target.StatementRULocalCPUWorkRegistrar()
 	}
 	sc.statementRUOverride.active = true
 	sc.statementRUOverride.unit = unit
 	sc.statementRUOverride.evidence = evidence
 	sc.statementRUOverride.contributors = contributors
+	sc.statementRUOverride.localCPUWork = localCPUWork
 	defer func() {
 		if sc.ctxID == lifecycleID {
 			sc.statementRUOverride = previous

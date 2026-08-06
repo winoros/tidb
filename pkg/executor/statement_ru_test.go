@@ -105,6 +105,7 @@ func TestFinishExecuteStmtReportsStatementRUOnce(t *testing.T) {
 	require.NotNil(t, evidenceRecorder)
 	require.True(t, unitRecorder.Add(statementru.CPUWork, 3))
 	require.True(t, evidenceRecorder.MarkPresent(statementru.CPUWork.Mask()))
+	require.True(t, exec.CompleteStatementRUCPUWorkInventory(sessVars.StmtCtx))
 	execStmt, err := finishCompileWithStatementRU(&ExecStmt{
 		Ctx:      ctx,
 		GoCtx:    execdetails.ContextWithInitializedExecDetails(context.Background()),
@@ -982,6 +983,84 @@ func TestStatementRUSynchronousOperatorEligibilityAndWindowFormula(t *testing.T)
 	})
 }
 
+func TestStatementRULocalCPUWorkExclusionsFailClosed(t *testing.T) {
+	newContext := func(t *testing.T) *mock.Context {
+		ctx := mock.NewContext()
+		configureStatementRUCPUWorkTest(t, ctx)
+		return ctx
+	}
+	finishWithCompleteRemote := func(t *testing.T, ctx *mock.Context) {
+		sc := ctx.GetSessionVars().StmtCtx
+		require.True(t, exec.CompleteStatementRUCPUWorkInventory(sc))
+		statement := sc.TakeStatementRUForExecution()
+		require.NotNil(t, statement)
+		remote := statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.CPUWork.Mask())
+		require.NotNil(t, remote)
+		var values statementru.UnitValues
+		values[statementru.CPUWork] = 7
+		require.True(t, remote.Complete(values))
+
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonUnsupported,
+		}, finish.Result.Outcome())
+	}
+	newChildPlan := func(ctx *mock.Context, column *expression.Column) base.PhysicalPlan {
+		dual := physicalop.PhysicalTableDual{RowCount: 0}.Init(ctx.GetPlanCtx(), nil, 0)
+		dual.SetSchema(expression.NewSchema(column))
+		return dual
+	}
+
+	t.Run("data reader builder copy", func(t *testing.T) {
+		ctx := newContext(t)
+		builder := &executorBuilder{sctx: ctx, forDataReaderBuilder: true}
+		executorUnderTest := exec.NewBaseExecutorV2(ctx.GetSessionVars(), nil, 0)
+		builder.configureStatementRUCPUWork(&executorUnderTest, 1)
+		require.NoError(t, builder.err)
+		finishWithCompleteRemote(t, ctx)
+	})
+
+	t.Run("apply", func(t *testing.T) {
+		ctx := newContext(t)
+		leftColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		rightColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		plan := physicalop.PhysicalApply{PhysicalHashJoin: physicalop.PhysicalHashJoin{
+			BasePhysicalJoin: physicalop.BasePhysicalJoin{
+				JoinType:      base.InnerJoin,
+				InnerChildIdx: 1,
+			},
+		}}.Init(ctx.GetPlanCtx(), nil, 0)
+		plan.SetSchema(expression.NewSchema(leftColumn, rightColumn))
+		plan.SetChildren(newChildPlan(ctx, leftColumn), newChildPlan(ctx, rightColumn))
+
+		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+		require.NotNil(t, builder.build(plan))
+		require.NoError(t, builder.err)
+		finishWithCompleteRemote(t, ctx)
+	})
+
+	t.Run("merge join formula invariant", func(t *testing.T) {
+		ctx := newContext(t)
+		leftColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		rightColumn := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
+		plan := physicalop.PhysicalMergeJoin{BasePhysicalJoin: physicalop.BasePhysicalJoin{
+			JoinType:      base.InnerJoin,
+			LeftJoinKeys:  []*expression.Column{leftColumn},
+			RightJoinKeys: nil,
+		}}.Init(ctx.GetPlanCtx(), nil, 0)
+		plan.SetSchema(expression.NewSchema(leftColumn, rightColumn))
+		plan.SetChildren(newChildPlan(ctx, leftColumn), newChildPlan(ctx, rightColumn))
+
+		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
+		require.NotNil(t, builder.build(plan))
+		require.NoError(t, builder.err)
+		finishWithCompleteRemote(t, ctx)
+	})
+}
+
 func TestStatementRUStatefulJoinExpressionCount(t *testing.T) {
 	col := &expression.Column{Index: 0, RetType: types.NewFieldType(mysql.TypeLonglong)}
 	baseJoin := physicalop.BasePhysicalJoin{
@@ -1058,6 +1137,7 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 	tests := []struct {
 		name            string
 		additionalUnits statementru.UnitMask
+		synchronous     bool
 		new             func(exec.BaseExecutor) exec.Executor
 	}{
 		{name: "Sort", additionalUnits: statementru.CPUWork.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
@@ -1075,7 +1155,7 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 		{name: "HashJoinV2", additionalUnits: statementru.HashStateRows.Mask() | statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.HashJoinV2Exec{BaseExecutor: base}
 		}},
-		{name: "MergeJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
+		{name: "MergeJoin", additionalUnits: statementru.JoinOutputRows.Mask(), synchronous: true, new: func(base exec.BaseExecutor) exec.Executor {
 			return &join.MergeJoinExec{BaseExecutor: base}
 		}},
 		{name: "IndexJoin", additionalUnits: statementru.JoinOutputRows.Mask(), new: func(base exec.BaseExecutor) exec.Executor {
@@ -1106,9 +1186,14 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 			executorUnderTest := tt.new(exec.NewBaseExecutor(ctx, expression.NewSchema(), 0))
 			builder := &executorBuilder{sctx: ctx}
 
-			builder.configureStatementRUUnits(executorUnderTest, 1, tt.additionalUnits)
+			if tt.synchronous {
+				builder.configureStatementRUSynchronousUnits(executorUnderTest, 1, tt.additionalUnits)
+			} else {
+				builder.configureStatementRUUnits(executorUnderTest, 1, tt.additionalUnits)
+			}
 
 			require.NoError(t, builder.err)
+			require.True(t, exec.CompleteStatementRUCPUWorkInventory(sc))
 			provider, ok := executorUnderTest.(interface{ StatementRUEnabled() bool })
 			require.True(t, ok)
 			require.True(t, provider.StatementRUEnabled())
@@ -1116,6 +1201,24 @@ func TestConfigureStatementRUStatefulConcreteExecutors(t *testing.T) {
 				CPUWorkMultiplier: 1,
 				AdditionalUnits:   tt.additionalUnits,
 			}))
+			statement := sc.TakeStatementRUForExecution()
+			require.NotNil(t, statement)
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			if tt.synchronous {
+				// This configuration-only fixture never opens the registered
+				// synchronous producer. A real MergeJoin drain is covered below;
+				// an unbegun registered producer must remain fail-closed here.
+				require.Equal(t, statementru.Outcome{
+					State:  statementru.StateUnavailable,
+					Reason: statementru.ReasonMissingEvidence,
+				}, finish.Result.Outcome())
+			} else {
+				require.Equal(t, statementru.Outcome{
+					State:  statementru.StateUnavailable,
+					Reason: statementru.ReasonUnsupported,
+				}, finish.Result.Outcome())
+			}
 		})
 	}
 
@@ -1199,9 +1302,12 @@ func TestStatementRUShuffleAsyncSubtreesExcluded(t *testing.T) {
 
 	shuffle.dataSources[0].(*SelectionExec).RecordStatementRUCPUWork(5)
 	shuffle.workers[0].childExec.(*SelectionExec).RecordStatementRUCPUWork(7)
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	finish, first := statement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StateUnavailable,
+		Reason: statementru.ReasonUnsupported,
+	}, finish.Result.Outcome())
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	require.Equal(t, float64(0), units[statementru.CPUWork])
@@ -1254,9 +1360,12 @@ func TestStatementRUSelectionRecordsBeforeMemoryPanic(t *testing.T) {
 	selection.memTracker.SetActionOnExceed(nil)
 	require.NoError(t, exec.Close(selection))
 
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	finish, first := statement.Finish(statementru.TerminalError)
 	require.True(t, first)
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StatePartial,
+		Reason: statementru.ReasonIncompleteEvidence,
+	}, finish.Result.Outcome())
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	require.Equal(t, float64(rows), units[statementru.CPUWork])
@@ -1303,9 +1412,10 @@ func drainStatementRUCPUWorkExecutor(t testing.TB, executor exec.Executor) int {
 
 func finishStatementRUCPUWorkTest(t testing.TB, statement *statementru.Statement, expected float64) {
 	require.NotNil(t, statement)
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	finish, first := statement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
+	require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+	require.True(t, finish.Result.HasTotal())
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	require.Equal(t, expected, units[statementru.CPUWork])
@@ -1337,6 +1447,7 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
 		built := builder.build(plan)
 		require.NoError(t, builder.err)
+		require.True(t, exec.CompleteStatementRUCPUWorkInventory(ctx.GetSessionVars().StmtCtx))
 		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
 		require.Equal(t, inputRows-1, drainStatementRUCPUWorkExecutor(t, built))
 		finishStatementRUCPUWorkTest(t, statement, inputRows)
@@ -1369,6 +1480,7 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 			builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
 			built := builder.build(plan)
 			require.NoError(t, builder.err)
+			require.True(t, exec.CompleteStatementRUCPUWorkInventory(ctx.GetSessionVars().StmtCtx))
 			projection := built.(*ProjectionExec)
 			if test.concurrency > 0 {
 				require.Positive(t, projection.numWorkers)
@@ -1377,7 +1489,26 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 			}
 			statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
 			require.Equal(t, inputRows, drainStatementRUCPUWorkExecutor(t, built))
-			finishStatementRUCPUWorkTest(t, statement, test.expected)
+			if test.concurrency <= 0 {
+				finishStatementRUCPUWorkTest(t, statement, test.expected)
+				return
+			}
+
+			remote := statement.UnitContributorRegistrar().RegisterUnitContributor(statementru.CPUWork.Mask())
+			require.NotNil(t, remote)
+			var values statementru.UnitValues
+			values[statementru.CPUWork] = 3
+			require.True(t, remote.Complete(values))
+			finish, first := statement.Finish(statementru.TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, statementru.Outcome{
+				State:  statementru.StatePartial,
+				Reason: statementru.ReasonUnsupported,
+			}, finish.Result.Outcome())
+			require.False(t, finish.Result.HasTotal())
+			units, ok := finish.Result.Units()
+			require.True(t, ok)
+			require.Equal(t, float64(3), units[statementru.CPUWork])
 		})
 	}
 
@@ -1400,6 +1531,7 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
 		built := builder.build(plan)
 		require.NoError(t, builder.err)
+		require.True(t, exec.CompleteStatementRUCPUWorkInventory(ctx.GetSessionVars().StmtCtx))
 		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
 		require.Equal(t, inputRows, drainStatementRUCPUWorkExecutor(t, built))
 		finishStatementRUCPUWorkTest(t, statement, inputRows*2)
@@ -1430,6 +1562,7 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 			builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
 			built := builder.build(plan)
 			require.NoError(t, builder.err)
+			require.True(t, exec.CompleteStatementRUCPUWorkInventory(ctx.GetSessionVars().StmtCtx))
 			if pipelined {
 				require.IsType(t, &windowexec.PipelinedWindowExec{}, built)
 			} else {
@@ -1481,7 +1614,9 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 		builder := newExecutorBuilder(context.Background(), ctx, nil, nil)
 		builder.configureStatementRUCPUWork(unionScan, 1)
 		require.NoError(t, builder.err)
+		require.True(t, exec.CompleteStatementRUCPUWorkInventory(ctx.GetSessionVars().StmtCtx))
 		statement := ctx.GetSessionVars().StmtCtx.TakeStatementRUForExecution()
+		require.NoError(t, exec.Open(context.Background(), &unionScan.BaseExecutor))
 
 		rows := 0
 		for {
@@ -1494,6 +1629,7 @@ func TestStatementRUSynchronousOperatorAccounting(t *testing.T) {
 			unionScan.cursor4SnapshotRows++
 		}
 		require.Equal(t, inputRows, rows)
+		require.NoError(t, exec.Close(&unionScan.BaseExecutor))
 		finishStatementRUCPUWorkTest(t, statement, inputRows)
 	})
 }

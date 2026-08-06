@@ -104,6 +104,10 @@ func TestCompilerTransfersStatementRUOwnerToExecStmt(t *testing.T) {
 	}))
 	require.True(t, stmtCtx.StatementRUUnitRecorder().Add(statementru.CPUWork, 3))
 	require.True(t, stmtCtx.StatementRUEvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
+	// This fixture covers only Compiler's owner transfer and deliberately skips
+	// ExecStmt execution. Model the successful inventory checkpoint manually;
+	// production Exec and PointGet checkpoints have separate end-to-end tests.
+	require.True(t, stmtCtx.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
 	stmtNode, err := parser.New().ParseOneStmt("select 1", "", "")
 	require.NoError(t, err)
 

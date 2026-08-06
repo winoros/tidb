@@ -123,9 +123,7 @@ func (b *statementRUMutationMemBuffer) recordMutation() {
 	if b == nil || b.owner == nil {
 		return
 	}
-	if recorder := b.owner.statementRUCPUWorkRecorder(); recorder != nil {
-		recorder.Add(statementru.CPUWork, 1)
-	}
+	b.owner.recordStatementRUMutationCPUWork()
 }
 
 func (b *statementRUMutationMemBuffer) Set(key kv.Key, value []byte) error {
@@ -185,6 +183,19 @@ func (txn *LazyTxn) statementRUCPUWorkRecorder() statementru.UnitRecorder {
 	return recorder
 }
 
+func (txn *LazyTxn) recordStatementRUMutationCPUWork() {
+	vars := txn.statementRUVars
+	if vars == nil || vars.StmtCtx == nil {
+		return
+	}
+	recorder := txn.statementRUCPUWorkRecorder()
+	registrar := vars.StmtCtx.StatementRULocalCPUWorkRegistrar()
+	if recorder == nil || registrar == nil || !recorder.Add(statementru.CPUWork, 1) {
+		return
+	}
+	registrar.RecordLocalCPUWorkObservation()
+}
+
 // GetMemBuffer overrides the embedded transaction method so foreground encoded
 // mutation preparation shares the current logical statement CPUWork recorder.
 // Off and selections that do not collect CPUWork return the original buffer
@@ -198,6 +209,9 @@ func (txn *LazyTxn) GetMemBuffer() kv.MemBuffer {
 		// Fail closed if a nonstandard LazyTxn constructor did not initialize
 		// the proxy for this inner transaction; SQL mutation behavior must remain
 		// unchanged.
+		if registrar := txn.statementRUVars.StmtCtx.StatementRULocalCPUWorkRegistrar(); registrar != nil {
+			registrar.MarkLocalCPUWorkUnsupported()
+		}
 		return buffer
 	}
 	return &txn.statementRUMutationBuffer
@@ -205,17 +219,13 @@ func (txn *LazyTxn) GetMemBuffer() kv.MemBuffer {
 
 // Set records foreground paths that mutate through Transaction directly.
 func (txn *LazyTxn) Set(key kv.Key, value []byte) error {
-	if recorder := txn.statementRUCPUWorkRecorder(); recorder != nil {
-		recorder.Add(statementru.CPUWork, 1)
-	}
+	txn.recordStatementRUMutationCPUWork()
 	return txn.Transaction.Set(key, value)
 }
 
 // Delete records foreground paths that mutate through Transaction directly.
 func (txn *LazyTxn) Delete(key kv.Key) error {
-	if recorder := txn.statementRUCPUWorkRecorder(); recorder != nil {
-		recorder.Add(statementru.CPUWork, 1)
-	}
+	txn.recordStatementRUMutationCPUWork()
 	return txn.Transaction.Delete(key)
 }
 

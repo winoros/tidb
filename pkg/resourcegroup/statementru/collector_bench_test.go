@@ -101,6 +101,53 @@ func BenchmarkStatementUnitContributorParallel(b *testing.B) {
 	benchmarkFinish, _ = statement.Finish(TerminalSuccess)
 }
 
+func BenchmarkStatementLocalCPUWorkOwner(b *testing.B) {
+	// This isolates the core owner and opaque producer tokens. Each address-taken
+	// token may escape once in this fixture; BenchmarkStatementRUCPUWorkStatementSetup
+	// in executor/internal/exec measures the complete StatementContext + hook
+	// construction and lifecycle path.
+	weights := Weights{CPUWork: 1}
+	for _, test := range []struct {
+		name      string
+		producers int
+	}{
+		{name: "zero_producers", producers: 0},
+		{name: "one_producer", producers: 1},
+		{name: "32_producers", producers: 32},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				statement := NewStatement(Selection{
+					Mode:          ModeResultOnly,
+					Applicable:    true,
+					RequiredUnits: CPUWork.Mask(),
+					Weights:       &weights,
+				})
+				registrar := statement.LocalCPUWorkRegistrar()
+				if !registrar.Activate() {
+					b.Fatal("failed to activate local CPUWork owner")
+				}
+				for range test.producers {
+					var producer LocalCPUWorkProducer
+					if !registrar.RegisterLocalCPUWorkProducer(&producer) ||
+						!producer.BeginGeneration() || !producer.CompleteGeneration() {
+						b.Fatal("failed to complete local CPUWork producer")
+					}
+				}
+				if !registrar.CompleteLocalCPUWorkInventory() {
+					b.Fatal("failed to complete local CPUWork inventory")
+				}
+				var first bool
+				benchmarkFinish, first = statement.Finish(TerminalSuccess)
+				if !first || benchmarkFinish.Result.Outcome().State != StateComplete {
+					b.Fatal("statement did not complete local CPUWork lifecycle")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkCollectorLifecycleFinalize(b *testing.B) {
 	weights := Weights{CPUWork: 1}
 	b.ReportAllocs()

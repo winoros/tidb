@@ -124,10 +124,16 @@ func TestRUV2ExecutorMetricByTypeIncludesConcreteExecutorTypes(t *testing.T) {
 
 type mockStatementRUExecutor struct {
 	BaseExecutorV2
-	rows       int
-	returnErr  error
-	panicValue any
-	childReq   *chunk.Chunk
+	rows        int
+	openErr     error
+	closeErr    error
+	returnErr   error
+	openPanic   any
+	closePanic  any
+	panicValue  any
+	nextStarted chan<- struct{}
+	nextRelease <-chan struct{}
+	childReq    *chunk.Chunk
 }
 
 type statementRUUnsupportedExecutor struct {
@@ -145,6 +151,20 @@ func newMockStatementRUExecutor(ctx sessionctx.Context, rows int, children ...Ex
 	return executor
 }
 
+func (e *mockStatementRUExecutor) Open(context.Context) error {
+	if e.openPanic != nil {
+		panic(e.openPanic)
+	}
+	return e.openErr
+}
+
+func (e *mockStatementRUExecutor) Close() error {
+	if e.closePanic != nil {
+		panic(e.closePanic)
+	}
+	return e.closeErr
+}
+
 func (e *mockStatementRUExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
 	if len(e.AllChildren()) > 0 {
@@ -153,6 +173,12 @@ func (e *mockStatementRUExecutor) Next(ctx context.Context, req *chunk.Chunk) er
 			return err
 		}
 		e.RecordStatementRUCPUWork(e.childReq.NumRows())
+	}
+	if e.nextStarted != nil {
+		e.nextStarted <- struct{}{}
+	}
+	if e.nextRelease != nil {
+		<-e.nextRelease
 	}
 	if e.panicValue != nil {
 		panic(e.panicValue)
@@ -174,11 +200,11 @@ func configureStatementRUCPUWorkForTest(t testing.TB, ctx sessionctx.Context, ex
 		Weights:       &weights,
 	}))
 	require.True(t, ConfigureStatementRUCPUWork(executor, sc, multiplier))
+	require.True(t, CompleteStatementRUCPUWorkInventory(sc))
 	return sc.TakeStatementRUForExecution()
 }
 
 func statementRUCPUWorkUnits(t testing.TB, statement *statementru.Statement, terminal statementru.TerminalStatus) float64 {
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	finish, first := statement.Finish(terminal)
 	require.True(t, first)
 	units, ok := finish.Result.Units()
@@ -258,10 +284,108 @@ func TestStatementRUCPUWorkHookAccounting(t *testing.T) {
 
 		require.Equal(t, float64(0), statementRUCPUWorkUnits(t, statement, statementru.TerminalError))
 	})
+
+	t.Run("reopened synchronous executor completes every generation", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+
+		for range 2 {
+			require.NoError(t, Open(context.Background(), executor))
+			require.NoError(t, Close(executor))
+		}
+
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+	})
+
+	t.Run("active generation fails closed", func(t *testing.T) {
+		ctx := mock.NewContext()
+		executor := newMockStatementRUExecutor(ctx, 0)
+		statement := configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+		require.NoError(t, Open(context.Background(), executor))
+
+		finish, first := statement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StateUnavailable,
+			Reason: statementru.ReasonMissingEvidence,
+		}, finish.Result.Outcome())
+	})
+
+	for _, test := range []struct {
+		name       string
+		openErr    error
+		openPanic  any
+		closeErr   error
+		closePanic any
+	}{
+		{name: "open error", openErr: errors.New("open failed")},
+		{name: "open panic", openPanic: "open panicked"},
+		{name: "close error", closeErr: errors.New("close failed")},
+		{name: "close panic", closePanic: "close panicked"},
+	} {
+		t.Run(test.name+" fails closed", func(t *testing.T) {
+			ctx := mock.NewContext()
+			executor := newMockStatementRUExecutor(ctx, 0)
+			executor.openErr = test.openErr
+			executor.openPanic = test.openPanic
+			executor.closeErr = test.closeErr
+			executor.closePanic = test.closePanic
+			statement := configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+
+			openErr := Open(context.Background(), executor)
+			if test.openErr != nil || test.openPanic != nil {
+				require.Error(t, openErr)
+			} else {
+				require.NoError(t, openErr)
+				require.Error(t, Close(executor))
+			}
+
+			finish, first := statement.Finish(statementru.TerminalError)
+			require.True(t, first)
+			require.False(t, finish.Result.HasTotal())
+			require.Equal(t, statementru.Outcome{
+				State:  statementru.StateUnavailable,
+				Reason: statementru.ReasonMissingEvidence,
+			}, finish.Result.Outcome())
+		})
+	}
+
+	t.Run("concurrent close cannot hide late next error", func(t *testing.T) {
+		ctx := mock.NewContext()
+		child := newMockStatementRUExecutor(ctx, 3)
+		executor := newMockStatementRUExecutor(ctx, 0, child)
+		executor.returnErr = errors.New("next failed after close")
+		nextStarted := make(chan struct{})
+		nextRelease := make(chan struct{})
+		executor.nextStarted = nextStarted
+		executor.nextRelease = nextRelease
+		statement := configureStatementRUCPUWorkForTest(t, ctx, executor, 1)
+		require.NoError(t, Open(context.Background(), executor))
+
+		nextErr := make(chan error, 1)
+		go func() {
+			nextErr <- Next(context.Background(), executor, executor.NewChunk())
+		}()
+		<-nextStarted
+		require.NoError(t, Close(executor))
+		close(nextRelease)
+		require.ErrorIs(t, <-nextErr, executor.returnErr)
+
+		finish, first := statement.Finish(statementru.TerminalError)
+		require.True(t, first)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonIncompleteEvidence,
+		}, finish.Result.Outcome())
+	})
 }
 
 func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
-	t.Run("off and zero formulas install no hook", func(t *testing.T) {
+	t.Run("off installs no hook and selected zero formula owns coverage", func(t *testing.T) {
 		ctx := mock.NewContext()
 		executor := newMockStatementRUExecutor(ctx, 0, newMockStatementRUExecutor(ctx, 1))
 
@@ -277,7 +401,9 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 			Weights:       &weights,
 		}))
 		require.True(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, 0))
-		require.Nil(t, executor.statementRUHook)
+		require.NotNil(t, executor.statementRUHook)
+		require.True(t, executor.statementRUHook.cpuWorkEnabled)
+		require.Zero(t, executor.statementRUHook.multiplier)
 		require.False(t, ConfigureStatementRUCPUWork(executor, ctx.GetSessionVars().StmtCtx, -1))
 	})
 
@@ -391,7 +517,10 @@ func TestStatementRUCPUWorkHookConfiguration(t *testing.T) {
 		require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 		finish, first := statement.Finish(statementru.TerminalSuccess)
 		require.True(t, first)
-		require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonUnsupported,
+		}, finish.Result.Outcome())
 		units, ok := finish.Result.Units()
 		require.True(t, ok)
 		require.Equal(t, float64(2), units[statementru.CPUWork])
@@ -487,6 +616,92 @@ func BenchmarkStatementRUCPUWorkHook(b *testing.B) {
 			b.StopTimer()
 			if statement != nil {
 				require.Equal(b, float64(b.N), statementRUCPUWorkUnits(b, statement, statementru.TerminalSuccess))
+			}
+		})
+	}
+}
+
+func BenchmarkStatementRUCPUWorkGenerationLifecycle(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := mock.NewContext()
+			executor := newMockStatementRUExecutor(ctx, 0)
+			var statement *statementru.Statement
+			if enabled {
+				statement = configureStatementRUCPUWorkForTest(b, ctx, executor, 1)
+			}
+			goCtx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := Open(goCtx, executor); err != nil {
+					b.Fatal(err)
+				}
+				if err := Close(executor); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			if statement != nil {
+				benchmarkFinish, first := statement.Finish(statementru.TerminalSuccess)
+				if !first || benchmarkFinish.Result.Outcome().State != statementru.StateComplete {
+					b.Fatal("local CPUWork owner did not complete")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStatementRUCPUWorkStatementSetup(b *testing.B) {
+	weights := statementru.Weights{statementru.CPUWork: 1}
+	for _, test := range []struct {
+		name      string
+		producers int
+	}{
+		{name: "zero_producers"},
+		{name: "one_producer", producers: 1},
+		{name: "32_producers", producers: 32},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				ctx := mock.NewContext()
+				sc := ctx.GetSessionVars().StmtCtx
+				if !sc.ConfigureStatementRU(statementru.Selection{
+					Mode:          statementru.ModeResultOnly,
+					Applicable:    true,
+					RequiredUnits: statementru.CPUWork.Mask(),
+					Weights:       &weights,
+				}) {
+					b.Fatal("statement RU setup rejected")
+				}
+				statement := sc.TakeStatementRUForExecution()
+				var executors [32]*mockStatementRUExecutor
+				for i := range test.producers {
+					executors[i] = newMockStatementRUExecutor(ctx, 0)
+					if !ConfigureStatementRUCPUWork(executors[i], sc, 1) {
+						b.Fatal("CPUWork producer setup rejected")
+					}
+				}
+				if !CompleteStatementRUCPUWorkInventory(sc) {
+					b.Fatal("CPUWork inventory completion rejected")
+				}
+				for i := range test.producers {
+					if err := Open(context.Background(), executors[i]); err != nil {
+						b.Fatal(err)
+					}
+					if err := Close(executors[i]); err != nil {
+						b.Fatal(err)
+					}
+				}
+				finish, first := statement.Finish(statementru.TerminalSuccess)
+				if !first || finish.Result.Outcome().State != statementru.StateComplete {
+					b.Fatal("statement RU setup did not complete")
+				}
 			}
 		})
 	}

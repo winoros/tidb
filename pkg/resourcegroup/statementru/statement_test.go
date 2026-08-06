@@ -358,6 +358,205 @@ func TestStatementSelectionAndFinish(t *testing.T) {
 		require.Equal(t, finish, again)
 		require.Equal(t, 1, reporter.calls)
 	})
+
+	t.Run("local streaming CPU evidence combines with remote contributors", func(t *testing.T) {
+		newStatement := func(t *testing.T) *Statement {
+			statement := NewStatement(Selection{
+				Mode:          ModeCalibration,
+				Applicable:    true,
+				RequiredUnits: CPUWork.Mask(),
+				Weights:       &weights,
+			})
+			require.True(t, statement.LocalCPUWorkRegistrar().Activate())
+			return statement
+		}
+		completeRemote := func(t *testing.T, statement *Statement, value float64) {
+			remote := statement.UnitContributorRegistrar().RegisterUnitContributor(CPUWork.Mask())
+			require.NotNil(t, remote)
+			var values UnitValues
+			values[CPUWork] = value
+			require.True(t, remote.Complete(values))
+		}
+		completeInventory := func(t *testing.T, statement *Statement) {
+			require.True(t, statement.LocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
+		}
+
+		t.Run("complete local and remote domains are additive", func(t *testing.T) {
+			statement := newStatement(t)
+			var producer LocalCPUWorkProducer
+			require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+			require.True(t, producer.BeginGeneration())
+			require.True(t, statement.UnitRecorder().Add(CPUWork, 2))
+			require.True(t, producer.CompleteGeneration())
+			completeInventory(t, statement)
+			completeRemote(t, statement, 3)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateComplete}, finish.Result.Outcome())
+			total, ok := finish.Result.TotalRU()
+			require.True(t, ok)
+			require.Equal(t, float64(10), total)
+		})
+
+		t.Run("inventoried empty local domain is authoritative zero", func(t *testing.T) {
+			statement := newStatement(t)
+			completeInventory(t, statement)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateComplete}, finish.Result.Outcome())
+			total, ok := finish.Result.TotalRU()
+			require.True(t, ok)
+			require.Zero(t, total)
+		})
+
+		t.Run("retry inventory pass may extend after completion", func(t *testing.T) {
+			statement := newStatement(t)
+			completeInventory(t, statement)
+			var producer LocalCPUWorkProducer
+			require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+			require.True(t, producer.BeginGeneration())
+			require.True(t, statement.UnitRecorder().Add(CPUWork, 2))
+			require.True(t, producer.RecordObservation())
+			require.True(t, producer.CompleteGeneration())
+			completeInventory(t, statement)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateComplete}, finish.Result.Outcome())
+			units, ok := finish.Result.Units()
+			require.True(t, ok)
+			require.Equal(t, float64(2), units[CPUWork])
+		})
+
+		t.Run("producer added after inventory checkpoint remains fail closed", func(t *testing.T) {
+			statement := newStatement(t)
+			completeInventory(t, statement)
+			var producer LocalCPUWorkProducer
+			require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.False(t, finish.Result.HasTotal())
+			require.Equal(t, Outcome{State: StateUnavailable, Reason: ReasonMissingEvidence}, finish.Result.Outcome())
+		})
+
+		t.Run("late observation is rejected after finish", func(t *testing.T) {
+			statement := newStatement(t)
+			registrar := statement.LocalCPUWorkRegistrar()
+			require.True(t, registrar.RecordLocalCPUWorkObservation())
+			completeInventory(t, statement)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateComplete}, finish.Result.Outcome())
+			require.False(t, registrar.RecordLocalCPUWorkObservation())
+		})
+
+		t.Run("activation alone does not authorize empty local zero", func(t *testing.T) {
+			statement := newStatement(t)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StateUnavailable, Reason: ReasonMissingEvidence}, finish.Result.Outcome())
+		})
+
+		t.Run("remote present cannot hide uncompleted empty inventory", func(t *testing.T) {
+			reporter := &recordingStatementRUReporter{}
+			statement := NewStatement(Selection{
+				Mode:          ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: CPUWork.Mask(),
+				Weights:       &weights,
+				Reporter:      reporter,
+			})
+			require.True(t, statement.LocalCPUWorkRegistrar().Activate())
+			completeRemote(t, statement, 3)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.False(t, finish.Result.HasTotal())
+			require.False(t, finish.ReportSelected)
+			require.Empty(t, reporter.all())
+			require.Equal(t, Outcome{State: StatePartial, Reason: ReasonIncompleteEvidence}, finish.Result.Outcome())
+		})
+
+		t.Run("remote present cannot hide local unsupported", func(t *testing.T) {
+			statement := newStatement(t)
+			require.True(t, statement.LocalCPUWorkRegistrar().MarkLocalCPUWorkUnsupported())
+			completeRemote(t, statement, 3)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StatePartial, Reason: ReasonUnsupported}, finish.Result.Outcome())
+			coverage, ok := finish.Result.Coverage()
+			require.True(t, ok)
+			require.Equal(t, CPUWork.Mask(), coverage.PresentUnits)
+			require.Equal(t, CPUWork.Mask(), coverage.UnavailableUnits)
+			require.Equal(t, CPUWork.Mask(), coverage.UnsupportedUnits)
+		})
+
+		t.Run("remote present cannot hide active local generation", func(t *testing.T) {
+			statement := newStatement(t)
+			var producer LocalCPUWorkProducer
+			require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+			require.True(t, producer.BeginGeneration())
+			completeInventory(t, statement)
+			completeRemote(t, statement, 3)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StatePartial, Reason: ReasonIncompleteEvidence}, finish.Result.Outcome())
+			coverage, ok := finish.Result.Coverage()
+			require.True(t, ok)
+			require.Equal(t, CPUWork.Mask(), coverage.PresentUnits)
+			require.Equal(t, CPUWork.Mask(), coverage.UnavailableUnits)
+		})
+
+		t.Run("late next error downgrades completed close", func(t *testing.T) {
+			statement := newStatement(t)
+			var producer LocalCPUWorkProducer
+			require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+			require.True(t, producer.BeginGeneration())
+			require.True(t, statement.UnitRecorder().Add(CPUWork, 2))
+			require.True(t, producer.CompleteGeneration())
+			require.False(t, producer.AbortGeneration(true))
+			completeInventory(t, statement)
+
+			finish, first := statement.Finish(TerminalSuccess)
+			require.True(t, first)
+			require.Equal(t, Outcome{State: StatePartial, Reason: ReasonIncompleteEvidence}, finish.Result.Outcome())
+		})
+
+		t.Run("begin and seal race preserves authority ordering", func(t *testing.T) {
+			for range 100 {
+				statement := newStatement(t)
+				var producer LocalCPUWorkProducer
+				require.True(t, statement.LocalCPUWorkRegistrar().RegisterLocalCPUWorkProducer(&producer))
+				completeInventory(t, statement)
+
+				start := make(chan struct{})
+				begun := make(chan bool, 1)
+				finished := make(chan FinishResult, 1)
+				go func() {
+					<-start
+					begun <- producer.BeginGeneration()
+				}()
+				go func() {
+					<-start
+					finish, _ := statement.Finish(TerminalSuccess)
+					finished <- finish
+				}()
+				close(start)
+
+				<-begun
+				finish := <-finished
+				require.False(t, finish.Result.HasTotal())
+				require.Equal(t, StateUnavailable, finish.Result.Outcome().State)
+			}
+		})
+	})
 }
 
 func TestStatementFinishReportingGate(t *testing.T) {

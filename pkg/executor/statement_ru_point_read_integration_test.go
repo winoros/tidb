@@ -131,6 +131,52 @@ func drainStatementRUPointRecordSet(t *testing.T, rs sqlexec.RecordSet) {
 	require.NoError(t, rs.Close())
 }
 
+func TestStatementRULocalCPUWorkInventoryProductionBoundaries(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (id bigint primary key, v bigint)")
+	tk.MustExec("insert into t values (1, 10)")
+
+	for _, test := range []struct {
+		name      string
+		sql       string
+		pointGet  bool
+		wantTotal float64
+	}{
+		{name: "ordinary Exec", sql: "select 1", wantTotal: 1},
+		{name: "PointGet", sql: "select * from t where id = 1", pointGet: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stmtNode, err := parser.New().ParseOneStmt(test.sql, "", "")
+			require.NoError(t, err)
+			require.NoError(t, tk.Session().PrepareTxnCtx(context.Background(), stmtNode))
+			require.NoError(t, executor.ResetContextOfStmt(tk.Session(), stmtNode))
+			reporter := &statementRUPointReporter{}
+			weights := statementru.Weights{statementru.CPUWork: 1}
+			require.True(t, tk.Session().GetSessionVars().StmtCtx.ConfigureStatementRU(statementru.Selection{
+				Mode:          statementru.ModeResultOnly,
+				Applicable:    true,
+				RequiredUnits: statementru.CPUWork.Mask(),
+				Weights:       &weights,
+				Reporter:      reporter,
+			}))
+
+			execStmt, err := (&executor.Compiler{Ctx: tk.Session()}).Compile(context.Background(), stmtNode)
+			require.NoError(t, err)
+			rs, err := execStmt.Exec(context.Background())
+			require.NoError(t, err)
+			if test.pointGet {
+				withExecutor, ok := rs.(statementRUExecutorRecordSet)
+				require.True(t, ok, "record set type %T", rs)
+				require.IsType(t, &executor.PointGetExecutor{}, withExecutor.GetExecutor4Test())
+			}
+			drainStatementRUPointRecordSet(t, rs)
+			require.Equal(t, []statementru.Report{{TotalRU: test.wantTotal}}, reporter.reports)
+		})
+	}
+}
+
 func requireMissingPointReadScanDetail(
 	t *testing.T,
 	operation txnsnapshot.PointReadOperationStats,

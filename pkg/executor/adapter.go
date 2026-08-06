@@ -646,6 +646,9 @@ func (a *ExecStmt) PointGet(ctx context.Context) (*recordSet, error) {
 			a.PsStmt.PointGet.Executor = pointExecutor
 		}
 	}
+	if !exec.CompleteStatementRUCPUWorkInventory(a.Ctx.GetSessionVars().StmtCtx) {
+		return nil, errors.New("cannot complete statement RU CPU work inventory")
+	}
 
 	if err = exec.Open(ctx, executor); err != nil {
 		terror.Log(exec.Close(executor))
@@ -1706,6 +1709,9 @@ func (a *ExecStmt) buildExecutor(ctx context.Context) (exec.Executor, error) {
 			sctx.GetSessionVars().StmtCtx.Priority = kv.PriorityLow
 		}
 		e = executorExec.stmtExec
+	}
+	if !exec.CompleteStatementRUCPUWorkInventory(stmtCtx) {
+		return nil, errors.New("cannot complete statement RU CPU work inventory")
 	}
 	a.isSelectForUpdate = b.hasLock && (!stmtCtx.InDeleteStmt && !stmtCtx.InUpdateStmt && !stmtCtx.InInsertStmt)
 	return e, nil

@@ -86,9 +86,12 @@ func newStatementRUJoinDataSource(ctx sessionctx.Context, failNext bool) exec.Ex
 
 func configureStatementRUJoin(t testing.TB, ctx sessionctx.Context, executor exec.Executor, multiplier int) *statementru.Statement {
 	additionalUnits := statementru.JoinOutputRows.Mask()
+	synchronousCPUWork := false
 	switch executor.(type) {
 	case *exec.BaseExecutor, *HashJoinV1Exec, *HashJoinV2Exec:
 		additionalUnits |= statementru.HashStateRows.Mask()
+	case *MergeJoinExec:
+		synchronousCPUWork = true
 	}
 	required := statementru.CPUWork.Mask() | additionalUnits
 	weights := statementru.Weights{
@@ -104,18 +107,27 @@ func configureStatementRUJoin(t testing.TB, ctx sessionctx.Context, executor exe
 		Weights:       &weights,
 	}))
 	require.True(t, exec.ConfigureStatementRUExecutor(executor, sc, exec.StatementRUExecutorConfig{
-		CPUWorkMultiplier: multiplier,
-		AdditionalUnits:   additionalUnits,
+		CPUWorkMultiplier:  multiplier,
+		AdditionalUnits:    additionalUnits,
+		SynchronousCPUWork: synchronousCPUWork,
 	}))
+	require.True(t, exec.CompleteStatementRUCPUWorkInventory(sc))
 	statement := sc.TakeStatementRUForExecution()
 	require.NotNil(t, statement)
 	return statement
 }
 
 func finishStatementRUJoin(t testing.TB, statement *statementru.Statement, terminal statementru.TerminalStatus) statementru.UnitValues {
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statement.UnitRecorder().CollectedUnits()))
+	require.True(t, statement.EvidenceRecorder().MarkPresent(
+		statement.UnitRecorder().CollectedUnits()&^statementru.CPUWork.Mask(),
+	))
 	finish, first := statement.Finish(terminal)
 	require.True(t, first)
+	if finish.Result.Outcome().State == statementru.StateComplete {
+		require.True(t, finish.Result.HasTotal())
+	} else {
+		require.False(t, finish.Result.HasTotal())
+	}
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	return units
@@ -201,8 +213,11 @@ func TestStatementRUJoinRuntimeCompletion(t *testing.T) {
 		require.True(t, statement.EvidenceRecorder().MarkPresent(required))
 		finish, first := statement.Finish(statementru.TerminalError)
 		require.True(t, first)
-		require.True(t, finish.Result.HasTotal())
-		require.NotEqual(t, statementru.StateInvalid, finish.Result.Outcome().State)
+		require.False(t, finish.Result.HasTotal())
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonUnsupported,
+		}, finish.Result.Outcome())
 	})
 
 	for _, test := range []struct {
@@ -611,8 +626,11 @@ func TestStatementRUConcurrentCloseSuppressesAsyncTerminal(t *testing.T) {
 			require.True(t, fixture.statement.EvidenceRecorder().MarkPresent(fixture.statement.UnitRecorder().CollectedUnits()))
 			finish, first := fixture.statement.Finish(statementru.TerminalCanceled)
 			require.True(t, first)
-			require.True(t, finish.Result.HasTotal())
-			require.NotEqual(t, statementru.StateInvalid, finish.Result.Outcome().State)
+			require.False(t, finish.Result.HasTotal())
+			require.Equal(t, statementru.Outcome{
+				State:  statementru.StatePartial,
+				Reason: statementru.ReasonUnsupported,
+			}, finish.Result.Outcome())
 			units, ok := finish.Result.Units()
 			require.True(t, ok)
 			require.Zero(t, units[statementru.CPUWork])

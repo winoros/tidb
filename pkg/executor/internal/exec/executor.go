@@ -90,20 +90,28 @@ func needNextIOAcc(trackRUV2 bool, parentAcc *nextIOAcc, childCount int) bool {
 	return childCount > 0 && (trackRUV2 || parentAcc != nil)
 }
 
-// statementRUHook is immutable after executor construction. Keeping the
-// hook behind a pointer makes the universally-off executor footprint one word
-// and keeps the hot path independent of session/context lookups.
+// statementRUHook freezes configuration after construction. The synchronous
+// lifecycle wrapper alone resets and updates cpuWorkObserved for each Open
+// generation. Keeping the hook behind a pointer makes the universally-off
+// executor footprint one word and avoids hot-path session/context lookups.
 type statementRUHook struct {
-	recorder   statementru.UnitRecorder
-	multiplier float64
-	allowed    statementru.UnitMask
+	recorder        statementru.UnitRecorder
+	cpuWork         statementru.LocalCPUWorkProducer
+	multiplier      float64
+	allowed         statementru.UnitMask
+	cpuWorkEnabled  bool
+	cpuWorkObserved stdatomic.Bool
 }
 
 func (h *statementRUHook) recordInputRows(rows int64) {
 	if h == nil || rows <= 0 || h.multiplier == 0 {
 		return
 	}
-	h.recorder.Add(statementru.CPUWork, float64(rows)*h.multiplier)
+	if h.recorder.Add(statementru.CPUWork, float64(rows)*h.multiplier) {
+		if h.cpuWorkObserved.CompareAndSwap(false, true) {
+			h.cpuWork.RecordObservation()
+		}
+	}
 }
 
 func (h *statementRUHook) recordUnit(kind statementru.UnitKind, delta float64) {
@@ -118,11 +126,13 @@ type statementRUProvider interface {
 }
 
 // StatementRUExecutorConfig freezes the units one executor can produce.
-// AdditionalUnits contains terminal or nonlinear units beyond the linear
-// CPUWork formula selected by a positive CPUWorkMultiplier.
+// AdditionalUnits contains terminal or nonlinear units beyond the CPUWork
+// formula selected by CPUWorkMultiplier. SynchronousCPUWork is true only when
+// successful Close proves the complete streaming CPUWork contribution.
 type StatementRUExecutorConfig struct {
-	CPUWorkMultiplier int
-	AdditionalUnits   statementru.UnitMask
+	CPUWorkMultiplier  int
+	AdditionalUnits    statementru.UnitMask
+	SynchronousCPUWork bool
 }
 
 // ConfigureStatementRUExecutor installs one frozen executor recorder. An
@@ -132,11 +142,14 @@ func ConfigureStatementRUExecutor(e Executor, sc *stmtctx.StatementContext, conf
 	if !ok || config.CPUWorkMultiplier < 0 || config.AdditionalUnits&^statementru.AllUnits != 0 {
 		return false
 	}
+	if lifecycleProvider, ok := e.(executorRuntimeProvider); ok && lifecycleProvider.statementRULifecycleHook() != nil {
+		return false
+	}
 	if sc == nil {
 		return true
 	}
 	producedUnits := config.AdditionalUnits
-	if config.CPUWorkMultiplier > 0 {
+	if config.CPUWorkMultiplier > 0 || config.SynchronousCPUWork {
 		producedUnits |= statementru.CPUWork.Mask()
 	}
 	recorder := sc.StatementRUUnitRecorder()
@@ -152,20 +165,63 @@ func ConfigureStatementRUExecutor(e Executor, sc *stmtctx.StatementContext, conf
 	if allowedUnits&statementru.CPUWork.Mask() == 0 {
 		multiplier = 0
 	}
-	return provider.installStatementRUHook(&statementRUHook{
+	hook := &statementRUHook{
 		recorder:   recorder,
 		multiplier: float64(multiplier),
 		allowed:    allowedUnits,
-	})
+	}
+	if allowedUnits&statementru.CPUWork.Mask() != 0 {
+		registrar := sc.StatementRULocalCPUWorkRegistrar()
+		if registrar == nil {
+			return false
+		}
+		if config.SynchronousCPUWork {
+			if !registrar.RegisterLocalCPUWorkProducer(&hook.cpuWork) {
+				return false
+			}
+			hook.cpuWorkEnabled = true
+		} else if !registrar.MarkLocalCPUWorkUnsupported() {
+			return false
+		}
+	}
+	return provider.installStatementRUHook(hook)
 }
 
 // ConfigureStatementRUCPUWork installs one frozen synchronous executor
 // formula and reports whether the request is supported and valid. The caller
 // is responsible for excluding asynchronous executor forms. A zero multiplier
-// is a valid zero formula and needs no hot-path hook. An enabled hook can be
-// installed only once during executor construction.
+// is a valid zero formula and installs only the lifecycle owner when CPUWork is
+// collected. An enabled hook can be installed only once during executor
+// construction.
 func ConfigureStatementRUCPUWork(e Executor, sc *stmtctx.StatementContext, multiplier int) bool {
-	return ConfigureStatementRUExecutor(e, sc, StatementRUExecutorConfig{CPUWorkMultiplier: multiplier})
+	return ConfigureStatementRUExecutor(e, sc, StatementRUExecutorConfig{
+		CPUWorkMultiplier:  multiplier,
+		SynchronousCPUWork: true,
+	})
+}
+
+// MarkStatementRUCPUWorkUnsupported records one audited local producer shape
+// whose current implementation cannot prove complete CPUWork evidence. It is
+// a true no-op when CPUWork is not collected.
+func MarkStatementRUCPUWorkUnsupported(sc *stmtctx.StatementContext) bool {
+	if sc == nil {
+		return true
+	}
+	registrar := sc.StatementRULocalCPUWorkRegistrar()
+	return registrar == nil || registrar.MarkLocalCPUWorkUnsupported()
+}
+
+// CompleteStatementRUCPUWorkInventory records one successful top-level builder
+// inventory pass after executor construction has finished. Selection alone
+// never authorizes an empty local-domain zero. A later retry build may register
+// additional producers; registration is tracked immediately and remains
+// fail-closed until those producer generations complete.
+func CompleteStatementRUCPUWorkInventory(sc *stmtctx.StatementContext) bool {
+	if sc == nil {
+		return true
+	}
+	registrar := sc.StatementRULocalCPUWorkRegistrar()
+	return registrar == nil || registrar.CompleteLocalCPUWorkInventory()
 }
 
 type ruv2ExecutorMetric struct {
@@ -252,8 +308,9 @@ type ruv2NextCacheState struct {
 	hasInfo    bool
 }
 
-type ruv2CacheProvider interface {
+type executorRuntimeProvider interface {
 	ruv2NextCache() *ruv2NextCacheState
+	statementRULifecycleHook() *statementRUHook
 }
 
 func populateRUV2NextCache(ctx context.Context, cache *ruv2NextCacheState, e Executor) {
@@ -601,6 +658,10 @@ func (e *BaseExecutorV2) installStatementRUHook(hook *statementRUHook) bool {
 	return true
 }
 
+func (e *BaseExecutorV2) statementRULifecycleHook() *statementRUHook {
+	return e.statementRUHook
+}
+
 // RecordStatementRUCPUWork records rows successfully returned by this
 // synchronous executor's direct child. Asynchronous executor forms must not be
 // configured with a hook.
@@ -732,16 +793,28 @@ func NewFirstChunk(e Executor) *chunk.Chunk {
 
 // Open is a wrapper function on e.Open(), it handles some common codes.
 func Open(ctx context.Context, e Executor) (err error) {
+	provider, _ := e.(executorRuntimeProvider)
+	var hook *statementRUHook
+	if provider != nil {
+		hook = provider.statementRULifecycleHook()
+	}
+	if hook != nil && hook.cpuWorkEnabled {
+		hook.cpuWorkObserved.Store(false)
+		hook.cpuWork.BeginGeneration()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = util.GetRecoverError(r)
+		}
+		if err != nil && hook != nil && hook.cpuWorkEnabled {
+			hook.cpuWork.AbortGeneration(false)
 		}
 	}()
 	if e.RuntimeStats() != nil {
 		start := time.Now()
 		defer func() { e.RuntimeStats().RecordOpen(time.Since(start)) }()
 	}
-	if provider, ok := e.(ruv2CacheProvider); ok {
+	if provider != nil {
 		populateRUV2NextCache(ctx, provider.ruv2NextCache(), e)
 	}
 	return e.Open(ctx)
@@ -749,9 +822,17 @@ func Open(ctx context.Context, e Executor) (err error) {
 
 // Next is a wrapper function on e.Next(), it handles some common codes.
 func Next(ctx context.Context, e Executor, req *chunk.Chunk) (err error) {
+	provider, _ := e.(executorRuntimeProvider)
+	var hook *statementRUHook
+	if provider != nil {
+		hook = provider.statementRULifecycleHook()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = util.GetRecoverError(r)
+		}
+		if err != nil && hook != nil && hook.cpuWorkEnabled {
+			hook.cpuWork.AbortGeneration(hook.cpuWorkObserved.Load())
 		}
 	}()
 	if e.RuntimeStats() != nil {
@@ -770,7 +851,7 @@ func Next(ctx context.Context, e Executor, req *chunk.Chunk) (err error) {
 		ruv2Metrics *execdetails.RUV2Metrics
 		recorder    execdetails.ExecutorMetricRecorder
 	)
-	if provider, ok := e.(ruv2CacheProvider); ok {
+	if provider != nil {
 		cache := provider.ruv2NextCache()
 		if cache.regionName == "" {
 			populateRUV2NextCache(ctx, cache, e)
@@ -844,10 +925,23 @@ func Next(ctx context.Context, e Executor, req *chunk.Chunk) (err error) {
 
 // Close is a wrapper function on e.Close(), it handles some common codes.
 func Close(e Executor) (err error) {
+	provider, _ := e.(executorRuntimeProvider)
+	var hook *statementRUHook
+	if provider != nil {
+		hook = provider.statementRULifecycleHook()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = util.GetRecoverError(r)
 		}
+		if hook == nil || !hook.cpuWorkEnabled {
+			return
+		}
+		if err != nil {
+			hook.cpuWork.AbortGeneration(hook.cpuWorkObserved.Load())
+			return
+		}
+		hook.cpuWork.CompleteGeneration()
 	}()
 	if e.RuntimeStats() != nil {
 		start := time.Now()

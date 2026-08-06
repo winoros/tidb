@@ -162,10 +162,12 @@ func TestStatementRUMutationPreparationCollection(t *testing.T) {
 	require.NoError(t, lazyTxn.Set(kv.Key("k3"), []byte("v3")))
 	require.NoError(t, lazyTxn.Delete(kv.Key("k3")))
 
+	require.True(t, sc.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
 	statement := sc.TakeStatementRUForExecution()
-	require.True(t, statement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	finish, first := statement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
+	require.Equal(t, statementru.Outcome{State: statementru.StateComplete}, finish.Result.Outcome())
+	require.True(t, finish.Result.HasTotal())
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	require.Equal(t, float64(6), units[statementru.CPUWork])
@@ -198,8 +200,9 @@ func TestStatementRUMutationPreparationCollection(t *testing.T) {
 	require.NotNil(t, lazyTxn.statementRUCPUWorkRecorder())
 	require.Same(t, buffer, lazyTxn.GetMemBuffer())
 	require.NoError(t, lazyTxn.Set(kv.Key("optional-cpu"), []byte("value")))
+	require.True(t, optionalCPU.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
 	optionalStatement := optionalCPU.TakeStatementRUForExecution()
-	require.True(t, optionalStatement.EvidenceRecorder().MarkPresent(statementru.NetworkBytes.Mask()|statementru.CPUWork.Mask()))
+	require.True(t, optionalStatement.EvidenceRecorder().MarkPresent(statementru.NetworkBytes.Mask()))
 	optionalFinish, first := optionalStatement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
 	optionalUnits, ok := optionalFinish.Result.Units()
@@ -230,8 +233,8 @@ func TestStatementRUMutationPreparationCollection(t *testing.T) {
 		require.NoError(t, retainedBuffer.Set(kv.Key("retry"), []byte("value")))
 		return nil
 	}))
+	require.True(t, target.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
 	targetStatement := target.TakeStatementRUForExecution()
-	require.True(t, targetStatement.EvidenceRecorder().MarkPresent(statementru.CPUWork.Mask()))
 	targetFinish, first := targetStatement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
 	targetUnits, ok := targetFinish.Result.Units()
@@ -286,6 +289,35 @@ func TestStatementRUMutationPreparationCollection(t *testing.T) {
 	<-reinitDone
 	require.Same(t, retainedBuffer, lazyTxn.GetMemBuffer())
 	require.Same(t, secondInner.GetMemBuffer(), lazyTxn.statementRUMutationBuffer.MemBuffer)
+
+	t.Run("nonstandard mutation buffer fails closed", func(t *testing.T) {
+		fallbackSC := stmtctx.NewStmtCtx()
+		require.True(t, fallbackSC.ConfigureStatementRU(statementru.Selection{
+			Mode:          statementru.ModeCalibration,
+			Applicable:    true,
+			RequiredUnits: statementru.CPUWork.Mask(),
+			Weights:       &weights,
+		}))
+		fallbackVars := &variable.SessionVars{StmtCtx: fallbackSC}
+		fallbackTxn := &LazyTxn{Transaction: secondInner, statementRUVars: fallbackVars}
+		fallbackTxn.statementRUMutationBuffer.owner = fallbackTxn
+		require.Same(t, secondInner.GetMemBuffer(), fallbackTxn.GetMemBuffer())
+		require.True(t, fallbackSC.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
+		fallbackStatement := fallbackSC.TakeStatementRUForExecution()
+		remote := fallbackStatement.UnitContributorRegistrar().RegisterUnitContributor(statementru.CPUWork.Mask())
+		require.NotNil(t, remote)
+		var values statementru.UnitValues
+		values[statementru.CPUWork] = 1
+		require.True(t, remote.Complete(values))
+
+		fallbackFinish, first := fallbackStatement.Finish(statementru.TerminalSuccess)
+		require.True(t, first)
+		require.False(t, fallbackFinish.Result.HasTotal())
+		require.Equal(t, statementru.Outcome{
+			State:  statementru.StatePartial,
+			Reason: statementru.ReasonUnsupported,
+		}, fallbackFinish.Result.Outcome())
+	})
 }
 
 func TestStatementRUReplayCoordinator(t *testing.T) {

@@ -142,6 +142,7 @@ type executorBuilder struct {
 
 func (b *executorBuilder) configureStatementRUCPUWork(executor exec.Executor, multiplier int) {
 	if !b.statementRUCPUWorkEligible() {
+		b.markStatementRUCPUWorkUnsupported()
 		return
 	}
 	if !exec.ConfigureStatementRUCPUWork(executor, b.sctx.GetSessionVars().StmtCtx, multiplier) {
@@ -151,6 +152,7 @@ func (b *executorBuilder) configureStatementRUCPUWork(executor exec.Executor, mu
 
 func (b *executorBuilder) configureStatementRUUnits(executor exec.Executor, multiplier int, additionalUnits statementru.UnitMask) {
 	if !b.statementRUCPUWorkEligible() {
+		b.markStatementRUCPUWorkUnsupported()
 		return
 	}
 	if !exec.ConfigureStatementRUExecutor(executor, b.sctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
@@ -158,6 +160,26 @@ func (b *executorBuilder) configureStatementRUUnits(executor exec.Executor, mult
 		AdditionalUnits:   additionalUnits,
 	}) {
 		b.err = errors.Errorf("cannot configure statement RU units for executor %T with multiplier %d and additional units %d", executor, multiplier, additionalUnits)
+	}
+}
+
+func (b *executorBuilder) configureStatementRUSynchronousUnits(executor exec.Executor, multiplier int, additionalUnits statementru.UnitMask) {
+	if !b.statementRUCPUWorkEligible() {
+		b.markStatementRUCPUWorkUnsupported()
+		return
+	}
+	if !exec.ConfigureStatementRUExecutor(executor, b.sctx.GetSessionVars().StmtCtx, exec.StatementRUExecutorConfig{
+		CPUWorkMultiplier:  multiplier,
+		AdditionalUnits:    additionalUnits,
+		SynchronousCPUWork: true,
+	}) {
+		b.err = errors.Errorf("cannot configure synchronous statement RU units for executor %T with multiplier %d and additional units %d", executor, multiplier, additionalUnits)
+	}
+}
+
+func (b *executorBuilder) markStatementRUCPUWorkUnsupported() {
+	if !exec.MarkStatementRUCPUWorkUnsupported(b.sctx.GetSessionVars().StmtCtx) {
+		b.err = errors.New("cannot mark statement RU CPU work unsupported")
 	}
 }
 
@@ -1839,7 +1861,9 @@ func (b *executorBuilder) buildMergeJoin(v *physicalop.PhysicalMergeJoin) exec.E
 
 	executor_metrics.ExecutorCounterMergeJoinExec.Inc()
 	if expressionCount, ok := statementRUMergeJoinExpressionCount(v); ok {
-		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
+		b.configureStatementRUSynchronousUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
+	} else {
+		b.markStatementRUCPUWorkUnsupported()
 	}
 	return e
 }
@@ -2070,6 +2094,8 @@ func (b *executorBuilder) buildHashJoin(v *physicalop.PhysicalHashJoin) exec.Exe
 	if e != nil {
 		if expressionCount, ok := statementRUHashJoinExpressionCount(v); ok {
 			b.configureStatementRUUnits(e, expressionCount, statementru.HashStateRows.Mask()|statementru.JoinOutputRows.Mask())
+		} else {
+			b.markStatementRUCPUWorkUnsupported()
 		}
 	}
 	return e
@@ -2434,6 +2460,8 @@ func (b *executorBuilder) newProjectionExec(childExec exec.Executor, v *physical
 	}
 	if statementRUProjectionCPUWorkEligible(e.numWorkers, e.evaluatorSuit.Vectorizable()) {
 		b.configureStatementRUCPUWork(e, len(v.Exprs))
+	} else {
+		b.markStatementRUCPUWorkUnsupported()
 	}
 	return e
 }
@@ -2864,6 +2892,12 @@ func (b *executorBuilder) buildTopN(v *physicalop.PhysicalTopN) exec.Executor {
 }
 
 func (b *executorBuilder) buildApply(v *physicalop.PhysicalApply) exec.Executor {
+	// Apply does not yet have a frozen local CPUWork formula. Keep the whole
+	// local domain fail-closed until both serial and parallel forms are owned.
+	b.markStatementRUCPUWorkUnsupported()
+	if b.err != nil {
+		return nil
+	}
 	var (
 		innerPlan base.PhysicalPlan
 		outerPlan base.PhysicalPlan
@@ -3621,6 +3655,8 @@ func (b *executorBuilder) buildIndexLookUpJoin(v *physicalop.PhysicalIndexJoin) 
 	}
 	if expressionCount, ok := statementRUIndexJoinExpressionCount(v); ok {
 		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
+	} else {
+		b.markStatementRUCPUWorkUnsupported()
 	}
 	return e
 }
@@ -3874,6 +3910,8 @@ func (b *executorBuilder) buildIndexLookUpMergeJoin(v *physicalop.PhysicalIndexM
 	e.Joiners = joiners
 	if expressionCount, ok := statementRUIndexMergeJoinExpressionCount(v); ok {
 		b.configureStatementRUUnits(e, expressionCount, statementru.JoinOutputRows.Mask())
+	} else {
+		b.markStatementRUCPUWorkUnsupported()
 	}
 	return e
 }
@@ -3894,6 +3932,8 @@ func (b *executorBuilder) buildIndexNestedLoopHashJoin(v *physicalop.PhysicalInd
 	}
 	if expressionCount, ok := statementRUIndexHashJoinExpressionCount(v); ok {
 		b.configureStatementRUUnits(idxHash, expressionCount, statementru.JoinOutputRows.Mask())
+	} else {
+		b.markStatementRUCPUWorkUnsupported()
 	}
 	return idxHash
 }

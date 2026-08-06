@@ -322,7 +322,10 @@ func TestStatementRUHashAggOpenGenerationIsolation(t *testing.T) {
 	require.True(t, statement.EvidenceRecorder().MarkPresent(requiredUnits))
 	finish, first := statement.Finish(statementru.TerminalSuccess)
 	require.True(t, first)
-	require.Equal(t, statementru.Outcome{State: statementru.StateComplete, Reason: statementru.ReasonNone}, finish.Result.Outcome())
+	require.Equal(t, statementru.Outcome{
+		State:  statementru.StatePartial,
+		Reason: statementru.ReasonUnsupported,
+	}, finish.Result.Outcome())
 	units, ok := finish.Result.Units()
 	require.True(t, ok)
 	require.Equal(t, float64(2), units[statementru.CPUWork])

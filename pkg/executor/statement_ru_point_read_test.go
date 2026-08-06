@@ -348,6 +348,7 @@ func TestStatementRUPointReadIgnoresUnrequestedScanBytes(t *testing.T) {
 			require.Equal(t, test.wantOwner, attachment.owner != nil)
 			require.Equal(t, test.wantOwner, attachment.stats != nil)
 			require.Equal(t, test.wantOwner, attachment.registry != nil)
+			require.True(t, sc.StatementRULocalCPUWorkRegistrar().CompleteLocalCPUWorkInventory())
 
 			statement := sc.TakeStatementRUForExecution()
 			require.NotNil(t, statement)
