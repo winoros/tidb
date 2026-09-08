@@ -227,7 +227,7 @@ func TestCloseCollectsUnconsumedStatsAfterResponseClose(t *testing.T) {
 	resp := &closeOrderingResponse{
 		mockResponse: &mockResponse{},
 		stats: []*copr.CopRuntimeStats{{
-			CopExecDetails: execdetails.CopExecDetails{CalleeAddress: "callee"},
+			CopExecDetails: execdetails.CopExecDetails{CalleeAddress: "callee", ScanDetail: &util.ScanDetail{TotalKeys: 10, ProcessedKeys: 5, ProcessedKeysSize: 100}},
 		}},
 	}
 	sr := &selectResult{
@@ -246,6 +246,13 @@ func TestCloseCollectsUnconsumedStatsAfterResponseClose(t *testing.T) {
 	require.Equal(t, uint64(0), snapshot.ExpectedSummaries)
 	require.Equal(t, uint64(0), snapshot.ObservedSummaries)
 	require.False(t, snapshot.Complete())
+	coll := ctx.GetSessionVars().StmtCtx.RuntimeStatsColl
+	scan, found := coll.GetCopScanDetail(1234)
+	require.True(t, found, "unconsumed physical work remains owned by the request root")
+	require.Equal(t, int64(100), scan.ProcessedKeysSize)
+	require.NoError(t, sr.close())
+	again, _ := coll.GetCopScanDetail(1234)
+	require.Equal(t, scan, again, "closing twice must not double count scan bytes")
 }
 
 func TestNewSelRespChannelIter(t *testing.T) {

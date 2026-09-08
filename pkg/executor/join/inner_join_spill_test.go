@@ -15,9 +15,11 @@
 package join
 
 import (
+	"context"
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/executor/internal/testutil"
 	"github.com/pingcap/tidb/pkg/executor/internal/util"
 	"github.com/pingcap/tidb/pkg/expression"
@@ -438,6 +440,16 @@ func TestHashJoinV2HashStateAcrossRepeatedOpen(t *testing.T) {
 		rUsed:            []int{0},
 	})
 
+	// An opened join with no Next contributes known zero to later executions.
+	leftDataSource.PrepareChunks()
+	rightDataSource.PrepareChunks()
+	require.NoError(t, hashJoinExec.Open(context.Background()))
+	require.NoError(t, hashJoinExec.Close())
+	unused, found := ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootHashStateRowsSnapshot(hashJoinExec.ID())
+	require.True(t, found)
+	require.True(t, unused.Complete())
+	require.Zero(t, unused.Rows)
+
 	// The first execution builds seven rows. The second uses the same executor
 	// with eleven build rows, exercising RuntimeStatsColl's repeated-open merge.
 	rightDataSource.GenData = allBuildChunks[:1]
@@ -454,15 +466,43 @@ func TestHashJoinV2HashStateAcrossRepeatedOpen(t *testing.T) {
 	require.Equal(t, int64(18), snapshot.Rows)
 	require.True(t, snapshot.Complete())
 
-	// A failed repeated execution must poison the merged evidence instead of
-	// preserving the previously complete state.
+	// Stopping after one output chunk must retain all eleven built entries.
+	leftDataSource.PrepareChunks()
+	rightDataSource.PrepareChunks()
+	require.NoError(t, hashJoinExec.Open(context.Background()))
+	req := chunk.NewChunkWithCapacity(hashJoinExec.RetFieldTypes(), 7)
+	require.NoError(t, hashJoinExec.Next(context.Background(), req))
+	require.Positive(t, req.NumRows())
+	require.NoError(t, hashJoinExec.Close())
+	snapshot, found = ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootHashStateRowsSnapshot(hashJoinExec.ID())
+	require.True(t, found)
+	require.True(t, snapshot.Complete())
+	require.Equal(t, int64(29), snapshot.Rows)
+
+	t.Run("stop with pending restore retains accounted state", func(t *testing.T) {
+		// Model the round boundary: the previous build is accounted, and an
+		// untouched partition remains on the restore stack when Close stops work.
+		state := execdetails.NewHashStateRuntimeStats()
+		state.AddRows(7)
+		stopped := &HashJoinV2Exec{
+			BaseExecutor:  exec.NewBaseExecutor(ctx, expression.NewSchema(), 0),
+			HashJoinCtxV2: &HashJoinCtxV2{hashStateStats: state},
+		}
+		stopped.spillHelper = &hashJoinSpillHelper{}
+		stopped.spillHelper.stack.push(&restorePartition{round: 1})
+		stopped.finished.Store(true)
+		stopped.joinResultCh = make(chan *hashjoinWorkerResult)
+		stopped.startBuildAndProbe(context.Background())
+		require.Len(t, stopped.spillHelper.stack.elems, 1)
+		require.Equal(t, int64(7), state.HashStateRowsSnapshot().Rows)
+		require.True(t, state.HashStateRowsSnapshot().Complete())
+	})
+
+	// A failed repeated execution must still report its SQL error. Statement RU
+	// publication is gated by the final statement outcome, not this local state.
 	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/executor/join/issue51998", "return(true)")
 	leftDataSource.PrepareChunks()
 	rightDataSource.PrepareChunks()
 	err := executeHashJoinExecAndGetError(t, hashJoinExec)
 	require.EqualError(t, err, "issue51998 build return error")
-	snapshot, found = ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.GetRootHashStateRowsSnapshot(hashJoinExec.ID())
-	require.True(t, found)
-	require.False(t, snapshot.Complete())
-	require.True(t, snapshot.Invalid())
 }

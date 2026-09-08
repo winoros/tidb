@@ -166,6 +166,10 @@ func SetTiFlashConfVarsInContext(ctx context.Context, dctx *distsqlctx.DistSQLCo
 // which can help selectResult to collect runtime stats.
 func SelectWithRuntimeStats(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Request,
 	fieldTypes []*types.FieldType, copPlanIDs []int, rootPlanID int) (SelectResult, error) {
+	if dctx.RuntimeStatsColl != nil && kvReq.StoreType == kv.TiKV && len(copPlanIDs) > 0 &&
+		(kvReq.KeyRanges == nil || kvReq.KeyRanges.TotalRangeNum() != 0) {
+		dctx.RuntimeStatsColl.RecordCopRequest(copPlanIDs[len(copPlanIDs)-1])
+	}
 	sr, err := Select(ctx, dctx, kvReq, fieldTypes)
 	if err != nil {
 		return nil, err

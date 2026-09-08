@@ -75,6 +75,8 @@ const (
 	TpExplainRURuntimeStats
 	// TpHashStateRuntimeStats is the tp for typed hash-state evidence.
 	TpHashStateRuntimeStats
+	// TpDeferredExecution is the tp for an owner-declared execution opportunity.
+	TpDeferredExecution
 )
 
 // RuntimeStats is used to express the executor runtime information.
@@ -104,8 +106,8 @@ type HashStateRowsSnapshot struct {
 	state hashStateRowsState
 }
 
-// Complete reports whether every observed execution completed state
-// construction with a nonnegative row count.
+// Complete reports whether every registered execution either never started
+// constructing hash state or accounted for all state constructed before stopping.
 func (s HashStateRowsSnapshot) Complete() bool {
 	return s.state == hashStateRowsComplete && s.Rows >= 0
 }
@@ -134,7 +136,8 @@ func (s *HashStateRuntimeStats) AddRows(rows uint64) {
 	s.rows.Add(int64(rows))
 }
 
-// Complete marks the lifecycle complete after every state partition is built.
+// Complete seals the accounting after all producers stop. Rows must cover all
+// state actually constructed, including work before a normal early stop.
 // Duplicate completion is invalid.
 func (s *HashStateRuntimeStats) Complete() {
 	if !s.state.CompareAndSwap(uint32(hashStateRowsIncomplete), uint32(hashStateRowsComplete)) {
@@ -587,6 +590,40 @@ func (e *BasicRuntimeStats) GetTime() int64 {
 	return e.consume.Load()
 }
 
+// DeferredExecution belongs to an owner that delays execution of a subtree.
+// All owner clones and repeated executions for that root share one marker.
+// Ordinary executors use their existing row counters and do not need a marker.
+type DeferredExecution struct {
+	started atomic.Bool
+}
+
+// Start marks the owner beginning deferred construction or Open.
+func (e *DeferredExecution) Start() {
+	if !e.started.Load() {
+		e.started.Store(true)
+	}
+}
+
+// String keeps execution evidence out of EXPLAIN runtime-stat rendering.
+func (*DeferredExecution) String() string { return "" }
+
+// Tp implements RuntimeStats.
+func (*DeferredExecution) Tp() int { return TpDeferredExecution }
+
+// Clone implements RuntimeStats.
+func (e *DeferredExecution) Clone() RuntimeStats {
+	cloned := &DeferredExecution{}
+	cloned.started.Store(e.started.Load())
+	return cloned
+}
+
+// Merge preserves any earlier attempt across owners of the same plan ID.
+func (e *DeferredExecution) Merge(other RuntimeStats) {
+	if other, ok := other.(*DeferredExecution); ok && other.started.Load() {
+		e.Start()
+	}
+}
+
 // RuntimeStatsColl collects executors's execution info.
 type RuntimeStatsColl struct {
 	rootStats                  map[int]*RootRuntimeStats
@@ -598,8 +635,10 @@ type RuntimeStatsColl struct {
 }
 
 type copResponseSummaryExpectation struct {
-	count   uint64
-	invalid bool
+	count             uint64
+	invalid           bool
+	requestRegistered bool
+	requestStarted    bool
 }
 
 // NewRuntimeStatsColl creates new executor collector.
@@ -629,6 +668,46 @@ func NewRuntimeStatsColl(reuse *RuntimeStatsColl) *RuntimeStatsColl {
 		copStats:                   make(map[int]*CopRuntimeStats),
 		copResponseSummaryExpected: make(map[int]copResponseSummaryExpectation),
 	}
+}
+
+// RegisterDeferredExecution declares a deferred subtree on its existing root
+// statistics entry. Registration cannot erase an earlier execution attempt.
+func (e *RuntimeStatsColl) RegisterDeferredExecution(planID int) *DeferredExecution {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	root := e.rootStats[planID]
+	if root == nil {
+		root = NewRootRuntimeStats()
+		e.rootStats[planID] = root
+	}
+	for _, stats := range root.groupRss {
+		if deferred, ok := stats.(*DeferredExecution); ok {
+			return deferred
+		}
+	}
+	deferred := &DeferredExecution{}
+	root.groupRss = append(root.groupRss, deferred)
+	return deferred
+}
+
+// RegisterCopRequest declares one TiKV DAG root, including a deferred reader
+// leg that may never send a request. Descendants need no separate registration.
+func (e *RuntimeStatsColl) RegisterCopRequest(rootID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	expectation := e.copResponseSummaryExpected[rootID]
+	expectation.requestRegistered = true
+	e.copResponseSummaryExpected[rootID] = expectation
+}
+
+// RecordCopRequest marks a nonempty request before sending.
+// Repeated requests cannot restore an unstarted state.
+func (e *RuntimeStatsColl) RecordCopRequest(rootID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	expectation := e.copResponseSummaryExpected[rootID]
+	expectation.requestStarted = true
+	e.copResponseSummaryExpected[rootID] = expectation
 }
 
 // EstimateScanBytes estimates physical scan bytes from one logical scan request.
@@ -757,6 +836,9 @@ type RootRowsSnapshot struct {
 	Rows     int64
 	observed bool
 	invalid  bool
+
+	registered bool
+	unstarted  bool
 }
 
 // Observed reports whether at least one executor Next call recorded rows.
@@ -764,33 +846,55 @@ func (s RootRowsSnapshot) Observed() bool {
 	return !s.invalid && s.Rows >= 0 && s.observed
 }
 
+// Known also accepts a constructed executor's zero output counter or an
+// explicitly unstarted subtree. Zero output does not imply zero physical work:
+// a reader can send requests from Open without a single Next call.
+func (s RootRowsSnapshot) Known() bool {
+	return !s.Invalid() && (s.observed || s.registered || s.unstarted)
+}
+
+// Unstarted reports an owner-declared subtree that was never started. Consumers
+// must wait for statement execution to stop before using this as final evidence.
+func (s RootRowsSnapshot) Unstarted() bool { return s.unstarted }
+
 // Invalid reports malformed row or record counters.
 func (s RootRowsSnapshot) Invalid() bool {
 	return s.invalid || s.Rows < 0
 }
 
-// GetRootRowsSnapshot returns scalar evidence without creating a root-stats
-// entry or exposing a live BasicRuntimeStats pointer.
+// GetRootRowsSnapshot reads rows and optional factory evidence in one lookup.
 func (e *RuntimeStatsColl) GetRootRowsSnapshot(planID int) RootRowsSnapshot {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	root, ok := e.rootStats[planID]
-	if !ok || root == nil || root.basic == nil {
+	root := e.rootStats[planID]
+	if root == nil {
 		return RootRowsSnapshot{}
 	}
-	rows := root.basic.rows.Load()
-	records := root.basic.loop.Load()
-	return RootRowsSnapshot{
-		Rows:     rows,
-		observed: records > 0,
-		invalid:  rows < 0 || records < 0,
+	snapshot := RootRowsSnapshot{}
+	if root.basic != nil {
+		snapshot.Rows = root.basic.rows.Load()
+		records := root.basic.loop.Load()
+		snapshot.registered = true
+		snapshot.observed = records > 0
+		snapshot.invalid = snapshot.Rows < 0 || records < 0
 	}
+	// Ordinary executed roots need no optional owner lookup.
+	if !snapshot.observed {
+		for _, stats := range root.groupRss {
+			if deferred, ok := stats.(*DeferredExecution); ok {
+				snapshot.unstarted = !deferred.started.Load()
+				break
+			}
+		}
+	}
+	return snapshot
 }
 
 // CopRowsSnapshot is a value-only copy of TiKV execution-summary evidence.
 // ExpectedSummaries counts received responses that should contain this plan's
 // summary; it is response-summary coverage, not physical-attempt coverage.
 type CopRowsSnapshot struct {
+	unstarted         bool
 	Rows              int64
 	ObservedSummaries uint64
 	ExpectedSummaries uint64
@@ -810,6 +914,10 @@ func (s CopRowsSnapshot) Observed() bool {
 	return !s.Invalid && s.Rows >= 0 && s.ExpectedSummaries > 0 &&
 		s.ObservedSummaries > 0 && s.ObservedSummaries <= s.ExpectedSummaries
 }
+
+// Unstarted reports a registered request root whose entire DAG was never sent.
+// It does not promote absent response summaries to complete coverage.
+func (s CopRowsSnapshot) Unstarted() bool { return s.unstarted }
 
 // RecordExpectedCopResponseSummaries records the summary slots owned by one
 // consumed TiKV response. It must run before validating the returned summary
@@ -853,11 +961,14 @@ func (e *RuntimeStatsColl) GetCopRowsSnapshot(planID int) CopRowsSnapshot {
 		ExpectedSummaries: expectation.count,
 		Invalid:           expectation.invalid,
 	}
+	started := expectation.requestStarted || expectation.count > 0 || expectation.invalid
 	if stats, ok := e.copStats[planID]; ok && stats != nil {
+		started = true
 		snapshot.Rows = stats.summaryRows
 		snapshot.ObservedSummaries = stats.summaryCount
 		snapshot.Invalid = snapshot.Invalid || snapshot.ObservedSummaries > snapshot.ExpectedSummaries
 	}
+	snapshot.unstarted = expectation.requestRegistered && !started
 	return snapshot
 }
 

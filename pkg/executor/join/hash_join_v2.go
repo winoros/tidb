@@ -697,6 +697,10 @@ func (e *HashJoinV2Exec) Close() error {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
 	}
 	if e.hashStateStats != nil {
+		if !e.prepared {
+			// No build worker started; seal known zero at the owner boundary.
+			e.hashStateStats.Complete()
+		}
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.hashStateStats)
 	}
 	e.releaseDisk()
@@ -1105,6 +1109,9 @@ func (e *HashJoinV2Exec) startBuildAndProbe(ctx context.Context) {
 		if r := recover(); r != nil {
 			e.joinResultCh <- &hashjoinWorkerResult{err: util.GetRecoverError(r)}
 		}
+		if e.hashStateStats != nil {
+			e.hashStateStats.Complete()
+		}
 		close(e.joinResultCh)
 	}()
 
@@ -1121,9 +1128,6 @@ func (e *HashJoinV2Exec) startBuildAndProbe(ctx context.Context) {
 
 		e.waiterWg.Wait()
 		if !e.ProbeSideTupleFetcher.buildSuccess {
-			if e.hashStateStats != nil {
-				e.hashStateStats.Invalidate()
-			}
 			return
 		}
 		e.collectSpillStats()
@@ -1139,9 +1143,6 @@ func (e *HashJoinV2Exec) startBuildAndProbe(ctx context.Context) {
 		restoredPartition := e.spillHelper.stack.pop()
 		if restoredPartition == nil {
 			// No more data to restore
-			if e.hashStateStats != nil {
-				e.hashStateStats.Complete()
-			}
 			return
 		}
 		e.spillHelper.round = restoredPartition.round

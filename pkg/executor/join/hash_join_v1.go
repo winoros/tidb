@@ -179,6 +179,10 @@ func (e *HashJoinV1Exec) Close() error {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
 	}
 	if e.hashStateStats != nil {
+		if !e.Prepared {
+			// No build worker started; seal known zero at the owner boundary.
+			e.hashStateStats.Complete()
+		}
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.hashStateStats)
 	}
 
@@ -1248,6 +1252,7 @@ func (w *BuildWorkerV1) BuildHashTableForList(buildSideResultCh <-chan *chunk.Ch
 
 // NestedLoopApplyExec is the executor for apply.
 type NestedLoopApplyExec struct {
+	InnerPlanID int
 	exec.BaseExecutor
 
 	Sctx        sessionctx.Context
@@ -1288,6 +1293,10 @@ func (e *NestedLoopApplyExec) Close() error {
 	e.innerRows = nil
 	e.memTracker = nil
 	if e.RuntimeStats() != nil {
+		deferred := e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterDeferredExecution(e.InnerPlanID)
+		if e.innerIter != nil || e.outerRow != nil {
+			deferred.Start()
+		}
 		runtimeStats := NewJoinRuntimeStats()
 		if e.CanUseCache {
 			var hitRatio float64

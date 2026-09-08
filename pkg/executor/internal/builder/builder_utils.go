@@ -68,6 +68,10 @@ func ConstructDAGReq(ctx sessionctx.Context, plans []plannercore.PhysicalPlan, s
 	if sc.RuntimeStatsColl != nil {
 		collExec := true
 		dagReq.CollectExecutionSummaries = &collExec
+		if storeType == kv.TiKV && len(plans) > 0 {
+			// TiKV plans are in leaf-to-root order. One root owns the whole DAG.
+			sc.RuntimeStatsColl.RegisterCopRequest(plans[len(plans)-1].ID())
+		}
 	}
 	dagReq.Flags = sc.PushDownFlags()
 	if ctx.GetSessionVars().GetDivPrecisionIncrement() != vardef.DefDivPrecisionIncrement {

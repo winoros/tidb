@@ -470,6 +470,44 @@ func TestStatementRUCalculationTraversal(t *testing.T) {
 		})
 	}
 
+	t.Run("deferred execution needs producer proof", func(t *testing.T) {
+		for _, mode := range []string{"missing", "unstarted", "started", "descendant invalid", "repeated"} {
+			t.Run(mode, func(t *testing.T) {
+				fixture := newStatementRUSimpleSelectFixture(t)
+				join, outer, inner := newJoin(fixture, "index")
+				coll := fixture.stmt.Ctx.GetSessionVars().StmtCtx.RuntimeStatsColl
+				recordRootRows(fixture, outer, 3)
+				recordRootRows(fixture, join, 0)
+				setPlan(fixture, join)
+				if mode != "missing" {
+					activity := coll.RegisterDeferredExecution(inner.ID())
+					switch mode {
+					case "started":
+						activity.Start()
+					case "descendant invalid":
+						recordCopRows(fixture, inner.TablePlan, uint64(1)<<63)
+					case "repeated":
+						activity.Start()
+						recordRootRows(fixture, inner, 2)
+						coll.RegisterDeferredExecution(inner.ID())
+					}
+				}
+				if mode == "missing" || mode == "started" {
+					requireNoPublication(t, fixture)
+					return
+				}
+				cpuWork := float64(3)
+				if mode == "repeated" {
+					cpuWork += 2
+				}
+				requirePublication(t, fixture, statementRURawUnits{
+					CPUWork: cpuWork, NetBytes: 20,
+					FrontendCompileBytes: float64(len(statementRUSimpleSelectSQLForTest)),
+				})
+			})
+		}
+	})
+
 	t.Run("Join accepts build-side-first display order", func(t *testing.T) {
 		fixture := newStatementRUSimpleSelectFixture(t)
 		join, left, right := newJoin(fixture, "hash")
@@ -609,6 +647,38 @@ func TestStatementRUCalculationTraversal(t *testing.T) {
 		recordHashState(missing, missingAgg, 0, true, false)
 		setPlan(missing, missingAgg)
 		requireNoPublication(t, missing)
+	})
+
+	t.Run("unstarted DAG root bypasses descendant evidence", func(t *testing.T) {
+		for _, mode := range []string{"missing", "unstarted", "started", "descendant response"} {
+			t.Run(mode, func(t *testing.T) {
+				fixture := newStatementRUSimpleSelectFixture(t)
+				reader, scan := newTableReader(fixture)
+				agg := newAggregation(fixture, true, scan)
+				reader.TablePlan = agg
+				reader.TablePlans = physicalop.FlattenListPushDownPlan(agg)
+				coll := fixture.stmt.Ctx.GetSessionVars().StmtCtx.RuntimeStatsColl
+				coll.GetBasicRuntimeStats(reader.ID(), true)
+				if mode != "missing" {
+					coll.RegisterCopRequest(agg.ID())
+				}
+				switch mode {
+				case "started":
+					coll.RecordCopRequest(agg.ID())
+					coll.RegisterCopRequest(agg.ID())
+				case "descendant response":
+					recordCopRows(fixture, scan, 0)
+				}
+				setPlan(fixture, reader)
+				if mode != "unstarted" && mode != "descendant response" {
+					requireNoPublication(t, fixture)
+					return
+				}
+				requirePublication(t, fixture, statementRURawUnits{
+					NetBytes: 20, FrontendCompileBytes: float64(len(statementRUSimpleSelectSQLForTest)),
+				})
+			})
+		}
 	})
 
 	t.Run("TiKV cop HashAgg charges valid responses when another summary is missing", func(t *testing.T) {
@@ -1103,6 +1173,16 @@ func TestStatementRUCalculationTraversal(t *testing.T) {
 		recordRootRows(fixture, reader, -1)
 		setPlan(fixture, selection)
 
+		requireNoPublication(t, fixture)
+	})
+
+	t.Run("negative cop leaf rows fail closed", func(t *testing.T) {
+		fixture := newStatementRUSimpleSelectFixture(t)
+		reader, scan := newTableReader(fixture)
+		recordRootRows(fixture, reader, 0)
+		recordScan(fixture, scan, 1, 1, 10)
+		recordCopRows(fixture, scan, uint64(1)<<63)
+		setPlan(fixture, reader)
 		requireNoPublication(t, fixture)
 	})
 

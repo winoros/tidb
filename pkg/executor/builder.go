@@ -2885,6 +2885,7 @@ func (b *executorBuilder) buildApply(v *physicalop.PhysicalApply) exec.Executor 
 			OuterSchema:  v.OuterSchema,
 			Sctx:         b.sctx,
 			CanUseCache:  v.CanUseCache,
+			InnerPlanID:  innerPlan.ID(),
 		}
 		executor_metrics.ExecutorCounterNestedLoopApplyExec.Inc()
 		return serialExec
@@ -2929,6 +2930,7 @@ func (b *executorBuilder) buildApply(v *physicalop.PhysicalApply) exec.Executor 
 			concurrency:  v.Concurrency,
 			keepOrder:    v.KeepOrder,
 			useCache:     v.CanUseCache,
+			innerPlanID:  innerPlan.ID(),
 		}
 	}
 	return constructSerialExec()
@@ -3594,7 +3596,12 @@ func (b *executorBuilder) newDataReaderBuilder(p base.PhysicalPlan) (*dataReader
 		builderForDataReader.stmtCtxLock = &sync.Mutex{}
 	}
 
+	var deferred *execdetails.DeferredExecution
+	if p != nil && b.sctx.GetSessionVars().StmtCtx.RuntimeStatsColl != nil {
+		deferred = b.sctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterDeferredExecution(p.ID())
+	}
 	return &dataReaderBuilder{
+		deferred:        deferred,
 		plan:            p,
 		executorBuilder: &builderForDataReader,
 		once:            &dataReaderBuilderOnce{},
@@ -4975,6 +4982,8 @@ type dataReaderBuilder struct {
 	plan base.Plan
 	*executorBuilder
 
+	deferred *execdetails.DeferredExecution
+
 	selectResultHook // for testing
 	// indexJoinKeyUniqueIDs records the inner join key unique IDs for index join inner build.
 	indexJoinKeyUniqueIDs []int64
@@ -5005,6 +5014,7 @@ func (builder *dataReaderBuilder) cloneForIndexJoinBuild() *dataReaderBuilder {
 	clonedExecBuilder := *builder.executorBuilder
 	clonedExecBuilder.err = nil
 	return &dataReaderBuilder{
+		deferred:              builder.deferred,
 		plan:                  builder.plan,
 		executorBuilder:       &clonedExecBuilder,
 		selectResultHook:      builder.selectResultHook,
@@ -5016,6 +5026,9 @@ func (builder *dataReaderBuilder) cloneForIndexJoinBuild() *dataReaderBuilder {
 func (builder *dataReaderBuilder) BuildExecutorForIndexJoin(ctx context.Context, lookUpContents []*join.IndexJoinLookUpContent,
 	indexRanges []*ranger.Range, keyOff2IdxOff []int, cwc *physicalop.ColWithCmpFuncManager, canReorderHandles bool, memTracker *memory.Tracker, interruptSignal *atomic.Value,
 ) (exec.Executor, error) {
+	if builder.deferred != nil {
+		builder.deferred.Start()
+	}
 	localBuilder := builder.cloneForIndexJoinBuild()
 	return localBuilder.buildExecutorForIndexJoinInternal(ctx, localBuilder.plan, lookUpContents, indexRanges, keyOff2IdxOff, cwc, canReorderHandles, memTracker, interruptSignal)
 }

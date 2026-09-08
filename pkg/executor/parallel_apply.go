@@ -57,6 +57,7 @@ type orderedResult struct {
 
 // ParallelNestedLoopApplyExec is the executor for apply.
 type ParallelNestedLoopApplyExec struct {
+	innerPlanID int
 	exec.BaseExecutor
 
 	// outer-side fields
@@ -271,6 +272,14 @@ func (e *ParallelNestedLoopApplyExec) Close() error {
 	err := exec.Close(e.outerExec)
 
 	if e.RuntimeStats() != nil {
+		deferred := e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterDeferredExecution(e.innerPlanID)
+		for id := range e.innerExecs {
+			// Cancellation can stop a selected outer row before its inner iterator is created.
+			if e.innerIter[id] != nil || e.outerRow[id] != nil {
+				deferred.Start()
+				break
+			}
+		}
 		runtimeStats := join.NewJoinRuntimeStats()
 		if e.useCache {
 			var hitRatio float64

@@ -358,7 +358,7 @@ func calculateStatementRUPlan(
 	rootOwnedUnits statementRURawUnits,
 	operatorRUs []plannercore.ExplainRUOperatorResult,
 ) statementRUOperatorResult {
-	if !validateStatementRUFlatTree(tree) {
+	if !validateStatementRUFlatTree(tree) || (operatorRUs != nil && len(operatorRUs) != len(tree)) {
 		return statementRUOperatorResult{state: statementRUOperatorInvalid}
 	}
 	return calculateStatementRUPlanChildFirst(
@@ -426,6 +426,43 @@ func calculateStatementRUPlanChildFirst(
 	if operator == nil || operator.Origin == nil {
 		return statementRUOperatorResult{state: statementRUOperatorInvalid}
 	}
+	unstarted := false
+	outputRows := int64(0)
+	outputRowsObserved := false
+	if runtimeStatsColl != nil {
+		if operator.IsRoot {
+			snapshot := runtimeStatsColl.GetRootRowsSnapshot(operator.Origin.ID())
+			if snapshot.Invalid() {
+				return statementRUOperatorResult{state: statementRUOperatorInvalid}
+			}
+			outputRows = snapshot.Rows
+			outputRowsObserved = snapshot.Known()
+			unstarted = snapshot.Unstarted()
+		} else {
+			snapshot := runtimeStatsColl.GetCopRowsSnapshot(operator.Origin.ID())
+			if snapshot.Invalid {
+				return statementRUOperatorResult{state: statementRUOperatorInvalid}
+			}
+			outputRows = snapshot.Rows
+			// Missing summary slots remain marked by Complete, but do not discard
+			// rows from other valid responses for the same cop occurrence.
+			outputRowsObserved = snapshot.Observed()
+			unstarted = snapshot.Unstarted()
+		}
+	}
+	if outputRows < 0 {
+		return statementRUOperatorResult{state: statementRUOperatorInvalid}
+	}
+	if unstarted {
+		// The execution owner guarantees this entire subtree never started.
+		// Descendants need no row, scan or hash evidence, including completeness.
+		if operatorRUs != nil && operatorIndex == 0 {
+			ru := calculateStatementRUResultOnly(rootOwnedUnits).TotalRU
+			operatorRUs[0].SelfRU, operatorRUs[0].CumRU = ru, ru
+		}
+		return statementRUOperatorResult{state: statementRUOperatorComplete, outputRowsObserved: true}
+	}
+
 	beforeSubtree := calculator.units
 	children := make([]statementRUOperatorResult, len(operator.ChildrenIdx))
 	childState := statementRUOperatorComplete
@@ -443,37 +480,6 @@ func calculateStatementRUPlanChildFirst(
 	}
 	if childState != statementRUOperatorComplete {
 		return statementRUOperatorResult{state: childState}
-	}
-
-	outputRows := int64(0)
-	outputRowsObserved := false
-	// Typed snapshots preserve observed zero through outputRowsObserved. Missing
-	// evidence remains an unobserved zero for best-effort linear/wrapper formulas,
-	// while operators that require proof of execution explicitly test Observed.
-	// Negative or otherwise invalid snapshots fail closed. Because the former two
-	// cases are not interchangeable, every successful forest remains calibration-
-	// Incomplete until direct opportunity coverage is available.
-	if runtimeStatsColl != nil {
-		if operator.IsRoot {
-			snapshot := runtimeStatsColl.GetRootRowsSnapshot(operator.Origin.ID())
-			if snapshot.Invalid() {
-				return statementRUOperatorResult{state: statementRUOperatorInvalid}
-			}
-			outputRows = snapshot.Rows
-			outputRowsObserved = snapshot.Observed()
-		} else {
-			snapshot := runtimeStatsColl.GetCopRowsSnapshot(operator.Origin.ID())
-			if snapshot.Invalid {
-				return statementRUOperatorResult{state: statementRUOperatorInvalid}
-			}
-			outputRows = snapshot.Rows
-			// Missing summary slots remain marked by Complete, but do not discard
-			// rows from other valid responses for the same cop occurrence.
-			outputRowsObserved = snapshot.Observed()
-		}
-	}
-	if outputRows < 0 {
-		return statementRUOperatorResult{state: statementRUOperatorInvalid}
 	}
 
 	beforeOperator := calculator.units
@@ -717,9 +723,6 @@ func calculateStatementRUPlanChildFirst(
 	}
 
 	if operatorRUs != nil {
-		if len(operatorRUs) != len(tree) {
-			return statementRUOperatorResult{state: statementRUOperatorInvalid}
-		}
 		selfUnits := subtractStatementRURawUnits(calculator.units, beforeOperator)
 		cumUnits := subtractStatementRURawUnits(calculator.units, beforeSubtree)
 		if operatorIndex == 0 {
